@@ -10,7 +10,9 @@ import (
 	"strings"
 	"sync"
 
+	// Imported for side effect: registers the sqlite-vec extension auto-loader.
 	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
+	// Imported for side effect: registers the sql.Open("sqlite3", ...) driver.
 	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
@@ -142,7 +144,7 @@ func probeSQLiteReadyContext(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open sqlite readiness probe: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := configureDB(ctx, db); err != nil {
 		return fmt.Errorf("configure sqlite readiness probe: %w", err)

@@ -32,10 +32,12 @@ func NewFixture(model string, dimensions int) (*Fixture, error) {
 	}, nil
 }
 
+// Fingerprint returns a stable identifier for the fixture configuration.
 func (f *Fixture) Fingerprint() string {
 	return fmt.Sprintf("fixture|%s|%s|%d", f.model, fixtureStrategy, f.dimensions)
 }
 
+// Dimension reports the embedding dimensionality.
 func (f *Fixture) Dimension(ctx context.Context) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -43,10 +45,12 @@ func (f *Fixture) Dimension(ctx context.Context) (int, error) {
 	return f.dimensions, ctx.Err()
 }
 
+// EmbedDocuments returns deterministic embeddings for indexed document texts.
 func (f *Fixture) EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error) {
 	return f.embedTexts(ctx, texts)
 }
 
+// EmbedQueries returns deterministic embeddings for query texts.
 func (f *Fixture) EmbedQueries(ctx context.Context, texts []string) ([][]float64, error) {
 	return f.embedTexts(ctx, texts)
 }

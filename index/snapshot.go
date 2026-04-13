@@ -116,7 +116,7 @@ func (s *Snapshot) Stats(ctx context.Context) (*Stats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("count records by kind: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var kind string
 		var count int
@@ -180,7 +180,7 @@ ORDER BY ref ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query records: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make([]corpus.Record, 0)
 	for rows.Next() {
@@ -254,7 +254,7 @@ ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query sections: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make([]Section, 0)
 	for rows.Next() {
@@ -360,7 +360,7 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	if err != nil {
 		return nil, fmt.Errorf("run search query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	hits := make([]SearchHit, 0, query.Limit)
 	for rows.Next() {
@@ -422,7 +422,7 @@ func appendRecordQueryFilter(builder *strings.Builder, args *[]any, column strin
 	builder.WriteString(")")
 }
 
-func unmarshalMetadata(ref string, raw string) (map[string]string, error) {
+func unmarshalMetadata(ref, raw string) (map[string]string, error) {
 	if strings.TrimSpace(raw) == "" || raw == "{}" {
 		return map[string]string{}, nil
 	}
