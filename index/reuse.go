@@ -33,7 +33,7 @@ type recordReusePlan struct {
 	recordUnchanged    bool
 }
 
-func loadReuseStateContext(ctx context.Context, path string, embedderFingerprint string, embedderDimension int) *reuseState {
+func loadReuseStateContext(ctx context.Context, path, embedderFingerprint string, embedderDimension int) *reuseState {
 	empty := &reuseState{records: map[string]storedRecord{}}
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -54,7 +54,7 @@ func loadReuseStateContext(ctx context.Context, path string, embedderFingerprint
 	if err != nil {
 		return empty
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if !isCompatibleReuseSnapshot(ctx, db, embedderFingerprint, embedderDimension) {
 		return empty
@@ -88,7 +88,7 @@ func loadStoredReuseRecordsContext(ctx context.Context, db *sql.DB) (*reuseState
 	if err != nil {
 		return nil, fmt.Errorf("query stored records: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	state := &reuseState{records: make(map[string]storedRecord)}
 	for rows.Next() {
@@ -118,7 +118,7 @@ ORDER BY c.record_ref, c.chunk_index ASC, c.id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query stored chunks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var (

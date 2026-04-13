@@ -1,3 +1,4 @@
+// Package index orchestrates atomic Stroma index rebuilds and searches.
 package index
 
 import (
@@ -101,7 +102,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 	}
 	reuseState := loadReuseStateContext(ctx, options.ReuseFromPath, options.Embedder.Fingerprint(), dimension)
 
-	if err := os.MkdirAll(filepath.Dir(indexPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(indexPath), 0o750); err != nil {
 		return nil, fmt.Errorf("create index directory: %w", err)
 	}
 
@@ -135,7 +136,7 @@ ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_jso
 	if err != nil {
 		return nil, fmt.Errorf("prepare record insert: %w", err)
 	}
-	defer recordStmt.Close()
+	defer func() { _ = recordStmt.Close() }()
 
 	chunkStmt, err := tx.PrepareContext(ctx, `INSERT INTO chunks (
 record_ref, chunk_index, heading, content
@@ -143,13 +144,13 @@ record_ref, chunk_index, heading, content
 	if err != nil {
 		return nil, fmt.Errorf("prepare chunk insert: %w", err)
 	}
-	defer chunkStmt.Close()
+	defer func() { _ = chunkStmt.Close() }()
 
 	vectorStmt, err := tx.PrepareContext(ctx, `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`)
 	if err != nil {
 		return nil, fmt.Errorf("prepare vector insert: %w", err)
 	}
-	defer vectorStmt.Close()
+	defer func() { _ = vectorStmt.Close() }()
 
 	result := &BuildResult{
 		Path:                indexPath,
@@ -264,7 +265,7 @@ func ReadStats(ctx context.Context, path string) (*Stats, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer snapshot.Close()
+	defer func() { _ = snapshot.Close() }()
 	return snapshot.Stats(ctx)
 }
 
@@ -274,7 +275,7 @@ func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer snapshot.Close()
+	defer func() { _ = snapshot.Close() }()
 	return snapshot.Search(ctx, SnapshotSearchQuery{
 		Text:     query.Text,
 		Limit:    query.Limit,
@@ -395,7 +396,7 @@ func runIntegrityChecksContext(ctx context.Context, db *sql.DB) error {
 	if err := row.Scan(&result); err != nil {
 		return fmt.Errorf("run integrity_check: %w", err)
 	}
-	if strings.ToLower(result) != "ok" {
+	if !strings.EqualFold(result, "ok") {
 		return fmt.Errorf("integrity_check failed: %s", result)
 	}
 
@@ -403,7 +404,7 @@ func runIntegrityChecksContext(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("run foreign_key_check: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	if rows.Next() {
 		var table string
 		var rowID int
@@ -450,9 +451,9 @@ func ensureCompatibleEmbedder(ctx context.Context, db *sql.DB, embedder embed.Em
 	return nil
 }
 
-func buildSearchSQL(query SearchQuery, queryBlob []byte) (string, []any) {
+func buildSearchSQL(query SearchQuery, queryBlob []byte) (querySQL string, args []any) {
 	var builder strings.Builder
-	args := make([]any, 0, 4+len(query.Kinds))
+	args = make([]any, 0, 4+len(query.Kinds))
 
 	builder.WriteString(`
 WITH vector_hits AS (

@@ -1,6 +1,6 @@
 GO_FILES := $(shell find . -name '*.go' -not -path './.git/*' | sort)
 
-.PHONY: fmt fmt-check smoke-sqlite-vec test test-race vet analyze
+.PHONY: fmt fmt-check smoke-sqlite-vec test test-race vet analyze lint
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -23,3 +23,6 @@ vet:
 analyze:
 	staticcheck ./...
 	govulncheck ./...
+
+lint:
+	golangci-lint run ./...

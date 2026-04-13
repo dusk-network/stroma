@@ -1,3 +1,4 @@
+// Package corpus defines the neutral record unit that Stroma indexes.
 package corpus
 
 import (
@@ -89,12 +90,13 @@ func (r Record) Validate() error {
 
 // HashRecord returns a deterministic content hash for a normalized record.
 func HashRecord(r Record) string {
-	parts := []string{
-		"kind=" + strings.TrimSpace(r.Kind),
-		"title=" + strings.TrimSpace(r.Title),
-		"body_format=" + strings.TrimSpace(r.BodyFormat),
-		"body_text=" + strings.TrimSpace(r.BodyText),
-	}
+	parts := make([]string, 0, 4+len(r.Metadata))
+	parts = append(parts,
+		"kind="+strings.TrimSpace(r.Kind),
+		"title="+strings.TrimSpace(r.Title),
+		"body_format="+strings.TrimSpace(r.BodyFormat),
+		"body_text="+strings.TrimSpace(r.BodyText),
+	)
 	keys := make([]string, 0, len(r.Metadata))
 	for key := range r.Metadata {
 		keys = append(keys, key)

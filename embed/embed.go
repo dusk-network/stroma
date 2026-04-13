@@ -1,3 +1,4 @@
+// Package embed defines embedder interfaces and a deterministic test fixture.
 package embed
 
 import "context"

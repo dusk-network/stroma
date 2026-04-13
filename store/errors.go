@@ -1,3 +1,4 @@
+// Package store provides SQLite-backed storage primitives for Stroma indexes.
 package store
 
 import (

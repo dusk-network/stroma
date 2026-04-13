@@ -1,3 +1,4 @@
+// Package chunk splits text bodies into heading-aware sections for indexing.
 package chunk
 
 import "strings"
@@ -74,13 +75,12 @@ func Markdown(title, body string) []Section {
 	return sections
 }
 
-func parseHeading(line string) (int, string, bool) {
+func parseHeading(line string) (level int, text string, ok bool) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return 0, "", false
 	}
 
-	level := 0
 	for level < len(trimmed) && trimmed[level] == '#' {
 		level++
 	}
@@ -91,7 +91,7 @@ func parseHeading(line string) (int, string, bool) {
 		return 0, "", false
 	}
 
-	text := strings.TrimSpace(trimmed[level+1:])
+	text = strings.TrimSpace(trimmed[level+1:])
 	if text == "" {
 		return 0, "", false
 	}
