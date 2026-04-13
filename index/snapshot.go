@@ -422,14 +422,6 @@ func appendRecordQueryFilter(builder *strings.Builder, args *[]any, column strin
 	builder.WriteString(")")
 }
 
-func marshalMetadata(ref string, metadata map[string]string) (string, error) {
-	raw, err := json.Marshal(metadata)
-	if err != nil {
-		return "", fmt.Errorf("marshal record %s metadata: %w", ref, err)
-	}
-	return string(raw), nil
-}
-
 func unmarshalMetadata(ref string, raw string) (map[string]string, error) {
 	if strings.TrimSpace(raw) == "" || raw == "{}" {
 		return map[string]string{}, nil

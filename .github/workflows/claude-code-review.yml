@@ -9,6 +9,7 @@ env:
 
 jobs:
   claude-review:
+    if: ${{ vars.CLAUDE_CODE_REVIEW_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
