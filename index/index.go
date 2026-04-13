@@ -22,8 +22,9 @@ const schemaVersion = "1"
 
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
-	Path     string
-	Embedder embed.Embedder
+	Path          string
+	ReuseFromPath string
+	Embedder      embed.Embedder
 }
 
 // BuildResult summarizes a completed rebuild.
@@ -31,6 +32,9 @@ type BuildResult struct {
 	Path                string
 	RecordCount         int
 	ChunkCount          int
+	ReusedRecordCount   int
+	ReusedChunkCount    int
+	EmbeddedChunkCount  int
 	EmbedderDimension   int
 	EmbedderFingerprint string
 	ContentFingerprint  string
@@ -95,6 +99,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 	if dimension <= 0 {
 		return nil, fmt.Errorf("embedder dimension must be positive")
 	}
+	reuseState := loadReuseStateContext(ctx, options.ReuseFromPath, options.Embedder.Fingerprint(), dimension)
 
 	if err := os.MkdirAll(filepath.Dir(indexPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create index directory: %w", err)
@@ -159,28 +164,39 @@ record_ref, chunk_index, heading, content
 			return nil, err
 		}
 
-		sections := sectionsForRecord(record)
+		plan := planRecordReuse(record, storedRecordForReuse(reuseState, record.Ref))
+		sections := plan.sections
 		result.ChunkCount += len(sections)
+		result.ReusedChunkCount += plan.reusedChunkCount
+		result.EmbeddedChunkCount += plan.embeddedChunkCount
+		if plan.recordUnchanged {
+			result.ReusedRecordCount++
+		}
 		if len(sections) == 0 {
 			continue
 		}
 
 		texts := make([]string, 0, len(sections))
 		for _, section := range sections {
+			key := reuseChunkKey(record.Title, section.Heading, section.Body)
+			if _, ok := plan.reusedEmbeddings[key]; ok {
+				continue
+			}
 			texts = append(texts, textForEmbedding(record.Title, section))
 		}
-		vectors, err := options.Embedder.EmbedDocuments(ctx, texts)
-		if err != nil {
-			return nil, fmt.Errorf("embed record %s: %w", record.Ref, err)
-		}
-		if len(vectors) != len(sections) {
-			return nil, fmt.Errorf("embedder returned %d vectors for %d sections on %s", len(vectors), len(sections), record.Ref)
+		vectors := make([][]float64, 0, len(texts))
+		if len(texts) > 0 {
+			vectors, err = options.Embedder.EmbedDocuments(ctx, texts)
+			if err != nil {
+				return nil, fmt.Errorf("embed record %s: %w", record.Ref, err)
+			}
+			if len(vectors) != len(texts) {
+				return nil, fmt.Errorf("embedder returned %d vectors for %d new sections on %s", len(vectors), len(texts), record.Ref)
+			}
 		}
 
+		newVectorIndex := 0
 		for index, section := range sections {
-			if len(vectors[index]) != dimension {
-				return nil, fmt.Errorf("record %s section %d embedding has dimension %d, want %d", record.Ref, index, len(vectors[index]), dimension)
-			}
 			chunkResult, err := chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body)
 			if err != nil {
 				return nil, fmt.Errorf("insert record %s chunk %d: %w", record.Ref, index, err)
@@ -189,13 +205,27 @@ record_ref, chunk_index, heading, content
 			if err != nil {
 				return nil, fmt.Errorf("read chunk id for %s chunk %d: %w", record.Ref, index, err)
 			}
-			blob, err := store.EncodeVectorBlob(vectors[index])
+			key := reuseChunkKey(record.Title, section.Heading, section.Body)
+			if blob, ok := plan.reusedEmbeddings[key]; ok {
+				if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
+					return nil, fmt.Errorf("insert reused embedding for %s chunk %d: %w", record.Ref, index, err)
+				}
+				continue
+			}
+			if newVectorIndex >= len(vectors) {
+				return nil, fmt.Errorf("record %s chunk %d is missing a new embedding", record.Ref, index)
+			}
+			if len(vectors[newVectorIndex]) != dimension {
+				return nil, fmt.Errorf("record %s section %d embedding has dimension %d, want %d", record.Ref, index, len(vectors[newVectorIndex]), dimension)
+			}
+			blob, err := store.EncodeVectorBlob(vectors[newVectorIndex])
 			if err != nil {
 				return nil, fmt.Errorf("encode embedding for %s chunk %d: %w", record.Ref, index, err)
 			}
 			if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
 				return nil, fmt.Errorf("insert embedding for %s chunk %d: %w", record.Ref, index, err)
 			}
+			newVectorIndex++
 		}
 	}
 
@@ -230,154 +260,27 @@ record_ref, chunk_index, heading, content
 
 // ReadStats inspects an existing index.
 func ReadStats(ctx context.Context, path string) (*Stats, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	db, err := store.OpenReadOnlyContext(ctx, path)
+	snapshot, err := OpenSnapshot(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
-
-	stats := &Stats{
-		Path:       path,
-		KindCounts: map[string]int{},
-	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM records`).Scan(&stats.RecordCount); err != nil {
-		return nil, fmt.Errorf("count records: %w", err)
-	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&stats.ChunkCount); err != nil {
-		return nil, fmt.Errorf("count chunks: %w", err)
-	}
-
-	rows, err := db.QueryContext(ctx, `SELECT kind, COUNT(*) FROM records GROUP BY kind ORDER BY kind`)
-	if err != nil {
-		return nil, fmt.Errorf("count records by kind: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var kind string
-		var count int
-		if err := rows.Scan(&kind, &count); err != nil {
-			return nil, fmt.Errorf("scan kind count: %w", err)
-		}
-		stats.KindCounts[kind] = count
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate kind counts: %w", err)
-	}
-
-	stats.SchemaVersion, err = readMetadataValue(ctx, db, "schema_version")
-	if err != nil {
-		return nil, err
-	}
-	dimensionValue, err := readMetadataValue(ctx, db, "embedder_dimension")
-	if err != nil {
-		return nil, err
-	}
-	stats.EmbedderDimension, err = strconv.Atoi(dimensionValue)
-	if err != nil {
-		return nil, fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
-	}
-	stats.EmbedderFingerprint, err = readMetadataValue(ctx, db, "embedder_fingerprint")
-	if err != nil {
-		return nil, err
-	}
-	stats.ContentFingerprint, err = readMetadataValue(ctx, db, "content_fingerprint")
-	if err != nil {
-		return nil, err
-	}
-	stats.CreatedAt, err = readMetadataValue(ctx, db, "created_at")
-	if err != nil {
-		return nil, err
-	}
-	return stats, nil
+	defer snapshot.Close()
+	return snapshot.Stats(ctx)
 }
 
 // Search returns semantically close sections from an existing index.
 func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	query.Path = strings.TrimSpace(query.Path)
-	query.Text = strings.TrimSpace(query.Text)
-	if query.Path == "" {
-		return nil, fmt.Errorf("search path is required")
-	}
-	if query.Text == "" {
-		return nil, fmt.Errorf("search text is required")
-	}
-	if query.Embedder == nil {
-		return nil, fmt.Errorf("search embedder is required")
-	}
-	if query.Limit <= 0 {
-		query.Limit = 10
-	}
-
-	db, err := store.OpenReadOnlyContext(ctx, query.Path)
+	snapshot, err := OpenSnapshot(ctx, query.Path)
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
-
-	if err := ensureCompatibleEmbedder(ctx, db, query.Embedder); err != nil {
-		return nil, err
-	}
-
-	vectors, err := query.Embedder.EmbedQueries(ctx, []string{query.Text})
-	if err != nil {
-		return nil, fmt.Errorf("embed query: %w", err)
-	}
-	if len(vectors) != 1 {
-		return nil, fmt.Errorf("embedder returned %d query vectors, want 1", len(vectors))
-	}
-	queryBlob, err := store.EncodeVectorBlob(vectors[0])
-	if err != nil {
-		return nil, fmt.Errorf("encode query vector: %w", err)
-	}
-
-	sqlText, args := buildSearchSQL(query, queryBlob)
-	rows, err := db.QueryContext(ctx, sqlText, args...)
-	if err != nil {
-		return nil, fmt.Errorf("run search query: %w", err)
-	}
-	defer rows.Close()
-
-	hits := make([]SearchHit, 0, query.Limit)
-	for rows.Next() {
-		var (
-			hit          SearchHit
-			metadataJSON string
-			distance     float64
-		)
-		if err := rows.Scan(
-			&hit.ChunkID,
-			&hit.Ref,
-			&hit.Kind,
-			&hit.Title,
-			&hit.SourceRef,
-			&hit.Heading,
-			&hit.Content,
-			&metadataJSON,
-			&distance,
-		); err != nil {
-			return nil, fmt.Errorf("scan search hit: %w", err)
-		}
-		if strings.TrimSpace(metadataJSON) != "" && metadataJSON != "{}" {
-			if err := json.Unmarshal([]byte(metadataJSON), &hit.Metadata); err != nil {
-				return nil, fmt.Errorf("decode metadata for %s: %w", hit.Ref, err)
-			}
-		}
-		hit.Score = store.CosineScoreFromDistance(distance)
-		hits = append(hits, hit)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate search hits: %w", err)
-	}
-	if len(hits) > query.Limit {
-		hits = hits[:query.Limit]
-	}
-	return hits, nil
+	defer snapshot.Close()
+	return snapshot.Search(ctx, SnapshotSearchQuery{
+		Text:     query.Text,
+		Limit:    query.Limit,
+		Kinds:    query.Kinds,
+		Embedder: query.Embedder,
+	})
 }
 
 func normalizeRecords(records []corpus.Record) ([]corpus.Record, error) {

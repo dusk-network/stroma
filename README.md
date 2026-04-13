@@ -2,7 +2,7 @@
 
 Stroma is a neutral corpus and indexing substrate.
 
-It owns the lowest-level operations needed to ingest text artifacts, chunk them, embed them, persist them in SQLite plus `sqlite-vec`, and retrieve semantically close sections. It does not own governance, specifications, compliance, drift analysis, MCP, or CLI workflows.
+It owns the lowest-level operations needed to ingest text artifacts, chunk them, embed them, persist them in SQLite plus `sqlite-vec`, and retrieve semantically close sections. Callers consume Stroma through its APIs and treat the SQLite snapshot as an opaque local artifact. It does not own governance, specifications, compliance, drift analysis, MCP, or CLI workflows.
 
 ## Scope
 
@@ -27,7 +27,7 @@ Stroma is not for:
 - `chunk`: heading-aware Markdown chunking
 - `embed`: embedding interface and deterministic fixture embedder
 - `store`: SQLite readiness and vector blob helpers
-- `index`: index rebuild, stats, and semantic search
+- `index`: index rebuild with embedding reuse, opened snapshot readers, stats, and semantic search
 
 ## Example
 
