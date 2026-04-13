@@ -16,12 +16,15 @@ type Section struct {
 // Options controls how Markdown sections are split.
 type Options struct {
 	// MaxTokens is the approximate maximum number of tokens (words) per
-	// section. Sections exceeding this limit are split into sub-sections.
+	// section. Sections exceeding this limit are split into sub-sections
+	// unless OverlapTokens is an invalid value that disables splitting.
 	// Zero disables token-budget splitting.
 	MaxTokens int
 
 	// OverlapTokens is the approximate number of tokens to overlap between
 	// adjacent sub-sections when a section is split. Zero disables overlap.
+	// Values greater than or equal to MaxTokens are treated as invalid and
+	// leave oversized sections unsplit.
 	OverlapTokens int
 }
 
@@ -126,8 +129,9 @@ func joinHeadings(stack []heading) string {
 }
 
 // MarkdownWithOptions splits Markdown into heading-aware sections and then
-// applies token-budget splitting when sections exceed opts.MaxTokens.
-// Zero-value options produce the same output as Markdown.
+// applies token-budget splitting when sections exceed opts.MaxTokens, unless
+// opts.OverlapTokens is invalid for splitting. Zero-value options produce the
+// same output as Markdown.
 func MarkdownWithOptions(title, body string, opts Options) []Section {
 	sections := Markdown(title, body)
 	if opts.MaxTokens <= 0 {
@@ -189,9 +193,13 @@ func SplitSection(s Section, maxTokens, overlapTokens int) []Section {
 		}
 		lo := lineStart(s.Body, spans[start].start, minPos)
 		hi := spans[end-1].end
+		body := strings.TrimRightFunc(s.Body[lo:hi], unicode.IsSpace)
+		if start > 0 && lo == minPos {
+			body = strings.TrimLeftFunc(body, unicode.IsSpace)
+		}
 		result = append(result, Section{
 			Heading: s.Heading,
-			Body:    strings.TrimSpace(s.Body[lo:hi]),
+			Body:    body,
 		})
 		if end == len(spans) {
 			break

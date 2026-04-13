@@ -26,6 +26,21 @@ type BuildOptions struct {
 	Path          string
 	ReuseFromPath string
 	Embedder      embed.Embedder
+
+	// MaxChunkTokens sets the approximate maximum number of tokens (words)
+	// per chunk. Sections that exceed this limit are split into smaller
+	// sub-sections. Zero disables token-budget splitting.
+	MaxChunkTokens int
+
+	// ChunkOverlapTokens sets the approximate number of overlapping tokens
+	// between adjacent sub-sections when a section is split. Zero disables
+	// overlap.
+	ChunkOverlapTokens int
+
+	// Quantization controls the vector storage format. Supported values
+	// are "float32" (default) and "int8". Int8 reduces storage by 4x at
+	// the cost of minor precision loss.
+	Quantization string
 }
 
 // BuildResult summarizes a completed rebuild.
@@ -100,7 +115,11 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 	if dimension <= 0 {
 		return nil, fmt.Errorf("embedder dimension must be positive")
 	}
-	reuseState := loadReuseStateContext(ctx, options.ReuseFromPath, options.Embedder.Fingerprint(), dimension)
+	quantization, err := normalizeQuantization(options.Quantization)
+	if err != nil {
+		return nil, err
+	}
+	reuseState := loadReuseStateContext(ctx, options.ReuseFromPath, options.Embedder.Fingerprint(), dimension, quantization)
 
 	if err := os.MkdirAll(filepath.Dir(indexPath), 0o750); err != nil {
 		return nil, fmt.Errorf("create index directory: %w", err)
@@ -118,7 +137,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 		_ = os.Remove(tmpPath)
 	}()
 
-	if err := createSchemaContext(ctx, db, dimension); err != nil {
+	if err := createSchemaContext(ctx, db, dimension, quantization); err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
@@ -146,11 +165,26 @@ record_ref, chunk_index, heading, content
 	}
 	defer func() { _ = chunkStmt.Close() }()
 
-	vectorStmt, err := tx.PrepareContext(ctx, `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`)
+	vectorInsertSQL := `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`
+	if quantization == store.QuantizationInt8 {
+		vectorInsertSQL = `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_int8(?))`
+	}
+	vectorStmt, err := tx.PrepareContext(ctx, vectorInsertSQL)
 	if err != nil {
 		return nil, fmt.Errorf("prepare vector insert: %w", err)
 	}
 	defer func() { _ = vectorStmt.Close() }()
+
+	ftsStmt, err := tx.PrepareContext(ctx, `INSERT INTO fts_chunks(rowid, title, heading, content) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return nil, fmt.Errorf("prepare fts insert: %w", err)
+	}
+	defer func() { _ = ftsStmt.Close() }()
+
+	chunkOpts := chunk.Options{
+		MaxTokens:     options.MaxChunkTokens,
+		OverlapTokens: options.ChunkOverlapTokens,
+	}
 
 	result := &BuildResult{
 		Path:                indexPath,
@@ -165,7 +199,7 @@ record_ref, chunk_index, heading, content
 			return nil, err
 		}
 
-		plan := planRecordReuse(record, storedRecordForReuse(reuseState, record.Ref))
+		plan := planRecordReuse(record, storedRecordForReuse(reuseState, record.Ref), chunkOpts)
 		sections := plan.sections
 		result.ChunkCount += len(sections)
 		result.ReusedChunkCount += plan.reusedChunkCount
@@ -196,37 +230,8 @@ record_ref, chunk_index, heading, content
 			}
 		}
 
-		newVectorIndex := 0
-		for index, section := range sections {
-			chunkResult, err := chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body)
-			if err != nil {
-				return nil, fmt.Errorf("insert record %s chunk %d: %w", record.Ref, index, err)
-			}
-			chunkID, err := chunkResult.LastInsertId()
-			if err != nil {
-				return nil, fmt.Errorf("read chunk id for %s chunk %d: %w", record.Ref, index, err)
-			}
-			key := reuseChunkKey(record.Title, section.Heading, section.Body)
-			if blob, ok := plan.reusedEmbeddings[key]; ok {
-				if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
-					return nil, fmt.Errorf("insert reused embedding for %s chunk %d: %w", record.Ref, index, err)
-				}
-				continue
-			}
-			if newVectorIndex >= len(vectors) {
-				return nil, fmt.Errorf("record %s chunk %d is missing a new embedding", record.Ref, index)
-			}
-			if len(vectors[newVectorIndex]) != dimension {
-				return nil, fmt.Errorf("record %s section %d embedding has dimension %d, want %d", record.Ref, index, len(vectors[newVectorIndex]), dimension)
-			}
-			blob, err := store.EncodeVectorBlob(vectors[newVectorIndex])
-			if err != nil {
-				return nil, fmt.Errorf("encode embedding for %s chunk %d: %w", record.Ref, index, err)
-			}
-			if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
-				return nil, fmt.Errorf("insert embedding for %s chunk %d: %w", record.Ref, index, err)
-			}
-			newVectorIndex++
+		if err := insertChunksContext(ctx, record, plan, sections, vectors, dimension, quantization, chunkStmt, ftsStmt, vectorStmt); err != nil {
+			return nil, err
 		}
 	}
 
@@ -236,6 +241,7 @@ record_ref, chunk_index, heading, content
 		"embedder_dimension":   strconv.Itoa(dimension),
 		"embedder_fingerprint": result.EmbedderFingerprint,
 		"content_fingerprint":  result.ContentFingerprint,
+		"quantization":         quantization,
 		"created_at":           createdAt,
 	}
 	for key, value := range metadata {
@@ -299,7 +305,12 @@ func normalizeRecords(records []corpus.Record) ([]corpus.Record, error) {
 	return normalized, nil
 }
 
-func createSchemaContext(ctx context.Context, db *sql.DB, dimension int) error {
+func createSchemaContext(ctx context.Context, db *sql.DB, dimension int, quantization string) error {
+	vecType := fmt.Sprintf("float[%d]", dimension)
+	if quantization == store.QuantizationInt8 {
+		vecType = fmt.Sprintf("int8[%d]", dimension)
+	}
+
 	statements := []string{
 		`CREATE TABLE records (
 			ref           TEXT PRIMARY KEY,
@@ -321,12 +332,13 @@ func createSchemaContext(ctx context.Context, db *sql.DB, dimension int) error {
 		)`,
 		fmt.Sprintf(`CREATE VIRTUAL TABLE chunks_vec USING vec0(
 			chunk_id INTEGER PRIMARY KEY,
-			embedding float[%d] distance_metric=cosine
-		)`, dimension),
+			embedding %s distance_metric=cosine
+		)`, vecType),
 		`CREATE TABLE metadata (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+		`CREATE VIRTUAL TABLE fts_chunks USING fts5(title, heading, content)`,
 		`CREATE INDEX idx_records_kind ON records(kind)`,
 		`CREATE INDEX idx_chunks_record_ref ON chunks(record_ref)`,
 	}
@@ -360,18 +372,77 @@ func insertRecordContext(ctx context.Context, stmt *sql.Stmt, record corpus.Reco
 	return nil
 }
 
-func sectionsForRecord(record corpus.Record) []chunk.Section {
+func insertChunksContext(
+	ctx context.Context,
+	record corpus.Record,
+	plan recordReusePlan,
+	sections []chunk.Section,
+	vectors [][]float64,
+	dimension int,
+	quantization string,
+	chunkStmt, ftsStmt, vectorStmt *sql.Stmt,
+) error {
+	newVectorIndex := 0
+	for index, section := range sections {
+		chunkResult, err := chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body)
+		if err != nil {
+			return fmt.Errorf("insert record %s chunk %d: %w", record.Ref, index, err)
+		}
+		chunkID, err := chunkResult.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("read chunk id for %s chunk %d: %w", record.Ref, index, err)
+		}
+		if _, err := ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, section.Body); err != nil {
+			return fmt.Errorf("insert fts for %s chunk %d: %w", record.Ref, index, err)
+		}
+		key := reuseChunkKey(record.Title, section.Heading, section.Body)
+		if blob, ok := plan.reusedEmbeddings[key]; ok {
+			if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
+				return fmt.Errorf("insert reused embedding for %s chunk %d: %w", record.Ref, index, err)
+			}
+			continue
+		}
+		if newVectorIndex >= len(vectors) {
+			return fmt.Errorf("record %s chunk %d is missing a new embedding", record.Ref, index)
+		}
+		if len(vectors[newVectorIndex]) != dimension {
+			return fmt.Errorf("record %s section %d embedding has dimension %d, want %d", record.Ref, index, len(vectors[newVectorIndex]), dimension)
+		}
+		blob, err := encodeVector(vectors[newVectorIndex], quantization)
+		if err != nil {
+			return fmt.Errorf("encode embedding for %s chunk %d: %w", record.Ref, index, err)
+		}
+		if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
+			return fmt.Errorf("insert embedding for %s chunk %d: %w", record.Ref, index, err)
+		}
+		newVectorIndex++
+	}
+	return nil
+}
+
+func sectionsForRecord(record corpus.Record, opts chunk.Options) []chunk.Section {
 	switch record.BodyFormat {
 	case corpus.FormatPlaintext:
 		text := strings.TrimSpace(record.BodyText)
 		if text == "" {
 			return nil
 		}
-		return []chunk.Section{{
+		sections := []chunk.Section{{
 			Heading: record.Title,
 			Body:    text,
 		}}
+		if opts.MaxTokens > 0 {
+			var result []chunk.Section
+			for _, s := range sections {
+				result = append(result, chunk.SplitSection(s, opts.MaxTokens, opts.OverlapTokens)...)
+			}
+			return result
+		}
+		return sections
 	default:
+		if opts.MaxTokens > 0 {
+			return chunk.MarkdownWithOptions(record.Title, record.BodyText, opts)
+		}
 		return chunk.Markdown(record.Title, record.BodyText)
 	}
 }
@@ -439,6 +510,15 @@ func readMetadataValue(ctx context.Context, db *sql.DB, key string) (string, err
 	return value, nil
 }
 
+//nolint:unparam // key will vary as more metadata fields are added
+func readMetadataValueDefault(ctx context.Context, db *sql.DB, key, defaultValue string) string {
+	value, err := readMetadataValue(ctx, db, key)
+	if err != nil {
+		return defaultValue
+	}
+	return value
+}
+
 func ensureCompatibleEmbedder(ctx context.Context, db *sql.DB, embedder embed.Embedder) error {
 	indexFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
 	if err != nil {
@@ -451,15 +531,20 @@ func ensureCompatibleEmbedder(ctx context.Context, db *sql.DB, embedder embed.Em
 	return nil
 }
 
-func buildSearchSQL(query SearchQuery, queryBlob []byte) (querySQL string, args []any) {
+func buildSearchSQL(query SearchQuery, queryBlob []byte, quantization string) (querySQL string, args []any) {
 	var builder strings.Builder
 	args = make([]any, 0, 4+len(query.Kinds))
 
-	builder.WriteString(`
+	matchExpr := "?"
+	if quantization == store.QuantizationInt8 {
+		matchExpr = "vec_int8(?)"
+	}
+
+	builder.WriteString(fmt.Sprintf(`
 WITH vector_hits AS (
   SELECT chunk_id, distance
   FROM chunks_vec
-  WHERE embedding MATCH ? AND k = ?
+  WHERE embedding MATCH %s AND k = ?
   ORDER BY distance
 )
 SELECT
@@ -475,8 +560,8 @@ SELECT
 FROM vector_hits vh
 JOIN chunks c ON c.id = vh.chunk_id
 JOIN records r ON r.ref = c.record_ref
-WHERE 1 = 1`)
-	args = append(args, queryBlob, candidateLimit(query.Limit))
+WHERE 1 = 1`, matchExpr))
+	args = append(args, queryBlob, query.Limit)
 
 	if len(query.Kinds) > 0 {
 		builder.WriteString(" AND r.kind IN (")
@@ -493,7 +578,7 @@ WHERE 1 = 1`)
 	builder.WriteString(`
 ORDER BY vh.distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
-	args = append(args, candidateLimit(query.Limit))
+	args = append(args, query.Limit)
 	return builder.String(), args
 }
 
@@ -507,4 +592,30 @@ func candidateLimit(limit int) int {
 	default:
 		return overfetch
 	}
+}
+
+func normalizeQuantization(q string) (string, error) {
+	q = strings.TrimSpace(strings.ToLower(q))
+	switch q {
+	case "", store.QuantizationFloat32:
+		return store.QuantizationFloat32, nil
+	case store.QuantizationInt8:
+		return store.QuantizationInt8, nil
+	default:
+		return "", fmt.Errorf("unsupported quantization mode %q (must be %q or %q)", q, store.QuantizationFloat32, store.QuantizationInt8)
+	}
+}
+
+func encodeVector(vector []float64, quantization string) ([]byte, error) {
+	if quantization == store.QuantizationInt8 {
+		return store.EncodeVectorBlobInt8(vector)
+	}
+	return store.EncodeVectorBlob(vector)
+}
+
+func decodeVector(blob []byte, quantization string) ([]float64, error) {
+	if quantization == store.QuantizationInt8 {
+		return store.DecodeVectorBlobInt8(blob)
+	}
+	return store.DecodeVectorBlob(blob)
 }

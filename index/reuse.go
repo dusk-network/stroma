@@ -33,7 +33,7 @@ type recordReusePlan struct {
 	recordUnchanged    bool
 }
 
-func loadReuseStateContext(ctx context.Context, path, embedderFingerprint string, embedderDimension int) *reuseState {
+func loadReuseStateContext(ctx context.Context, path, embedderFingerprint string, embedderDimension int, quantization string) *reuseState {
 	empty := &reuseState{records: map[string]storedRecord{}}
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -56,7 +56,7 @@ func loadReuseStateContext(ctx context.Context, path, embedderFingerprint string
 	}
 	defer func() { _ = db.Close() }()
 
-	if !isCompatibleReuseSnapshot(ctx, db, embedderFingerprint, embedderDimension) {
+	if !isCompatibleReuseSnapshot(ctx, db, embedderFingerprint, embedderDimension, quantization) {
 		return empty
 	}
 
@@ -67,7 +67,7 @@ func loadReuseStateContext(ctx context.Context, path, embedderFingerprint string
 	return state
 }
 
-func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int) bool {
+func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int, quantization string) bool {
 	schema, err := readMetadataValue(ctx, db, "schema_version")
 	if err != nil || strings.TrimSpace(schema) != schemaVersion {
 		return false
@@ -78,6 +78,12 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	}
 	storedDimension, err := readMetadataValue(ctx, db, "embedder_dimension")
 	if err != nil || strings.TrimSpace(storedDimension) != strconv.Itoa(embedderDimension) {
+		return false
+	}
+	storedQuantization := readMetadataValueDefault(ctx, db, "quantization", store.QuantizationFloat32)
+	normStored, err1 := normalizeQuantization(storedQuantization)
+	normTarget, err2 := normalizeQuantization(quantization)
+	if err1 != nil || err2 != nil || normStored != normTarget {
 		return false
 	}
 	return true
@@ -144,8 +150,8 @@ ORDER BY c.record_ref, c.chunk_index ASC, c.id ASC`)
 	return state, nil
 }
 
-func planRecordReuse(record corpus.Record, stored storedRecord) recordReusePlan {
-	sections := sectionsForRecord(record)
+func planRecordReuse(record corpus.Record, stored storedRecord, chunkOpts chunk.Options) recordReusePlan {
+	sections := sectionsForRecord(record, chunkOpts)
 	plan := recordReusePlan{
 		sections:         sections,
 		reusedEmbeddings: make(map[string][]byte),
