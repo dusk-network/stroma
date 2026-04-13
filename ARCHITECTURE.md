@@ -10,7 +10,7 @@ Its job is narrow:
 2. chunk record bodies into retrievable sections
 3. delegate vector generation to an embedder
 4. persist records, chunks, vectors, and index metadata in SQLite
-5. retrieve semantically close sections by query embedding
+5. open immutable local snapshots for typed reads and semantic search
 
 Everything above that line belongs elsewhere.
 
@@ -55,8 +55,9 @@ Stroma does not own:
 
 - `index`
   - rebuilds an index atomically
+  - reuses unchanged embeddings from a compatible previous snapshot when available
   - persists index metadata such as schema version and embedder fingerprint
-  - exposes stats and semantic search
+  - exposes opened snapshots, stats, section/record readers, and semantic search
 
 ## On-Disk Schema
 
@@ -71,7 +72,7 @@ The current schema is intentionally small:
 - `metadata`
   - schema version, embedder fingerprint, embedder dimension, content fingerprint, creation time
 
-The schema is product-neutral. There are no spec/document distinctions, no governance edges, and no transport-specific tables.
+The schema is product-neutral. There are no spec/document distinctions, no governance edges, and no transport-specific tables. Higher-order products should treat the snapshot as a Stroma-owned artifact and go through the library API instead of joining these tables directly.
 
 ## Extraction Principle
 
