@@ -7,6 +7,7 @@ import (
 
 	"github.com/dusk-network/stroma/corpus"
 	"github.com/dusk-network/stroma/embed"
+	"github.com/dusk-network/stroma/store"
 )
 
 func TestRebuildAndReadStats(t *testing.T) {
@@ -414,7 +415,10 @@ func TestRebuildInt8PreservesTopHitQuality(t *testing.T) {
 	}
 	defer func() { _ = int8Snapshot.Close() }()
 
-	gotQuantization := readMetadataValueDefault(context.Background(), int8Snapshot.db, "quantization", "")
+	gotQuantization, err := readMetadataValueOptional(context.Background(), int8Snapshot.db, "quantization", "")
+	if err != nil {
+		t.Fatalf("readMetadataValueOptional(quantization) error = %v", err)
+	}
 	if gotQuantization != "int8" {
 		t.Fatalf("quantization metadata = %q, want int8", gotQuantization)
 	}
@@ -508,6 +512,65 @@ func TestSearchFTSRequiresAllTokens(t *testing.T) {
 	}
 	if hits[0].Ref != "exact-match" {
 		t.Fatalf("first hit ref = %q, want exact-match (AND semantics should prevent partial-token boost)", hits[0].Ref)
+	}
+}
+
+func TestMergeRRFUsesFusedScores(t *testing.T) {
+	t.Parallel()
+
+	hits := mergeRRF(
+		[]SearchHit{{ChunkID: 1, Ref: "vector-only", Score: 0.8}, {ChunkID: 2, Ref: "shared", Score: 0.7}},
+		[]SearchHit{{ChunkID: 2, Ref: "shared", Score: -0.2}, {ChunkID: 3, Ref: "fts-only", Score: -0.1}},
+		3,
+	)
+	if len(hits) != 3 {
+		t.Fatalf("len(mergeRRF) = %d, want 3", len(hits))
+	}
+	for _, hit := range hits {
+		if hit.Score <= 0 {
+			t.Fatalf("hit %q has non-positive fused score %f", hit.Ref, hit.Score)
+		}
+	}
+	if hits[0].Ref != "shared" {
+		t.Fatalf("top fused hit = %q, want shared", hits[0].Ref)
+	}
+}
+
+func TestReadMetadataValueOptionalPropagatesNonMissingErrors(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "artifact",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "Burst handling lives here.",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = readMetadataValueOptional(canceledCtx, snapshot.db, "quantization", store.QuantizationFloat32)
+	if err == nil {
+		t.Fatal("readMetadataValueOptional() error = nil, want propagated context error")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,7 +20,7 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
-const schemaVersion = "1"
+const schemaVersion = "2"
 
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
@@ -511,12 +512,16 @@ func readMetadataValue(ctx context.Context, db *sql.DB, key string) (string, err
 }
 
 //nolint:unparam // key will vary as more metadata fields are added
-func readMetadataValueDefault(ctx context.Context, db *sql.DB, key, defaultValue string) string {
+func readMetadataValueOptional(ctx context.Context, db *sql.DB, key, defaultValue string) (string, error) {
 	value, err := readMetadataValue(ctx, db, key)
-	if err != nil {
-		return defaultValue
+	switch {
+	case err == nil:
+		return value, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return defaultValue, nil
+	default:
+		return "", err
 	}
-	return value
 }
 
 func ensureCompatibleEmbedder(ctx context.Context, db *sql.DB, embedder embed.Embedder) error {

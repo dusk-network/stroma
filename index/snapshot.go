@@ -223,7 +223,11 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 
 	quantization := store.QuantizationFloat32
 	if query.IncludeEmbeddings {
-		quantization = readMetadataValueDefault(ctx, s.db, "quantization", store.QuantizationFloat32)
+		var err error
+		quantization, err = readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var builder strings.Builder
@@ -325,7 +329,10 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 		return nil, err
 	}
 
-	quantization := readMetadataValueDefault(ctx, s.db, "quantization", store.QuantizationFloat32)
+	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return nil, err
+	}
 	vectors, err := query.Embedder.EmbedQueries(ctx, []string{query.Text})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -371,7 +378,10 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 		query.Limit = 10
 	}
 
-	quantization := readMetadataValueDefault(ctx, s.db, "quantization", store.QuantizationFloat32)
+	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return nil, err
+	}
 	hits, err := s.searchVectorCandidates(ctx, query.Embedding, candidateLimit(query.Limit), query.Kinds, quantization)
 	if err != nil {
 		return nil, err
@@ -467,7 +477,7 @@ LIMIT ?`)
 	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {
 		// FTS table does not exist in indexes built before hybrid search.
-		if strings.Contains(err.Error(), "no such table") {
+		if strings.Contains(err.Error(), "no such table: fts_chunks") {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("fts query: %w", err)

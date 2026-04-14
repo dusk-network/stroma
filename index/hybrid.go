@@ -9,16 +9,16 @@ import (
 const rrfK = 60
 
 // mergeRRF combines vector and FTS search hits using reciprocal rank fusion.
-// The returned hits preserve cosine-based Score (0–1) for vector hits and use
-// Score=0 for FTS-only hits that had no vector match.
+// The returned hits use the fused RRF score so callers can compare scores
+// across vector-only, FTS-only, and blended results.
 //
 // Ties are broken by source count (hits found by both retrieval paths beat
 // single-source hits) and then by best rank across sources, so FTS-only exact
 // matches are not buried by vector-only hits at the same RRF score.
 func mergeRRF(vectorHits, ftsHits []SearchHit, limit int) []SearchHit {
 	rrfScores := make(map[int64]float64)
-	sources := make(map[int64]int)    // number of retrieval paths that found this hit
-	bestRank := make(map[int64]int)   // best (lowest) rank across sources
+	sources := make(map[int64]int)  // number of retrieval paths that found this hit
+	bestRank := make(map[int64]int) // best (lowest) rank across sources
 	hitMap := make(map[int64]SearchHit)
 
 	for rank, hit := range vectorHits {
@@ -34,9 +34,6 @@ func mergeRRF(vectorHits, ftsHits []SearchHit, limit int) []SearchHit {
 			bestRank[hit.ChunkID] = rank
 		}
 		if _, ok := hitMap[hit.ChunkID]; !ok {
-			// FTS-only hit — zero out the Score so callers never see a
-			// negative BM25 rank masquerading as a cosine similarity.
-			hit.Score = 0
 			hitMap[hit.ChunkID] = hit
 		}
 	}
@@ -68,7 +65,9 @@ func mergeRRF(vectorHits, ftsHits []SearchHit, limit int) []SearchHit {
 
 	result := make([]SearchHit, 0, len(ranked))
 	for _, s := range ranked {
-		result = append(result, hitMap[s.id])
+		hit := hitMap[s.id]
+		hit.Score = s.rrfScore
+		result = append(result, hit)
 	}
 	return result
 }

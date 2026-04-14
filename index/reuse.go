@@ -80,7 +80,10 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	if err != nil || strings.TrimSpace(storedDimension) != strconv.Itoa(embedderDimension) {
 		return false
 	}
-	storedQuantization := readMetadataValueDefault(ctx, db, "quantization", store.QuantizationFloat32)
+	storedQuantization, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return false
+	}
 	normStored, err1 := normalizeQuantization(storedQuantization)
 	normTarget, err2 := normalizeQuantization(quantization)
 	if err1 != nil || err2 != nil || normStored != normTarget {
