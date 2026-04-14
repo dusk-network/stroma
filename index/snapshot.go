@@ -221,6 +221,15 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 		ctx = context.Background()
 	}
 
+	quantization := store.QuantizationFloat32
+	if query.IncludeEmbeddings {
+		var err error
+		quantization, err = readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var builder strings.Builder
 	args := make([]any, 0, len(query.Refs)+len(query.Kinds))
 	builder.WriteString(`
@@ -284,7 +293,7 @@ ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
 			return nil, err
 		}
 		if query.IncludeEmbeddings {
-			section.Embedding, err = store.DecodeVectorBlob(blob)
+			section.Embedding, err = decodeVector(blob, quantization)
 			if err != nil {
 				return nil, fmt.Errorf("decode section embedding for %s: %w", section.Ref, err)
 			}
@@ -297,7 +306,7 @@ ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
 	return result, nil
 }
 
-// Search runs a text search against the opened snapshot.
+// Search runs a hybrid text search (vector + FTS5) against the opened snapshot.
 func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]SearchHit, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("snapshot is not open")
@@ -319,6 +328,11 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	if err := ensureCompatibleEmbedder(ctx, s.db, query.Embedder); err != nil {
 		return nil, err
 	}
+
+	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return nil, err
+	}
 	vectors, err := query.Embedder.EmbedQueries(ctx, []string{query.Text})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -326,11 +340,27 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	if len(vectors) != 1 {
 		return nil, fmt.Errorf("embedder returned %d query vectors, want 1", len(vectors))
 	}
-	return s.SearchVector(ctx, VectorSearchQuery{
-		Embedding: vectors[0],
-		Limit:     query.Limit,
-		Kinds:     query.Kinds,
-	})
+
+	candidateCount := candidateLimit(query.Limit)
+
+	vectorHits, err := s.searchVectorCandidates(ctx, vectors[0], candidateCount, query.Kinds, quantization)
+	if err != nil {
+		return nil, err
+	}
+
+	ftsHits, ftsErr := s.searchFTS(ctx, query.Text, candidateCount, query.Kinds)
+	if ftsErr != nil {
+		return nil, fmt.Errorf("fts search: %w", ftsErr)
+	}
+
+	if len(ftsHits) == 0 {
+		if len(vectorHits) > query.Limit {
+			vectorHits = vectorHits[:query.Limit]
+		}
+		return vectorHits, nil
+	}
+
+	return mergeRRF(vectorHits, ftsHits, query.Limit), nil
 }
 
 // SearchVector runs a vector search against the opened snapshot.
@@ -348,21 +378,36 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 		query.Limit = 10
 	}
 
-	queryBlob, err := store.EncodeVectorBlob(query.Embedding)
+	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return nil, err
+	}
+	hits, err := s.searchVectorCandidates(ctx, query.Embedding, candidateLimit(query.Limit), query.Kinds, quantization)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) > query.Limit {
+		hits = hits[:query.Limit]
+	}
+	return hits, nil
+}
+
+func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float64, limit int, kinds []string, quantization string) ([]SearchHit, error) {
+	queryBlob, err := encodeVector(embedding, quantization)
 	if err != nil {
 		return nil, fmt.Errorf("encode query vector: %w", err)
 	}
 	sqlText, args := buildSearchSQL(SearchQuery{
-		Limit: query.Limit,
-		Kinds: query.Kinds,
-	}, queryBlob)
+		Limit: limit,
+		Kinds: kinds,
+	}, queryBlob, quantization)
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("run search query: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	hits := make([]SearchHit, 0, query.Limit)
+	hits := make([]SearchHit, 0, limit)
 	for rows.Next() {
 		var (
 			hit          SearchHit
@@ -392,8 +437,75 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate search hits: %w", err)
 	}
-	if len(hits) > query.Limit {
-		hits = hits[:query.Limit]
+	return hits, nil
+}
+
+func (s *Snapshot) searchFTS(ctx context.Context, text string, limit int, kinds []string) ([]SearchHit, error) {
+	ftsQuery := sanitizeFTSQuery(text)
+	if ftsQuery == "" {
+		return nil, nil
+	}
+
+	var builder strings.Builder
+	args := make([]any, 0, 2+len(kinds))
+
+	builder.WriteString(`
+SELECT c.id, r.ref, r.kind, r.title, r.source_ref, c.heading, c.content, r.metadata_json, fts.rank
+FROM fts_chunks fts
+JOIN chunks c ON c.id = fts.rowid
+JOIN records r ON r.ref = c.record_ref
+WHERE fts_chunks MATCH ?`)
+	args = append(args, ftsQuery)
+
+	if len(kinds) > 0 {
+		builder.WriteString(" AND r.kind IN (")
+		for i, kind := range kinds {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString("?")
+			args = append(args, strings.TrimSpace(kind))
+		}
+		builder.WriteString(")")
+	}
+
+	builder.WriteString(`
+ORDER BY fts.rank, c.id ASC
+LIMIT ?`)
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+	if err != nil {
+		// FTS table does not exist in indexes built before hybrid search.
+		if strings.Contains(err.Error(), "no such table: fts_chunks") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("fts query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var hits []SearchHit
+	for rows.Next() {
+		var (
+			hit          SearchHit
+			metadataJSON string
+			ftsRank      float64
+		)
+		if err := rows.Scan(
+			&hit.ChunkID, &hit.Ref, &hit.Kind, &hit.Title, &hit.SourceRef,
+			&hit.Heading, &hit.Content, &metadataJSON, &ftsRank,
+		); err != nil {
+			return nil, fmt.Errorf("scan fts hit: %w", err)
+		}
+		hit.Metadata, err = unmarshalMetadata(hit.Ref, metadataJSON)
+		if err != nil {
+			return nil, err
+		}
+		hit.Score = -ftsRank
+		hits = append(hits, hit)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate fts hits: %w", err)
 	}
 	return hits, nil
 }

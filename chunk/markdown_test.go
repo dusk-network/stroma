@@ -251,3 +251,17 @@ func TestSplitSectionPreservesWhitespace(t *testing.T) {
 		t.Fatalf("first chunk lost paragraph structure: %q", result[0].Body)
 	}
 }
+
+func TestSplitSectionPreservesIndentedContinuationChunk(t *testing.T) {
+	t.Parallel()
+
+	body := "one two\n\n    indented code block line"
+	s := Section{Heading: "H", Body: body}
+	result := SplitSection(s, 2, 0)
+	if len(result) < 2 {
+		t.Fatalf("expected at least 2 chunks, got %d", len(result))
+	}
+	if !strings.HasPrefix(result[1].Body, "    indented") {
+		t.Fatalf("continuation chunk lost indentation: %q", result[1].Body)
+	}
+}
