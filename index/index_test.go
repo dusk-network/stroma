@@ -3,9 +3,11 @@ package index
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/dusk-network/stroma/chunk"
 	"github.com/dusk-network/stroma/corpus"
 	"github.com/dusk-network/stroma/embed"
 	"github.com/dusk-network/stroma/store"
@@ -36,6 +38,48 @@ type errorReranker struct {
 
 func (r errorReranker) Rerank(context.Context, string, []SearchHit) ([]SearchHit, error) {
 	return nil, r.err
+}
+
+type contextualOnlyEmbedder struct {
+	fixture         *embed.Fixture
+	contextualCalls int
+	documentCalls   int
+	seenFullDocs    []string
+	seenChunks      [][]string
+}
+
+func newContextualOnlyEmbedder(t *testing.T) *contextualOnlyEmbedder {
+	t.Helper()
+
+	fixture, err := embed.NewFixture("fixture-contextual", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	return &contextualOnlyEmbedder{fixture: fixture}
+}
+
+func (e *contextualOnlyEmbedder) Fingerprint() string {
+	return "contextual|" + e.fixture.Fingerprint()
+}
+
+func (e *contextualOnlyEmbedder) Dimension(ctx context.Context) (int, error) {
+	return e.fixture.Dimension(ctx)
+}
+
+func (e *contextualOnlyEmbedder) EmbedDocuments(context.Context, []string) ([][]float64, error) {
+	e.documentCalls++
+	return nil, errors.New("EmbedDocuments should not be called when ContextualEmbedder is available")
+}
+
+func (e *contextualOnlyEmbedder) EmbedQueries(ctx context.Context, texts []string) ([][]float64, error) {
+	return e.fixture.EmbedQueries(ctx, texts)
+}
+
+func (e *contextualOnlyEmbedder) EmbedDocumentChunks(ctx context.Context, fullDoc string, chunks []string) ([][]float64, error) {
+	e.contextualCalls++
+	e.seenFullDocs = append(e.seenFullDocs, fullDoc)
+	e.seenChunks = append(e.seenChunks, append([]string(nil), chunks...))
+	return e.fixture.EmbedDocuments(ctx, chunks)
 }
 
 func TestRebuildAndReadStats(t *testing.T) {
@@ -202,6 +246,57 @@ func TestSearchHybridBoostsExactMatch(t *testing.T) {
 	}
 	if hits[0].Ref != "error-codes" {
 		t.Fatalf("first hit ref = %q, want error-codes (exact match via FTS)", hits[0].Ref)
+	}
+}
+
+func TestRebuildUsesContextualEmbedderWhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	embedder := newContextualOnlyEmbedder(t)
+
+	path := t.TempDir() + "/stroma.db"
+	record := corpus.Record{
+		Ref:        "long-note",
+		Kind:       "note",
+		Title:      "Long Note",
+		SourceRef:  "file://docs/long-note.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima",
+	}
+	buildOpts := BuildOptions{
+		Path:           path,
+		Embedder:       embedder,
+		MaxChunkTokens: 4,
+	}
+
+	result, err := Rebuild(context.Background(), []corpus.Record{record}, buildOpts)
+	if err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	sections := sectionsForRecord(record, chunk.Options{
+		MaxTokens:     buildOpts.MaxChunkTokens,
+		OverlapTokens: buildOpts.ChunkOverlapTokens,
+	})
+	wantChunks := make([]string, 0, len(sections))
+	for _, section := range sections {
+		wantChunks = append(wantChunks, textForEmbedding(record.Title, section))
+	}
+
+	if result.EmbeddedChunkCount != len(wantChunks) {
+		t.Fatalf("EmbeddedChunkCount = %d, want %d", result.EmbeddedChunkCount, len(wantChunks))
+	}
+	if embedder.contextualCalls != 1 {
+		t.Fatalf("contextualCalls = %d, want 1", embedder.contextualCalls)
+	}
+	if embedder.documentCalls != 0 {
+		t.Fatalf("documentCalls = %d, want 0", embedder.documentCalls)
+	}
+	if len(embedder.seenFullDocs) != 1 || embedder.seenFullDocs[0] != documentTextForEmbedding(record) {
+		t.Fatalf("seenFullDocs = %v, want [%q]", embedder.seenFullDocs, documentTextForEmbedding(record))
+	}
+	if len(embedder.seenChunks) != 1 || !reflect.DeepEqual(embedder.seenChunks[0], wantChunks) {
+		t.Fatalf("seenChunks = %#v, want %#v", embedder.seenChunks, wantChunks)
 	}
 }
 
