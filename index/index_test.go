@@ -378,8 +378,14 @@ func TestSearchAppliesRerankerBeforeLimitTruncation(t *testing.T) {
 	if len(hits) != 2 {
 		t.Fatalf("len(reranked hits) = %d, want 2", len(hits))
 	}
-	if hits[0].Ref != baseline[2].Ref || hits[1].Ref != baseline[1].Ref {
-		t.Fatalf("reranked refs = [%q %q], want [%q %q]", hits[0].Ref, hits[1].Ref, baseline[2].Ref, baseline[1].Ref)
+	if hits[0].Ref != reranker.seenCandidates[2].Ref || hits[1].Ref != reranker.seenCandidates[1].Ref {
+		t.Fatalf(
+			"reranked refs = [%q %q], want [%q %q] from reversed candidates",
+			hits[0].Ref,
+			hits[1].Ref,
+			reranker.seenCandidates[2].Ref,
+			reranker.seenCandidates[1].Ref,
+		)
 	}
 }
 
