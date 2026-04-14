@@ -92,6 +92,13 @@ type UpdateResult struct {
 	ContentFingerprint  string
 }
 
+type updateIndexConfig struct {
+	embedderFingerprint string
+	dimension           int
+	quantization        string
+	contextualEmbedder  embed.ContextualEmbedder
+}
+
 // Stats describes a built Stroma index.
 type Stats struct {
 	Path                string
@@ -331,10 +338,7 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 	if err != nil {
 		return nil, err
 	}
-	removedRefs, err := normalizeRemovedRefs(removed)
-	if err != nil {
-		return nil, err
-	}
+	removedRefs := normalizeRemovedRefs(removed)
 	if err := validateUpdateInputs(normalizedAdded, removedRefs); err != nil {
 		return nil, err
 	}
@@ -345,14 +349,20 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 	}
 	defer func() { _ = db.Close() }()
 
-	embedderFingerprint, dimension, quantization, contextualEmbedder, err := resolveUpdateIndexContext(ctx, db, normalizedAdded, options)
+	updateConfig, err := resolveUpdateIndexContext(ctx, db, normalizedAdded, options)
 	if err != nil {
 		return nil, err
 	}
 
 	reuseState := &reuseState{records: map[string]storedRecord{}}
 	if len(normalizedAdded) > 0 {
-		reuseState = loadReuseStateContext(ctx, indexPath, embedderFingerprint, dimension, quantization)
+		reuseState = loadReuseStateContext(
+			ctx,
+			indexPath,
+			updateConfig.embedderFingerprint,
+			updateConfig.dimension,
+			updateConfig.quantization,
+		)
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -366,8 +376,8 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 	result := &UpdateResult{
 		Path:                indexPath,
 		UpsertedCount:       len(normalizedAdded),
-		EmbedderDimension:   dimension,
-		EmbedderFingerprint: embedderFingerprint,
+		EmbedderDimension:   updateConfig.dimension,
+		EmbedderFingerprint: updateConfig.embedderFingerprint,
 	}
 
 	for _, ref := range removedRefs {
@@ -404,7 +414,7 @@ record_ref, chunk_index, heading, content
 		defer func() { _ = chunkStmt.Close() }()
 
 		vectorInsertSQL := `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`
-		if quantization == store.QuantizationInt8 {
+		if updateConfig.quantization == store.QuantizationInt8 {
 			vectorInsertSQL = `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_int8(?))`
 		}
 		vectorStmt, err = tx.PrepareContext(ctx, vectorInsertSQL)
@@ -454,8 +464,8 @@ record_ref, chunk_index, heading, content
 
 		vectors := make([][]float64, 0, len(texts))
 		if len(texts) > 0 {
-			if contextualEmbedder != nil {
-				vectors, err = contextualEmbedder.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
+			if updateConfig.contextualEmbedder != nil {
+				vectors, err = updateConfig.contextualEmbedder.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
 			} else {
 				vectors, err = options.Embedder.EmbedDocuments(ctx, texts)
 			}
@@ -467,7 +477,18 @@ record_ref, chunk_index, heading, content
 			}
 		}
 
-		if err := insertChunksContext(ctx, record, plan, sections, vectors, dimension, quantization, chunkStmt, ftsStmt, vectorStmt); err != nil {
+		if err := insertChunksContext(
+			ctx,
+			record,
+			plan,
+			sections,
+			vectors,
+			updateConfig.dimension,
+			updateConfig.quantization,
+			chunkStmt,
+			ftsStmt,
+			vectorStmt,
+		); err != nil {
 			return nil, err
 		}
 	}
@@ -485,10 +506,10 @@ record_ref, chunk_index, heading, content
 
 	metadata := map[string]string{
 		"schema_version":       schemaVersion,
-		"embedder_dimension":   strconv.Itoa(dimension),
-		"embedder_fingerprint": embedderFingerprint,
+		"embedder_dimension":   strconv.Itoa(updateConfig.dimension),
+		"embedder_fingerprint": updateConfig.embedderFingerprint,
 		"content_fingerprint":  result.ContentFingerprint,
-		"quantization":         quantization,
+		"quantization":         updateConfig.quantization,
 		"created_at":           time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := upsertMetadataContext(ctx, tx, metadata); err != nil {
@@ -855,7 +876,7 @@ func ensureExistingIndexContext(path string) error {
 	}
 }
 
-func normalizeRemovedRefs(refs []string) ([]string, error) {
+func normalizeRemovedRefs(refs []string) []string {
 	seen := make(map[string]struct{}, len(refs))
 	result := make([]string, 0, len(refs))
 	for _, ref := range refs {
@@ -870,7 +891,7 @@ func normalizeRemovedRefs(refs []string) ([]string, error) {
 		result = append(result, trimmed)
 	}
 	sort.Strings(result)
-	return result, nil
+	return result
 }
 
 func validateUpdateInputs(added []corpus.Record, removed []string) error {
@@ -889,70 +910,79 @@ func validateUpdateInputs(added []corpus.Record, removed []string) error {
 	return nil
 }
 
-func resolveUpdateIndexContext(ctx context.Context, db *sql.DB, added []corpus.Record, options UpdateOptions) (string, int, string, embed.ContextualEmbedder, error) {
+func resolveUpdateIndexContext(ctx context.Context, db *sql.DB, added []corpus.Record, options UpdateOptions) (*updateIndexConfig, error) {
 	schema, err := readMetadataValue(ctx, db, "schema_version")
 	if err != nil {
-		return "", 0, "", nil, err
+		return nil, err
 	}
 	if strings.TrimSpace(schema) != schemaVersion {
-		return "", 0, "", nil, fmt.Errorf("schema version mismatch: index=%q update=%q", strings.TrimSpace(schema), schemaVersion)
+		return nil, fmt.Errorf("schema version mismatch: index=%q update=%q", strings.TrimSpace(schema), schemaVersion)
 	}
 
 	embedderFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
 	if err != nil {
-		return "", 0, "", nil, err
+		return nil, err
 	}
 	dimensionValue, err := readMetadataValue(ctx, db, "embedder_dimension")
 	if err != nil {
-		return "", 0, "", nil, err
+		return nil, err
 	}
 	dimension, err := strconv.Atoi(strings.TrimSpace(dimensionValue))
 	if err != nil {
-		return "", 0, "", nil, fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
+		return nil, fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
 	}
 
 	quantization, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
 	if err != nil {
-		return "", 0, "", nil, err
+		return nil, err
 	}
 	quantization, err = normalizeQuantization(quantization)
 	if err != nil {
-		return "", 0, "", nil, err
+		return nil, err
 	}
 	if strings.TrimSpace(options.Quantization) != "" {
 		requestedQuantization, err := normalizeQuantization(options.Quantization)
 		if err != nil {
-			return "", 0, "", nil, err
+			return nil, err
 		}
 		if requestedQuantization != quantization {
-			return "", 0, "", nil, fmt.Errorf("quantization mismatch: index=%q update=%q", quantization, requestedQuantization)
+			return nil, fmt.Errorf("quantization mismatch: index=%q update=%q", quantization, requestedQuantization)
 		}
 	}
 
 	if len(added) == 0 && options.Embedder == nil {
-		return embedderFingerprint, dimension, quantization, nil, nil
+		return &updateIndexConfig{
+			embedderFingerprint: embedderFingerprint,
+			dimension:           dimension,
+			quantization:        quantization,
+		}, nil
 	}
 	if options.Embedder == nil {
-		return "", 0, "", nil, fmt.Errorf("update embedder is required when adding records")
+		return nil, fmt.Errorf("update embedder is required when adding records")
 	}
 
 	updateFingerprint := options.Embedder.Fingerprint()
 	if embedderFingerprint != updateFingerprint {
-		return "", 0, "", nil, fmt.Errorf("embedder fingerprint mismatch: index=%q update=%q", embedderFingerprint, updateFingerprint)
+		return nil, fmt.Errorf("embedder fingerprint mismatch: index=%q update=%q", embedderFingerprint, updateFingerprint)
 	}
 	updateDimension, err := options.Embedder.Dimension(ctx)
 	if err != nil {
-		return "", 0, "", nil, fmt.Errorf("resolve update embedder dimension: %w", err)
+		return nil, fmt.Errorf("resolve update embedder dimension: %w", err)
 	}
 	if updateDimension <= 0 {
-		return "", 0, "", nil, fmt.Errorf("embedder dimension must be positive")
+		return nil, fmt.Errorf("embedder dimension must be positive")
 	}
 	if updateDimension != dimension {
-		return "", 0, "", nil, fmt.Errorf("embedder dimension mismatch: index=%d update=%d", dimension, updateDimension)
+		return nil, fmt.Errorf("embedder dimension mismatch: index=%d update=%d", dimension, updateDimension)
 	}
 
 	contextualEmbedder, _ := options.Embedder.(embed.ContextualEmbedder)
-	return embedderFingerprint, dimension, quantization, contextualEmbedder, nil
+	return &updateIndexConfig{
+		embedderFingerprint: embedderFingerprint,
+		dimension:           dimension,
+		quantization:        quantization,
+		contextualEmbedder:  contextualEmbedder,
+	}, nil
 }
 
 func deleteRecordContext(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {

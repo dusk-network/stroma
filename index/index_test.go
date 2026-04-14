@@ -13,6 +13,8 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
+const testSyncGuideRef = "sync-guide"
+
 type reverseReranker struct {
 	seenQuery      string
 	seenCandidates []SearchHit
@@ -93,7 +95,7 @@ func TestRebuildAndReadStats(t *testing.T) {
 	path := t.TempDir() + "/stroma.db"
 	records := []corpus.Record{
 		{
-			Ref:        "sync-guide",
+			Ref:        testSyncGuideRef,
 			Kind:       "guide",
 			Title:      "Sync Guide",
 			SourceRef:  "file://docs/sync-guide.md",
@@ -153,7 +155,7 @@ func TestSearchReturnsClosestHit(t *testing.T) {
 	path := t.TempDir() + "/stroma.db"
 	records := []corpus.Record{
 		{
-			Ref:        "sync-guide",
+			Ref:        testSyncGuideRef,
 			Kind:       "guide",
 			Title:      "Sync Guide",
 			SourceRef:  "file://docs/sync-guide.md",
@@ -189,8 +191,8 @@ func TestSearchReturnsClosestHit(t *testing.T) {
 	if len(hits) == 0 {
 		t.Fatal("Search() returned no hits")
 	}
-	if hits[0].Ref != "sync-guide" {
-		t.Fatalf("first hit ref = %q, want sync-guide", hits[0].Ref)
+	if hits[0].Ref != testSyncGuideRef {
+		t.Fatalf("first hit ref = %q, want %s", hits[0].Ref, testSyncGuideRef)
 	}
 }
 
@@ -213,7 +215,7 @@ func TestSearchHybridBoostsExactMatch(t *testing.T) {
 			BodyText:   "# Error Codes\n\nERR_TIMEOUT_42 occurs when the background worker exceeds the deadline.",
 		},
 		{
-			Ref:        "sync-guide",
+			Ref:        testSyncGuideRef,
 			Kind:       "guide",
 			Title:      "Sync Guide",
 			SourceRef:  "file://docs/sync.md",
@@ -311,7 +313,7 @@ func TestSearchAppliesRerankerBeforeLimitTruncation(t *testing.T) {
 	path := t.TempDir() + "/stroma.db"
 	records := []corpus.Record{
 		{
-			Ref:        "sync-guide",
+			Ref:        testSyncGuideRef,
 			Kind:       "guide",
 			Title:      "Sync Guide",
 			SourceRef:  "file://docs/sync-guide.md",
@@ -881,7 +883,7 @@ func TestUpdateAddsRecord(t *testing.T) {
 	path := t.TempDir() + "/stroma.db"
 	initial := []corpus.Record{
 		{
-			Ref:        "sync-guide",
+			Ref:        testSyncGuideRef,
 			Kind:       "guide",
 			Title:      "Sync Guide",
 			SourceRef:  "file://docs/sync.md",
@@ -961,7 +963,7 @@ func TestUpdateRemovesRecordWithoutEmbedder(t *testing.T) {
 	path := t.TempDir() + "/stroma.db"
 	initial := []corpus.Record{
 		{
-			Ref:        "sync-guide",
+			Ref:        testSyncGuideRef,
 			Kind:       "guide",
 			Title:      "Sync Guide",
 			SourceRef:  "file://docs/sync.md",
@@ -1011,8 +1013,8 @@ func TestUpdateRemovesRecordWithoutEmbedder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Records() error = %v", err)
 	}
-	if len(records) != 1 || records[0].Ref != "sync-guide" {
-		t.Fatalf("records = %+v, want only sync-guide", records)
+	if len(records) != 1 || records[0].Ref != testSyncGuideRef {
+		t.Fatalf("records = %+v, want only %s", records, testSyncGuideRef)
 	}
 }
 
@@ -1026,7 +1028,7 @@ func TestUpdateReplacesRecord(t *testing.T) {
 
 	path := t.TempDir() + "/stroma.db"
 	initial := corpus.Record{
-		Ref:        "sync-guide",
+		Ref:        testSyncGuideRef,
 		Kind:       "guide",
 		Title:      "Sync Guide",
 		SourceRef:  "file://docs/sync.md",
@@ -1034,7 +1036,7 @@ func TestUpdateReplacesRecord(t *testing.T) {
 		BodyText:   "# Overview\n\nBackground workers process items in batches.\n\n## Scheduling\n\nRun every hour.",
 	}
 	replacement := corpus.Record{
-		Ref:        "sync-guide",
+		Ref:        testSyncGuideRef,
 		Kind:       "guide",
 		Title:      "Sync Guide",
 		SourceRef:  "file://docs/sync.md",
@@ -1092,8 +1094,8 @@ func TestUpdateReplacesRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
-	if len(hits) == 0 || hits[0].Ref != "sync-guide" {
-		t.Fatalf("top hit = %+v, want sync-guide", hits)
+	if len(hits) == 0 || hits[0].Ref != testSyncGuideRef {
+		t.Fatalf("top hit = %+v, want %s", hits, testSyncGuideRef)
 	}
 }
 
@@ -1241,7 +1243,8 @@ func snapshotContents(t *testing.T, path string) ([]corpus.Record, []comparableS
 	}
 
 	resultSections := make([]comparableSection, 0, len(sections))
-	for _, section := range sections {
+	for i := range sections {
+		section := &sections[i]
 		resultSections = append(resultSections, comparableSection{
 			Ref:       section.Ref,
 			Kind:      section.Kind,
