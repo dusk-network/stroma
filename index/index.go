@@ -77,6 +77,7 @@ type SearchQuery struct {
 	Limit    int
 	Kinds    []string
 	Embedder embed.Embedder
+	Reranker Reranker
 }
 
 // SearchHit is one retrieved section.
@@ -90,6 +91,12 @@ type SearchHit struct {
 	Content   string
 	Metadata  map[string]string
 	Score     float64
+}
+
+// Reranker optionally refines one search candidate shortlist before the final
+// limit truncation.
+type Reranker interface {
+	Rerank(ctx context.Context, query string, candidates []SearchHit) ([]SearchHit, error)
 }
 
 // Rebuild atomically recreates the index at the requested path.
@@ -288,6 +295,7 @@ func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
 		Limit:    query.Limit,
 		Kinds:    query.Kinds,
 		Embedder: query.Embedder,
+		Reranker: query.Reranker,
 	})
 }
 

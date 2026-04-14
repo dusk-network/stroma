@@ -25,6 +25,7 @@ type SnapshotSearchQuery struct {
 	Limit    int
 	Kinds    []string
 	Embedder embed.Embedder
+	Reranker Reranker
 }
 
 // VectorSearchQuery defines one vector search against an opened snapshot.
@@ -354,13 +355,10 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	}
 
 	if len(ftsHits) == 0 {
-		if len(vectorHits) > query.Limit {
-			vectorHits = vectorHits[:query.Limit]
-		}
-		return vectorHits, nil
+		return rerankCandidates(ctx, query.Text, query.Limit, vectorHits, query.Reranker)
 	}
 
-	return mergeRRF(vectorHits, ftsHits, query.Limit), nil
+	return rerankCandidates(ctx, query.Text, query.Limit, mergeRRF(vectorHits, ftsHits, candidateCount), query.Reranker)
 }
 
 // SearchVector runs a vector search against the opened snapshot.
@@ -506,6 +504,21 @@ LIMIT ?`)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate fts hits: %w", err)
+	}
+	return hits, nil
+}
+
+func rerankCandidates(ctx context.Context, query string, limit int, hits []SearchHit, reranker Reranker) ([]SearchHit, error) {
+	if reranker != nil {
+		candidates := append([]SearchHit(nil), hits...)
+		reranked, err := reranker.Rerank(ctx, query, candidates)
+		if err != nil {
+			return nil, fmt.Errorf("rerank candidates: %w", err)
+		}
+		hits = reranked
+	}
+	if len(hits) > limit {
+		hits = hits[:limit]
 	}
 	return hits, nil
 }
