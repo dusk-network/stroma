@@ -201,6 +201,7 @@ record_ref, chunk_index, heading, content
 		EmbedderFingerprint: options.Embedder.Fingerprint(),
 		ContentFingerprint:  corpus.Fingerprint(normalized),
 	}
+	contextualEmbedder, hasContextualEmbedder := options.Embedder.(embed.ContextualEmbedder)
 
 	for _, record := range normalized {
 		if err := insertRecordContext(ctx, recordStmt, record); err != nil {
@@ -229,7 +230,11 @@ record_ref, chunk_index, heading, content
 		}
 		vectors := make([][]float64, 0, len(texts))
 		if len(texts) > 0 {
-			vectors, err = options.Embedder.EmbedDocuments(ctx, texts)
+			if hasContextualEmbedder {
+				vectors, err = contextualEmbedder.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
+			} else {
+				vectors, err = options.Embedder.EmbedDocuments(ctx, texts)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("embed record %s: %w", record.Ref, err)
 			}
@@ -465,6 +470,17 @@ func textForEmbedding(title string, section chunk.Section) string {
 		parts = append(parts, trimmed)
 	}
 	if trimmed := strings.TrimSpace(section.Body); trimmed != "" {
+		parts = append(parts, trimmed)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func documentTextForEmbedding(record corpus.Record) string {
+	parts := make([]string, 0, 2)
+	if trimmed := strings.TrimSpace(record.Title); trimmed != "" {
+		parts = append(parts, trimmed)
+	}
+	if trimmed := strings.TrimSpace(record.BodyText); trimmed != "" {
 		parts = append(parts, trimmed)
 	}
 	return strings.Join(parts, "\n\n")
