@@ -25,7 +25,7 @@ Stroma is not for:
 
 - `corpus`: canonical record model and deterministic fingerprints
 - `chunk`: heading-aware Markdown chunking
-- `embed`: embedding interface and deterministic fixture embedder
+- `embed`: embedding interface, deterministic fixture embedder, and OpenAI-compatible HTTP embedder
 - `store`: SQLite readiness and vector blob helpers
 - `index`: index rebuild with embedding reuse, opened snapshot readers, stats, and semantic search
 

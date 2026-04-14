@@ -47,6 +47,7 @@ Stroma does not own:
 - `embed`
   - `Embedder` is the only embedding contract the index depends on.
   - `Fixture` provides deterministic embeddings for tests and offline use.
+  - `OpenAI` provides a generic OpenAI-compatible HTTP embedder without product-layer env loading or diagnostics.
 
 - `store`
   - validates that SQLite and `sqlite-vec` are usable
