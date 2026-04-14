@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,6 +10,33 @@ import (
 	"github.com/dusk-network/stroma/embed"
 	"github.com/dusk-network/stroma/store"
 )
+
+type reverseReranker struct {
+	seenQuery      string
+	seenCandidates []SearchHit
+}
+
+func (r *reverseReranker) Rerank(_ context.Context, query string, candidates []SearchHit) ([]SearchHit, error) {
+	r.seenQuery = query
+	r.seenCandidates = append([]SearchHit(nil), candidates...)
+
+	reranked := append([]SearchHit(nil), candidates...)
+	for i, j := 0, len(reranked)-1; i < j; i, j = i+1, j-1 {
+		reranked[i], reranked[j] = reranked[j], reranked[i]
+	}
+	for i := range reranked {
+		reranked[i].Score = float64(len(reranked) - i)
+	}
+	return reranked, nil
+}
+
+type errorReranker struct {
+	err error
+}
+
+func (r errorReranker) Rerank(context.Context, string, []SearchHit) ([]SearchHit, error) {
+	return nil, r.err
+}
 
 func TestRebuildAndReadStats(t *testing.T) {
 	t.Parallel()
@@ -174,6 +202,87 @@ func TestSearchHybridBoostsExactMatch(t *testing.T) {
 	}
 	if hits[0].Ref != "error-codes" {
 		t.Fatalf("first hit ref = %q, want error-codes (exact match via FTS)", hits[0].Ref)
+	}
+}
+
+func TestSearchAppliesRerankerBeforeLimitTruncation(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	records := []corpus.Record{
+		{
+			Ref:        "sync-guide",
+			Kind:       "guide",
+			Title:      "Sync Guide",
+			SourceRef:  "file://docs/sync-guide.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Overview\n\nBackground workers process items in batches every hour.",
+		},
+		{
+			Ref:        "status-note",
+			Kind:       "note",
+			Title:      "Status Note",
+			SourceRef:  "file://docs/status.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Background workers publish heartbeat status every minute.",
+		},
+		{
+			Ref:        "retry-guide",
+			Kind:       "guide",
+			Title:      "Retry Guide",
+			SourceRef:  "file://docs/retry.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Retries\n\nBackground workers retry transient failures with exponential backoff.",
+		},
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	baseline, err := Search(context.Background(), SearchQuery{
+		Path:     path,
+		Text:     "background workers",
+		Limit:    3,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search(baseline) error = %v", err)
+	}
+	if len(baseline) != 3 {
+		t.Fatalf("len(baseline) = %d, want 3", len(baseline))
+	}
+
+	reranker := &reverseReranker{}
+	hits, err := Search(context.Background(), SearchQuery{
+		Path:     path,
+		Text:     "background workers",
+		Limit:    2,
+		Embedder: fixture,
+		Reranker: reranker,
+	})
+	if err != nil {
+		t.Fatalf("Search(reranker) error = %v", err)
+	}
+	if reranker.seenQuery != "background workers" {
+		t.Fatalf("reranker query = %q, want background workers", reranker.seenQuery)
+	}
+	if len(reranker.seenCandidates) != 3 {
+		t.Fatalf("reranker saw %d candidates, want 3 before final truncation", len(reranker.seenCandidates))
+	}
+	if len(hits) != 2 {
+		t.Fatalf("len(reranked hits) = %d, want 2", len(hits))
+	}
+	if hits[0].Ref != baseline[2].Ref || hits[1].Ref != baseline[1].Ref {
+		t.Fatalf("reranked refs = [%q %q], want [%q %q]", hits[0].Ref, hits[1].Ref, baseline[2].Ref, baseline[1].Ref)
 	}
 }
 
@@ -616,5 +725,52 @@ func TestSearchRejectsEmbedderMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "embedder fingerprint mismatch") {
 		t.Fatalf("Search() error = %v, want fingerprint mismatch", err)
+	}
+}
+
+func TestSnapshotSearchPropagatesRerankerError(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	records := []corpus.Record{
+		{
+			Ref:        "alpha",
+			Kind:       "artifact",
+			Title:      "Alpha",
+			SourceRef:  "file://alpha.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "Burst handling lives here.",
+		},
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	_, err = snapshot.Search(context.Background(), SnapshotSearchQuery{
+		Text:     "burst handling",
+		Limit:    3,
+		Embedder: fixture,
+		Reranker: errorReranker{err: errors.New("boom")},
+	})
+	if err == nil {
+		t.Fatal("Snapshot.Search() error = nil, want reranker failure")
+	}
+	if !strings.Contains(err.Error(), "rerank candidates: boom") {
+		t.Fatalf("Snapshot.Search() error = %v, want reranker context", err)
 	}
 }
