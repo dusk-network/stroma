@@ -912,6 +912,10 @@ func TestUpdateAddsRecord(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Rebuild() error = %v", err)
 	}
+	initialStats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats(initial) error = %v", err)
+	}
 
 	result, err := Update(context.Background(), []corpus.Record{added}, nil, UpdateOptions{
 		Path:     path,
@@ -942,6 +946,9 @@ func TestUpdateAddsRecord(t *testing.T) {
 	}
 	if stats.RecordCount != 2 || stats.ChunkCount != 2 {
 		t.Fatalf("stats = %+v, want record_count=2 chunk_count=2", stats)
+	}
+	if stats.CreatedAt != initialStats.CreatedAt {
+		t.Fatalf("CreatedAt = %q, want preserved %q", stats.CreatedAt, initialStats.CreatedAt)
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
@@ -1215,8 +1222,10 @@ func TestUpdateMixedOperationsMatchEquivalentRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search(rebuildPath) error = %v", err)
 	}
-	if searchRefs(updateHits) == nil || !reflect.DeepEqual(searchRefs(updateHits), searchRefs(rebuildHits)) {
-		t.Fatalf("update search refs = %v, want %v", searchRefs(updateHits), searchRefs(rebuildHits))
+	updateRefs := searchRefs(updateHits)
+	rebuildRefs := searchRefs(rebuildHits)
+	if !reflect.DeepEqual(updateRefs, rebuildRefs) {
+		t.Fatalf("update search refs = %v, want %v", updateRefs, rebuildRefs)
 	}
 }
 

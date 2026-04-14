@@ -503,6 +503,11 @@ record_ref, chunk_index, heading, content
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	createdAt, err := readMetadataValueOptional(ctx, tx, "created_at", now)
+	if err != nil {
+		return nil, err
+	}
 
 	metadata := map[string]string{
 		"schema_version":       schemaVersion,
@@ -510,7 +515,8 @@ record_ref, chunk_index, heading, content
 		"embedder_fingerprint": updateConfig.embedderFingerprint,
 		"content_fingerprint":  result.ContentFingerprint,
 		"quantization":         updateConfig.quantization,
-		"created_at":           time.Now().UTC().Format(time.RFC3339),
+		"created_at":           createdAt,
+		"updated_at":           now,
 	}
 	if err := upsertMetadataContext(ctx, tx, metadata); err != nil {
 		return nil, err
