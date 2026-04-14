@@ -869,3 +869,396 @@ func TestSnapshotSearchPropagatesRerankerError(t *testing.T) {
 		t.Fatalf("Snapshot.Search() error = %v, want reranker context", err)
 	}
 }
+
+func TestUpdateAddsRecord(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	initial := []corpus.Record{
+		{
+			Ref:        "sync-guide",
+			Kind:       "guide",
+			Title:      "Sync Guide",
+			SourceRef:  "file://docs/sync.md",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Background workers process items in batches.",
+		},
+	}
+	added := corpus.Record{
+		Ref:        "retry-guide",
+		Kind:       "guide",
+		Title:      "Retry Guide",
+		SourceRef:  "file://docs/retry.md",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "Retry with exponential backoff after transient failures.",
+	}
+
+	if _, err := Rebuild(context.Background(), initial, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	result, err := Update(context.Background(), []corpus.Record{added}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if result.UpsertedCount != 1 {
+		t.Fatalf("UpsertedCount = %d, want 1", result.UpsertedCount)
+	}
+	if result.RecordCount != 2 {
+		t.Fatalf("RecordCount = %d, want 2", result.RecordCount)
+	}
+	if result.ChunkCount != 2 {
+		t.Fatalf("ChunkCount = %d, want 2", result.ChunkCount)
+	}
+
+	expectedRecords := append([]corpus.Record(nil), initial...)
+	expectedRecords = append(expectedRecords, added)
+	if result.ContentFingerprint != corpus.Fingerprint(expectedRecords) {
+		t.Fatalf("ContentFingerprint = %q, want %q", result.ContentFingerprint, corpus.Fingerprint(expectedRecords))
+	}
+
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.RecordCount != 2 || stats.ChunkCount != 2 {
+		t.Fatalf("stats = %+v, want record_count=2 chunk_count=2", stats)
+	}
+
+	hits, err := Search(context.Background(), SearchQuery{
+		Path:     path,
+		Text:     "exponential backoff",
+		Limit:    3,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(hits) == 0 || hits[0].Ref != "retry-guide" {
+		t.Fatalf("top hit = %+v, want retry-guide", hits)
+	}
+}
+
+func TestUpdateRemovesRecordWithoutEmbedder(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	initial := []corpus.Record{
+		{
+			Ref:        "sync-guide",
+			Kind:       "guide",
+			Title:      "Sync Guide",
+			SourceRef:  "file://docs/sync.md",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Background workers process items in batches.",
+		},
+		{
+			Ref:        "status-note",
+			Kind:       "note",
+			Title:      "Status Note",
+			SourceRef:  "file://docs/status.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Health checks run every minute.",
+		},
+	}
+
+	if _, err := Rebuild(context.Background(), initial, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	result, err := Update(context.Background(), nil, []string{"status-note"}, UpdateOptions{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("Update(remove) error = %v", err)
+	}
+	if result.UpsertedCount != 0 {
+		t.Fatalf("UpsertedCount = %d, want 0", result.UpsertedCount)
+	}
+	if result.RemovedCount != 1 {
+		t.Fatalf("RemovedCount = %d, want 1", result.RemovedCount)
+	}
+	if result.RecordCount != 1 || result.ChunkCount != 1 {
+		t.Fatalf("result = %+v, want record_count=1 chunk_count=1", result)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	records, err := snapshot.Records(context.Background(), RecordQuery{})
+	if err != nil {
+		t.Fatalf("Records() error = %v", err)
+	}
+	if len(records) != 1 || records[0].Ref != "sync-guide" {
+		t.Fatalf("records = %+v, want only sync-guide", records)
+	}
+}
+
+func TestUpdateReplacesRecord(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	initial := corpus.Record{
+		Ref:        "sync-guide",
+		Kind:       "guide",
+		Title:      "Sync Guide",
+		SourceRef:  "file://docs/sync.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "# Overview\n\nBackground workers process items in batches.\n\n## Scheduling\n\nRun every hour.",
+	}
+	replacement := corpus.Record{
+		Ref:        "sync-guide",
+		Kind:       "guide",
+		Title:      "Sync Guide",
+		SourceRef:  "file://docs/sync.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "# Overview\n\nBackground workers process items in batches.\n\n## Scheduling\n\nRun every 30 minutes.",
+	}
+
+	if _, err := Rebuild(context.Background(), []corpus.Record{initial}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	result, err := Update(context.Background(), []corpus.Record{replacement}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Update(replace) error = %v", err)
+	}
+	if result.UpsertedCount != 1 {
+		t.Fatalf("UpsertedCount = %d, want 1", result.UpsertedCount)
+	}
+	if result.ReusedChunkCount != 1 {
+		t.Fatalf("ReusedChunkCount = %d, want 1", result.ReusedChunkCount)
+	}
+	if result.EmbeddedChunkCount != 1 {
+		t.Fatalf("EmbeddedChunkCount = %d, want 1", result.EmbeddedChunkCount)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	sections, err := snapshot.Sections(context.Background(), SectionQuery{})
+	if err != nil {
+		t.Fatalf("Sections() error = %v", err)
+	}
+	if len(sections) != 2 {
+		t.Fatalf("len(sections) = %d, want 2", len(sections))
+	}
+	if !strings.Contains(sections[1].Content, "30 minutes") {
+		t.Fatalf("updated section content = %q, want 30 minutes", sections[1].Content)
+	}
+
+	hits, err := Search(context.Background(), SearchQuery{
+		Path:     path,
+		Text:     "30 minutes",
+		Limit:    3,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(hits) == 0 || hits[0].Ref != "sync-guide" {
+		t.Fatalf("top hit = %+v, want sync-guide", hits)
+	}
+}
+
+func TestUpdateMixedOperationsMatchEquivalentRebuild(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	updatePath := dir + "/update.db"
+	rebuildPath := dir + "/rebuild.db"
+
+	baseRecords := []corpus.Record{
+		{
+			Ref:        "alpha",
+			Kind:       "guide",
+			Title:      "Alpha",
+			SourceRef:  "file://docs/alpha.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Overview\n\nAlpha handles queue admission.\n\n## Limits\n\nAlpha applies hourly quotas.",
+		},
+		{
+			Ref:        "beta",
+			Kind:       "guide",
+			Title:      "Beta",
+			SourceRef:  "file://docs/beta.md",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Beta performs background health checks.",
+		},
+	}
+	alphaUpdated := corpus.Record{
+		Ref:        "alpha",
+		Kind:       "guide",
+		Title:      "Alpha",
+		SourceRef:  "file://docs/alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "# Overview\n\nAlpha handles queue admission.\n\n## Limits\n\nAlpha applies per-tenant quotas.",
+	}
+	gammaAdded := corpus.Record{
+		Ref:        "gamma",
+		Kind:       "note",
+		Title:      "Gamma",
+		SourceRef:  "file://docs/gamma.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "Gamma records retry budgets and backoff windows.",
+	}
+	finalRecords := []corpus.Record{alphaUpdated, gammaAdded}
+
+	if _, err := Rebuild(context.Background(), baseRecords, BuildOptions{
+		Path:     updatePath,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(updatePath) error = %v", err)
+	}
+	if _, err := Update(context.Background(), []corpus.Record{alphaUpdated, gammaAdded}, []string{"beta"}, UpdateOptions{
+		Path:     updatePath,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Update(mixed) error = %v", err)
+	}
+
+	if _, err := Rebuild(context.Background(), finalRecords, BuildOptions{
+		Path:     rebuildPath,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(rebuildPath) error = %v", err)
+	}
+
+	updateStats, err := ReadStats(context.Background(), updatePath)
+	if err != nil {
+		t.Fatalf("ReadStats(updatePath) error = %v", err)
+	}
+	rebuildStats, err := ReadStats(context.Background(), rebuildPath)
+	if err != nil {
+		t.Fatalf("ReadStats(rebuildPath) error = %v", err)
+	}
+	if updateStats.RecordCount != rebuildStats.RecordCount ||
+		updateStats.ChunkCount != rebuildStats.ChunkCount ||
+		updateStats.ContentFingerprint != rebuildStats.ContentFingerprint ||
+		updateStats.EmbedderFingerprint != rebuildStats.EmbedderFingerprint {
+		t.Fatalf("update stats = %+v rebuild stats = %+v, want matching core metadata", updateStats, rebuildStats)
+	}
+
+	updateRecords, updateSections := snapshotContents(t, updatePath)
+	rebuildRecords, rebuildSections := snapshotContents(t, rebuildPath)
+	if !reflect.DeepEqual(updateRecords, rebuildRecords) {
+		t.Fatalf("updated records = %#v, want %#v", updateRecords, rebuildRecords)
+	}
+	if !reflect.DeepEqual(updateSections, rebuildSections) {
+		t.Fatalf("updated sections = %#v, want %#v", updateSections, rebuildSections)
+	}
+
+	updateHits, err := Search(context.Background(), SearchQuery{
+		Path:     updatePath,
+		Text:     "retry budgets",
+		Limit:    3,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search(updatePath) error = %v", err)
+	}
+	rebuildHits, err := Search(context.Background(), SearchQuery{
+		Path:     rebuildPath,
+		Text:     "retry budgets",
+		Limit:    3,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search(rebuildPath) error = %v", err)
+	}
+	if searchRefs(updateHits) == nil || !reflect.DeepEqual(searchRefs(updateHits), searchRefs(rebuildHits)) {
+		t.Fatalf("update search refs = %v, want %v", searchRefs(updateHits), searchRefs(rebuildHits))
+	}
+}
+
+type comparableSection struct {
+	Ref       string
+	Kind      string
+	Title     string
+	SourceRef string
+	Heading   string
+	Content   string
+	Metadata  map[string]string
+}
+
+func snapshotContents(t *testing.T, path string) ([]corpus.Record, []comparableSection) {
+	t.Helper()
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(%q) error = %v", path, err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	records, err := snapshot.Records(context.Background(), RecordQuery{})
+	if err != nil {
+		t.Fatalf("Records(%q) error = %v", path, err)
+	}
+	sections, err := snapshot.Sections(context.Background(), SectionQuery{})
+	if err != nil {
+		t.Fatalf("Sections(%q) error = %v", path, err)
+	}
+
+	resultSections := make([]comparableSection, 0, len(sections))
+	for _, section := range sections {
+		resultSections = append(resultSections, comparableSection{
+			Ref:       section.Ref,
+			Kind:      section.Kind,
+			Title:     section.Title,
+			SourceRef: section.SourceRef,
+			Heading:   section.Heading,
+			Content:   section.Content,
+			Metadata:  section.Metadata,
+		})
+	}
+	return records, resultSections
+}
+
+func searchRefs(hits []SearchHit) []string {
+	result := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		result = append(result, hit.Ref)
+	}
+	return result
+}

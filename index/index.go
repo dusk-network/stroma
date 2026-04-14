@@ -57,6 +57,41 @@ type BuildResult struct {
 	ContentFingerprint  string
 }
 
+// UpdateOptions controls how an existing Stroma index is updated in place.
+type UpdateOptions struct {
+	Path     string
+	Embedder embed.Embedder
+
+	// MaxChunkTokens sets the approximate maximum number of tokens (words)
+	// per chunk. It should match the chunking policy used to build the current
+	// index if callers want incremental updates to remain section-compatible.
+	MaxChunkTokens int
+
+	// ChunkOverlapTokens sets the approximate number of overlapping tokens
+	// between adjacent sub-sections when a section is split. It should match
+	// the chunking policy used to build the current index.
+	ChunkOverlapTokens int
+
+	// Quantization, when provided, must match the existing index. Leaving it
+	// empty reuses the stored quantization metadata.
+	Quantization string
+}
+
+// UpdateResult summarizes one incremental update.
+type UpdateResult struct {
+	Path                string
+	UpsertedCount       int
+	RemovedCount        int
+	RecordCount         int
+	ChunkCount          int
+	ReusedRecordCount   int
+	ReusedChunkCount    int
+	EmbeddedChunkCount  int
+	EmbedderDimension   int
+	EmbedderFingerprint string
+	ContentFingerprint  string
+}
+
 // Stats describes a built Stroma index.
 type Stats struct {
 	Path                string
@@ -278,6 +313,196 @@ record_ref, chunk_index, heading, content
 	return result, nil
 }
 
+// Update applies add, replace, and remove operations to an existing Stroma
+// index without rebuilding it from scratch.
+func Update(ctx context.Context, added []corpus.Record, removed []string, options UpdateOptions) (*UpdateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	indexPath := strings.TrimSpace(options.Path)
+	if indexPath == "" {
+		return nil, fmt.Errorf("update path is required")
+	}
+	if err := ensureExistingIndexContext(indexPath); err != nil {
+		return nil, err
+	}
+
+	normalizedAdded, err := normalizeRecords(added)
+	if err != nil {
+		return nil, err
+	}
+	removedRefs, err := normalizeRemovedRefs(removed)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateUpdateInputs(normalizedAdded, removedRefs); err != nil {
+		return nil, err
+	}
+
+	db, err := store.OpenReadWriteContext(ctx, indexPath)
+	if err != nil {
+		return nil, fmt.Errorf("open index %s: %w", indexPath, err)
+	}
+	defer func() { _ = db.Close() }()
+
+	embedderFingerprint, dimension, quantization, contextualEmbedder, err := resolveUpdateIndexContext(ctx, db, normalizedAdded, options)
+	if err != nil {
+		return nil, err
+	}
+
+	reuseState := &reuseState{records: map[string]storedRecord{}}
+	if len(normalizedAdded) > 0 {
+		reuseState = loadReuseStateContext(ctx, indexPath, embedderFingerprint, dimension, quantization)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin update transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	result := &UpdateResult{
+		Path:                indexPath,
+		UpsertedCount:       len(normalizedAdded),
+		EmbedderDimension:   dimension,
+		EmbedderFingerprint: embedderFingerprint,
+	}
+
+	for _, ref := range removedRefs {
+		deleted, err := deleteRecordContext(ctx, tx, ref)
+		if err != nil {
+			return nil, err
+		}
+		if deleted {
+			result.RemovedCount++
+		}
+	}
+
+	var (
+		recordStmt *sql.Stmt
+		chunkStmt  *sql.Stmt
+		vectorStmt *sql.Stmt
+		ftsStmt    *sql.Stmt
+	)
+	if len(normalizedAdded) > 0 {
+		recordStmt, err = tx.PrepareContext(ctx, `INSERT INTO records (
+ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return nil, fmt.Errorf("prepare record insert: %w", err)
+		}
+		defer func() { _ = recordStmt.Close() }()
+
+		chunkStmt, err = tx.PrepareContext(ctx, `INSERT INTO chunks (
+record_ref, chunk_index, heading, content
+) VALUES (?, ?, ?, ?)`)
+		if err != nil {
+			return nil, fmt.Errorf("prepare chunk insert: %w", err)
+		}
+		defer func() { _ = chunkStmt.Close() }()
+
+		vectorInsertSQL := `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`
+		if quantization == store.QuantizationInt8 {
+			vectorInsertSQL = `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_int8(?))`
+		}
+		vectorStmt, err = tx.PrepareContext(ctx, vectorInsertSQL)
+		if err != nil {
+			return nil, fmt.Errorf("prepare vector insert: %w", err)
+		}
+		defer func() { _ = vectorStmt.Close() }()
+
+		ftsStmt, err = tx.PrepareContext(ctx, `INSERT INTO fts_chunks(rowid, title, heading, content) VALUES (?, ?, ?, ?)`)
+		if err != nil {
+			return nil, fmt.Errorf("prepare fts insert: %w", err)
+		}
+		defer func() { _ = ftsStmt.Close() }()
+	}
+
+	chunkOpts := chunk.Options{
+		MaxTokens:     options.MaxChunkTokens,
+		OverlapTokens: options.ChunkOverlapTokens,
+	}
+	for _, record := range normalizedAdded {
+		if _, err := deleteRecordContext(ctx, tx, record.Ref); err != nil {
+			return nil, err
+		}
+		if err := insertRecordContext(ctx, recordStmt, record); err != nil {
+			return nil, err
+		}
+
+		plan := planRecordReuse(record, storedRecordForReuse(reuseState, record.Ref), chunkOpts)
+		sections := plan.sections
+		result.ReusedChunkCount += plan.reusedChunkCount
+		result.EmbeddedChunkCount += plan.embeddedChunkCount
+		if plan.recordUnchanged {
+			result.ReusedRecordCount++
+		}
+		if len(sections) == 0 {
+			continue
+		}
+
+		texts := make([]string, 0, len(sections))
+		for _, section := range sections {
+			key := reuseChunkKey(record.Title, section.Heading, section.Body)
+			if _, ok := plan.reusedEmbeddings[key]; ok {
+				continue
+			}
+			texts = append(texts, textForEmbedding(record.Title, section))
+		}
+
+		vectors := make([][]float64, 0, len(texts))
+		if len(texts) > 0 {
+			if contextualEmbedder != nil {
+				vectors, err = contextualEmbedder.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
+			} else {
+				vectors, err = options.Embedder.EmbedDocuments(ctx, texts)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("embed record %s: %w", record.Ref, err)
+			}
+			if len(vectors) != len(texts) {
+				return nil, fmt.Errorf("embedder returned %d vectors for %d new sections on %s", len(vectors), len(texts), record.Ref)
+			}
+		}
+
+		if err := insertChunksContext(ctx, record, plan, sections, vectors, dimension, quantization, chunkStmt, ftsStmt, vectorStmt); err != nil {
+			return nil, err
+		}
+	}
+
+	recordsNow, err := loadCurrentRecordsContext(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	result.RecordCount = len(recordsNow)
+	result.ContentFingerprint = corpus.Fingerprint(recordsNow)
+	result.ChunkCount, err = countChunksContext(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := map[string]string{
+		"schema_version":       schemaVersion,
+		"embedder_dimension":   strconv.Itoa(dimension),
+		"embedder_fingerprint": embedderFingerprint,
+		"content_fingerprint":  result.ContentFingerprint,
+		"quantization":         quantization,
+		"created_at":           time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := upsertMetadataContext(ctx, tx, metadata); err != nil {
+		return nil, err
+	}
+	if err := runIntegrityChecksContext(ctx, tx); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit update transaction: %w", err)
+	}
+	return result, nil
+}
+
 // ReadStats inspects an existing index.
 func ReadStats(ctx context.Context, path string) (*Stats, error) {
 	snapshot, err := OpenSnapshot(ctx, path)
@@ -486,8 +711,8 @@ func documentTextForEmbedding(record corpus.Record) string {
 	return strings.Join(parts, "\n\n")
 }
 
-func runIntegrityChecksContext(ctx context.Context, db *sql.DB) error {
-	row := db.QueryRowContext(ctx, `PRAGMA integrity_check`)
+func runIntegrityChecksContext(ctx context.Context, query queryContextRunner) error {
+	row := query.QueryRowContext(ctx, `PRAGMA integrity_check`)
 	var result string
 	if err := row.Scan(&result); err != nil {
 		return fmt.Errorf("run integrity_check: %w", err)
@@ -496,7 +721,7 @@ func runIntegrityChecksContext(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("integrity_check failed: %s", result)
 	}
 
-	rows, err := db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	rows, err := query.QueryContext(ctx, `PRAGMA foreign_key_check`)
 	if err != nil {
 		return fmt.Errorf("run foreign_key_check: %w", err)
 	}
@@ -527,17 +752,22 @@ func replaceFile(stagingPath, finalPath string) error {
 	return nil
 }
 
-func readMetadataValue(ctx context.Context, db *sql.DB, key string) (string, error) {
+type queryContextRunner interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func readMetadataValue(ctx context.Context, query queryContextRunner, key string) (string, error) {
 	var value string
-	if err := db.QueryRowContext(ctx, `SELECT value FROM metadata WHERE key = ?`, key).Scan(&value); err != nil {
+	if err := query.QueryRowContext(ctx, `SELECT value FROM metadata WHERE key = ?`, key).Scan(&value); err != nil {
 		return "", fmt.Errorf("read metadata %s: %w", key, err)
 	}
 	return value, nil
 }
 
 //nolint:unparam // key will vary as more metadata fields are added
-func readMetadataValueOptional(ctx context.Context, db *sql.DB, key, defaultValue string) (string, error) {
-	value, err := readMetadataValue(ctx, db, key)
+func readMetadataValueOptional(ctx context.Context, query queryContextRunner, key, defaultValue string) (string, error) {
+	value, err := readMetadataValue(ctx, query, key)
 	switch {
 	case err == nil:
 		return value, nil
@@ -548,7 +778,7 @@ func readMetadataValueOptional(ctx context.Context, db *sql.DB, key, defaultValu
 	}
 }
 
-func ensureCompatibleEmbedder(ctx context.Context, db *sql.DB, embedder embed.Embedder) error {
+func ensureCompatibleEmbedder(ctx context.Context, db queryContextRunner, embedder embed.Embedder) error {
 	indexFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
 	if err != nil {
 		return err
@@ -609,6 +839,197 @@ ORDER BY vh.distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
 	args = append(args, query.Limit)
 	return builder.String(), args
+}
+
+func ensureExistingIndexContext(path string) error {
+	info, err := os.Stat(path)
+	switch {
+	case os.IsNotExist(err):
+		return &store.MissingIndexError{Path: path}
+	case err != nil:
+		return fmt.Errorf("stat index %s: %w", path, err)
+	case info.IsDir():
+		return fmt.Errorf("index path %s is a directory", path)
+	default:
+		return nil
+	}
+}
+
+func normalizeRemovedRefs(refs []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(refs))
+	result := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		trimmed := strings.TrimSpace(ref)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func validateUpdateInputs(added []corpus.Record, removed []string) error {
+	addedRefs := make(map[string]struct{}, len(added))
+	for _, record := range added {
+		if _, ok := addedRefs[record.Ref]; ok {
+			return fmt.Errorf("duplicate added record ref %q", record.Ref)
+		}
+		addedRefs[record.Ref] = struct{}{}
+	}
+	for _, ref := range removed {
+		if _, ok := addedRefs[ref]; ok {
+			return fmt.Errorf("record ref %q appears in both added and removed", ref)
+		}
+	}
+	return nil
+}
+
+func resolveUpdateIndexContext(ctx context.Context, db *sql.DB, added []corpus.Record, options UpdateOptions) (string, int, string, embed.ContextualEmbedder, error) {
+	schema, err := readMetadataValue(ctx, db, "schema_version")
+	if err != nil {
+		return "", 0, "", nil, err
+	}
+	if strings.TrimSpace(schema) != schemaVersion {
+		return "", 0, "", nil, fmt.Errorf("schema version mismatch: index=%q update=%q", strings.TrimSpace(schema), schemaVersion)
+	}
+
+	embedderFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
+	if err != nil {
+		return "", 0, "", nil, err
+	}
+	dimensionValue, err := readMetadataValue(ctx, db, "embedder_dimension")
+	if err != nil {
+		return "", 0, "", nil, err
+	}
+	dimension, err := strconv.Atoi(strings.TrimSpace(dimensionValue))
+	if err != nil {
+		return "", 0, "", nil, fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
+	}
+
+	quantization, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return "", 0, "", nil, err
+	}
+	quantization, err = normalizeQuantization(quantization)
+	if err != nil {
+		return "", 0, "", nil, err
+	}
+	if strings.TrimSpace(options.Quantization) != "" {
+		requestedQuantization, err := normalizeQuantization(options.Quantization)
+		if err != nil {
+			return "", 0, "", nil, err
+		}
+		if requestedQuantization != quantization {
+			return "", 0, "", nil, fmt.Errorf("quantization mismatch: index=%q update=%q", quantization, requestedQuantization)
+		}
+	}
+
+	if len(added) == 0 && options.Embedder == nil {
+		return embedderFingerprint, dimension, quantization, nil, nil
+	}
+	if options.Embedder == nil {
+		return "", 0, "", nil, fmt.Errorf("update embedder is required when adding records")
+	}
+
+	updateFingerprint := options.Embedder.Fingerprint()
+	if embedderFingerprint != updateFingerprint {
+		return "", 0, "", nil, fmt.Errorf("embedder fingerprint mismatch: index=%q update=%q", embedderFingerprint, updateFingerprint)
+	}
+	updateDimension, err := options.Embedder.Dimension(ctx)
+	if err != nil {
+		return "", 0, "", nil, fmt.Errorf("resolve update embedder dimension: %w", err)
+	}
+	if updateDimension <= 0 {
+		return "", 0, "", nil, fmt.Errorf("embedder dimension must be positive")
+	}
+	if updateDimension != dimension {
+		return "", 0, "", nil, fmt.Errorf("embedder dimension mismatch: index=%d update=%d", dimension, updateDimension)
+	}
+
+	contextualEmbedder, _ := options.Embedder.(embed.ContextualEmbedder)
+	return embedderFingerprint, dimension, quantization, contextualEmbedder, nil
+}
+
+func deleteRecordContext(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
+		return false, fmt.Errorf("delete vectors for %s: %w", ref, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fts_chunks WHERE rowid IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
+		return false, fmt.Errorf("delete fts rows for %s: %w", ref, err)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM records WHERE ref = ?`, ref)
+	if err != nil {
+		return false, fmt.Errorf("delete record %s: %w", ref, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read deleted row count for %s: %w", ref, err)
+	}
+	return rowsAffected > 0, nil
+}
+
+func loadCurrentRecordsContext(ctx context.Context, query queryContextRunner) ([]corpus.Record, error) {
+	rows, err := query.QueryContext(ctx, `
+SELECT ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_json
+FROM records
+ORDER BY ref ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query current records: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	records := make([]corpus.Record, 0)
+	for rows.Next() {
+		var (
+			record      corpus.Record
+			metadataRaw string
+		)
+		if err := rows.Scan(
+			&record.Ref,
+			&record.Kind,
+			&record.Title,
+			&record.SourceRef,
+			&record.BodyFormat,
+			&record.BodyText,
+			&record.ContentHash,
+			&metadataRaw,
+		); err != nil {
+			return nil, fmt.Errorf("scan current record: %w", err)
+		}
+		record.Metadata, err = unmarshalMetadata(record.Ref, metadataRaw)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate current records: %w", err)
+	}
+	return records, nil
+}
+
+func countChunksContext(ctx context.Context, query queryContextRunner) (int, error) {
+	var chunkCount int
+	if err := query.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&chunkCount); err != nil {
+		return 0, fmt.Errorf("count chunks: %w", err)
+	}
+	return chunkCount, nil
+}
+
+func upsertMetadataContext(ctx context.Context, tx *sql.Tx, metadata map[string]string) error {
+	for key, value := range metadata {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO metadata (key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
+			return fmt.Errorf("upsert metadata %s: %w", key, err)
+		}
+	}
+	return nil
 }
 
 func candidateLimit(limit int) int {
