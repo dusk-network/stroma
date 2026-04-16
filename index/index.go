@@ -199,42 +199,20 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 		_ = tx.Rollback()
 	}()
 
-	recordStmt, err := tx.PrepareContext(ctx, `INSERT INTO records (
-ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+	session, err := newIndexSession(ctx, tx, sessionConfig{
+		embedder: options.Embedder,
+		reuse:    reuseState,
+		chunkOpts: chunk.Options{
+			MaxTokens:     options.MaxChunkTokens,
+			OverlapTokens: options.ChunkOverlapTokens,
+		},
+		dimension:    dimension,
+		quantization: quantization,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("prepare record insert: %w", err)
+		return nil, err
 	}
-	defer func() { _ = recordStmt.Close() }()
-
-	chunkStmt, err := tx.PrepareContext(ctx, `INSERT INTO chunks (
-record_ref, chunk_index, heading, content
-) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		return nil, fmt.Errorf("prepare chunk insert: %w", err)
-	}
-	defer func() { _ = chunkStmt.Close() }()
-
-	vectorInsertSQL := `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`
-	if quantization == store.QuantizationInt8 {
-		vectorInsertSQL = `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_int8(?))`
-	}
-	vectorStmt, err := tx.PrepareContext(ctx, vectorInsertSQL)
-	if err != nil {
-		return nil, fmt.Errorf("prepare vector insert: %w", err)
-	}
-	defer func() { _ = vectorStmt.Close() }()
-
-	ftsStmt, err := tx.PrepareContext(ctx, `INSERT INTO fts_chunks(rowid, title, heading, content) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		return nil, fmt.Errorf("prepare fts insert: %w", err)
-	}
-	defer func() { _ = ftsStmt.Close() }()
-
-	chunkOpts := chunk.Options{
-		MaxTokens:     options.MaxChunkTokens,
-		OverlapTokens: options.ChunkOverlapTokens,
-	}
+	defer session.Close()
 
 	result := &BuildResult{
 		Path:                indexPath,
@@ -243,50 +221,17 @@ record_ref, chunk_index, heading, content
 		EmbedderFingerprint: options.Embedder.Fingerprint(),
 		ContentFingerprint:  corpus.Fingerprint(normalized),
 	}
-	contextualEmbedder, hasContextualEmbedder := options.Embedder.(embed.ContextualEmbedder)
 
 	for _, record := range normalized {
-		if err := insertRecordContext(ctx, recordStmt, record); err != nil {
+		stats, err := session.processRecord(ctx, record)
+		if err != nil {
 			return nil, err
 		}
-
-		plan := planRecordReuse(record, storedRecordForReuse(reuseState, record.Ref), chunkOpts)
-		sections := plan.sections
-		result.ChunkCount += len(sections)
-		result.ReusedChunkCount += plan.reusedChunkCount
-		result.EmbeddedChunkCount += plan.embeddedChunkCount
-		if plan.recordUnchanged {
+		result.ChunkCount += stats.sections
+		result.ReusedChunkCount += stats.reusedChunks
+		result.EmbeddedChunkCount += stats.embeddedChunks
+		if stats.recordUnchanged {
 			result.ReusedRecordCount++
-		}
-		if len(sections) == 0 {
-			continue
-		}
-
-		texts := make([]string, 0, len(sections))
-		for _, section := range sections {
-			key := reuseChunkKey(record.Title, section.Heading, section.Body)
-			if _, ok := plan.reusedEmbeddings[key]; ok {
-				continue
-			}
-			texts = append(texts, textForEmbedding(record.Title, section))
-		}
-		vectors := make([][]float64, 0, len(texts))
-		if len(texts) > 0 {
-			if hasContextualEmbedder {
-				vectors, err = contextualEmbedder.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
-			} else {
-				vectors, err = options.Embedder.EmbedDocuments(ctx, texts)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("embed record %s: %w", record.Ref, err)
-			}
-			if len(vectors) != len(texts) {
-				return nil, fmt.Errorf("embedder returned %d vectors for %d new sections on %s", len(vectors), len(texts), record.Ref)
-			}
-		}
-
-		if err := insertChunksContext(ctx, record, plan, sections, vectors, dimension, quantization, chunkStmt, ftsStmt, vectorStmt); err != nil {
-			return nil, err
 		}
 	}
 
@@ -636,6 +581,161 @@ func insertRecordContext(ctx context.Context, stmt *sql.Stmt, record corpus.Reco
 		return fmt.Errorf("insert record %s: %w", record.Ref, err)
 	}
 	return nil
+}
+
+type sessionConfig struct {
+	embedder     embed.Embedder
+	reuse        *reuseState
+	chunkOpts    chunk.Options
+	dimension    int
+	quantization string
+}
+
+type recordStats struct {
+	sections        int
+	reusedChunks    int
+	embeddedChunks  int
+	recordUnchanged bool
+}
+
+// indexSession owns the prepared statements, embedder branch, and reuse state
+// shared by Rebuild and Update so the two write paths cannot drift.
+type indexSession struct {
+	tx           *sql.Tx
+	embedder     embed.Embedder
+	contextual   embed.ContextualEmbedder
+	reuse        *reuseState
+	chunkOpts    chunk.Options
+	dimension    int
+	quantization string
+
+	recordStmt *sql.Stmt
+	chunkStmt  *sql.Stmt
+	vectorStmt *sql.Stmt
+	ftsStmt    *sql.Stmt
+}
+
+func newIndexSession(ctx context.Context, tx *sql.Tx, cfg sessionConfig) (*indexSession, error) {
+	s := &indexSession{
+		tx:           tx,
+		embedder:     cfg.embedder,
+		reuse:        cfg.reuse,
+		chunkOpts:    cfg.chunkOpts,
+		dimension:    cfg.dimension,
+		quantization: cfg.quantization,
+	}
+	if contextual, ok := cfg.embedder.(embed.ContextualEmbedder); ok {
+		s.contextual = contextual
+	}
+
+	var err error
+	s.recordStmt, err = tx.PrepareContext(ctx, `INSERT INTO records (
+ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("prepare record insert: %w", err)
+	}
+
+	s.chunkStmt, err = tx.PrepareContext(ctx, `INSERT INTO chunks (
+record_ref, chunk_index, heading, content
+) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("prepare chunk insert: %w", err)
+	}
+
+	vectorInsertSQL := `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`
+	if cfg.quantization == store.QuantizationInt8 {
+		vectorInsertSQL = `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_int8(?))`
+	}
+	s.vectorStmt, err = tx.PrepareContext(ctx, vectorInsertSQL)
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("prepare vector insert: %w", err)
+	}
+
+	s.ftsStmt, err = tx.PrepareContext(ctx, `INSERT INTO fts_chunks(rowid, title, heading, content) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("prepare fts insert: %w", err)
+	}
+
+	return s, nil
+}
+
+// Close releases prepared statements. It is nil-safe and idempotent.
+func (s *indexSession) Close() {
+	if s == nil {
+		return
+	}
+	for _, stmt := range []**sql.Stmt{&s.recordStmt, &s.chunkStmt, &s.vectorStmt, &s.ftsStmt} {
+		if *stmt != nil {
+			_ = (*stmt).Close()
+			*stmt = nil
+		}
+	}
+}
+
+func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) (recordStats, error) {
+	var stats recordStats
+
+	if err := insertRecordContext(ctx, s.recordStmt, record); err != nil {
+		return stats, err
+	}
+
+	plan := planRecordReuse(record, storedRecordForReuse(s.reuse, record.Ref), s.chunkOpts)
+	sections := plan.sections
+	stats.sections = len(sections)
+	stats.reusedChunks = plan.reusedChunkCount
+	stats.embeddedChunks = plan.embeddedChunkCount
+	stats.recordUnchanged = plan.recordUnchanged
+
+	if len(sections) == 0 {
+		return stats, nil
+	}
+
+	texts := make([]string, 0, len(sections))
+	for _, section := range sections {
+		key := reuseChunkKey(record.Title, section.Heading, section.Body)
+		if _, ok := plan.reusedEmbeddings[key]; ok {
+			continue
+		}
+		texts = append(texts, textForEmbedding(record.Title, section))
+	}
+
+	vectors := make([][]float64, 0, len(texts))
+	if len(texts) > 0 {
+		var err error
+		if s.contextual != nil {
+			vectors, err = s.contextual.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
+		} else {
+			vectors, err = s.embedder.EmbedDocuments(ctx, texts)
+		}
+		if err != nil {
+			return stats, fmt.Errorf("embed record %s: %w", record.Ref, err)
+		}
+		if len(vectors) != len(texts) {
+			return stats, fmt.Errorf("embedder returned %d vectors for %d new sections on %s", len(vectors), len(texts), record.Ref)
+		}
+	}
+
+	if err := insertChunksContext(
+		ctx,
+		record,
+		plan,
+		sections,
+		vectors,
+		s.dimension,
+		s.quantization,
+		s.chunkStmt,
+		s.ftsStmt,
+		s.vectorStmt,
+	); err != nil {
+		return stats, err
+	}
+
+	return stats, nil
 }
 
 func insertChunksContext(
