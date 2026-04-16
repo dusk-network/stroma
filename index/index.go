@@ -599,7 +599,8 @@ type recordStats struct {
 }
 
 // indexSession owns the prepared statements, embedder branch, and reuse state
-// shared by Rebuild and Update so the two write paths cannot drift.
+// for the per-record write path. Rebuild delegates to it today; Update will
+// migrate in a follow-up so both write paths share the same invariants.
 type indexSession struct {
 	tx           *sql.Tx
 	embedder     embed.Embedder
