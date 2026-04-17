@@ -51,8 +51,23 @@ type heading struct {
 	Text  string
 }
 
-// Markdown splits Markdown into heading-aware sections.
+// Markdown splits Markdown into heading-aware sections. No cap on section
+// count — direct callers who need DoS protection should use
+// MarkdownWithOptions with a positive MaxSections.
 func Markdown(title, body string) []Section {
+	// Unbounded path delegates to markdownBounded; the err branch is
+	// unreachable with maxSections == 0.
+	sections, _ := markdownBounded(title, body, 0)
+	return sections
+}
+
+// markdownBounded is the shared parser for Markdown and MarkdownWithOptions.
+// maxSections == 0 means unlimited; a positive value aborts section
+// emission at section N+1 so a pathological body (e.g., 10^6 headings)
+// can't force allocation of millions of Section entries before the cap
+// is checked. Each flush appends at most one section, then tests the
+// limit, so peak memory stays O(maxSections) rather than O(body size).
+func markdownBounded(title, body string, maxSections int) ([]Section, error) {
 	body = strings.ReplaceAll(body, "\r\n", "\n")
 	lines := strings.Split(body, "\n")
 
@@ -63,11 +78,11 @@ func Markdown(title, body string) []Section {
 		currentHeader string
 	)
 
-	flush := func() {
+	flush := func() error {
 		text := strings.TrimSpace(strings.Join(currentLines, "\n"))
 		currentLines = nil
 		if text == "" {
-			return
+			return nil
 		}
 
 		headingText := strings.TrimSpace(currentHeader)
@@ -79,12 +94,19 @@ func Markdown(title, body string) []Section {
 			Heading: headingText,
 			Body:    text,
 		})
+		if maxSections > 0 && len(sections) > maxSections {
+			return fmt.Errorf("%w: heading-aware pass exceeded %d sections",
+				ErrTooManySections, maxSections)
+		}
+		return nil
 	}
 
 	for _, line := range lines {
 		level, text, ok := parseHeading(line)
 		if ok {
-			flush()
+			if err := flush(); err != nil {
+				return nil, err
+			}
 			for len(stack) > 0 && stack[len(stack)-1].Level >= level {
 				stack = stack[:len(stack)-1]
 			}
@@ -96,20 +118,22 @@ func Markdown(title, body string) []Section {
 		currentLines = append(currentLines, line)
 	}
 
-	flush()
+	if err := flush(); err != nil {
+		return nil, err
+	}
 
 	if len(sections) == 0 {
 		text := strings.TrimSpace(body)
 		if text == "" {
-			return nil
+			return nil, nil
 		}
 		return []Section{{
 			Heading: strings.TrimSpace(title),
 			Body:    text,
-		}}
+		}}, nil
 	}
 
-	return sections
+	return sections, nil
 }
 
 func parseHeading(line string) (level int, text string, ok bool) {
@@ -151,18 +175,20 @@ func joinHeadings(stack []heading) string {
 // opts.OverlapTokens is invalid for splitting. Zero-value options produce the
 // same output as Markdown with a nil error.
 //
-// If opts.MaxSections is positive and either the heading-aware pass or the
-// post-split pass would produce more than that many sections, returns
-// ErrTooManySections (wrapped with the observed count and the cap) and a
-// nil slice so callers can surface the rejection cleanly. MaxSections is
-// checked on the heading pass too so a 10^6-heading body can't even
-// allocate the intermediate slice — the guard fires before the token-
-// budget pass, which might otherwise multiply the section count further.
+// If opts.MaxSections is positive and either the heading-aware parse or the
+// post-split pass would exceed that many sections, returns
+// ErrTooManySections (wrapped with the observed count) and a nil slice.
+// MaxSections is enforced inside the parser (see markdownBounded) so a
+// pathological 10^6-heading body aborts after allocating one section
+// past the cap rather than after materializing the full list. The
+// token-budget pass then re-checks after each SplitSection call so
+// one huge section split into many sub-sections can't amplify past the
+// cap either — the residual risk is bounded by the fan-out of a single
+// SplitSection invocation (~body_words / step).
 func MarkdownWithOptions(title, body string, opts Options) ([]Section, error) {
-	sections := Markdown(title, body)
-	if opts.MaxSections > 0 && len(sections) > opts.MaxSections {
-		return nil, fmt.Errorf("%w: heading-aware pass produced %d sections, limit is %d",
-			ErrTooManySections, len(sections), opts.MaxSections)
+	sections, err := markdownBounded(title, body, opts.MaxSections)
+	if err != nil {
+		return nil, err
 	}
 	if opts.MaxTokens <= 0 {
 		return sections, nil
@@ -172,12 +198,16 @@ func MarkdownWithOptions(title, body string, opts Options) ([]Section, error) {
 	for _, s := range sections {
 		if countWords(s.Body) <= opts.MaxTokens {
 			result = append(result, s)
+			if opts.MaxSections > 0 && len(result) > opts.MaxSections {
+				return nil, fmt.Errorf("%w: token-budget pass exceeded %d sections",
+					ErrTooManySections, opts.MaxSections)
+			}
 			continue
 		}
 		result = append(result, SplitSection(s, opts.MaxTokens, opts.OverlapTokens)...)
 		if opts.MaxSections > 0 && len(result) > opts.MaxSections {
-			return nil, fmt.Errorf("%w: token-budget split produced %d sections, limit is %d",
-				ErrTooManySections, len(result), opts.MaxSections)
+			return nil, fmt.Errorf("%w: token-budget split exceeded %d sections",
+				ErrTooManySections, opts.MaxSections)
 		}
 	}
 	return result, nil
