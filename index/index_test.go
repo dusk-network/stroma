@@ -1422,6 +1422,69 @@ func TestRebuildStreamingReuseAcrossManyRecords(t *testing.T) {
 	}
 }
 
+func TestRebuildSelfReuseReplacesSnapshotInPlace(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	path := dir + "/index.db"
+
+	records := []corpus.Record{
+		{
+			Ref:        "alpha",
+			Kind:       "guide",
+			Title:      "Alpha",
+			SourceRef:  "file://docs/alpha.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Overview\n\nAlpha handles queue admission.\n\n## Limits\n\nAlpha applies hourly quotas.",
+		},
+		{
+			Ref:        "beta",
+			Kind:       "note",
+			Title:      "Beta",
+			SourceRef:  "file://docs/beta.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Beta performs background health checks.",
+		},
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(initial) error = %v", err)
+	}
+
+	// Rebuilding into the same path while reusing from it must close the
+	// read-only reuse handle before replaceFile renames the staged file
+	// into place, otherwise the rebuild races an open handle against the
+	// atomic swap (fatal on Windows).
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          path,
+		ReuseFromPath: path,
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(self-reuse) error = %v", err)
+	}
+	if result.ReusedRecordCount != len(records) {
+		t.Fatalf("ReusedRecordCount = %d, want %d (all records carry over on self-reuse)",
+			result.ReusedRecordCount, len(records))
+	}
+	if result.EmbeddedChunkCount != 0 {
+		t.Fatalf("EmbeddedChunkCount = %d, want 0 (all chunks reused on self-reuse)",
+			result.EmbeddedChunkCount)
+	}
+	if result.ReusedChunkCount != result.ChunkCount {
+		t.Fatalf("ReusedChunkCount = %d, ChunkCount = %d, want equal on self-reuse",
+			result.ReusedChunkCount, result.ChunkCount)
+	}
+}
+
 type comparableSection struct {
 	Ref       string
 	Kind      string

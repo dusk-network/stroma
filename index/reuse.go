@@ -133,10 +133,11 @@ func planRecordReuse(record corpus.Record, stored storedRecord, chunkOpts chunk.
 }
 
 // storedRecordForReuse fetches the stored record's content hash and its chunk
-// embeddings for ref, on demand. Lookups failures (including "no row") fall
-// back to an empty storedRecord, matching the legacy best-effort reuse
-// contract: a failed read misses a reuse opportunity but never blocks the
-// write path.
+// embeddings for ref, on demand. A clean "no row" fall-through still misses a
+// reuse opportunity without blocking the write path; any other read error
+// disables reuse for the remainder of this session so embedder cost stays
+// predictable instead of producing a half-reused build under transient
+// SQLITE_BUSY or corruption.
 func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) storedRecord {
 	if state == nil || state.db == nil {
 		return storedRecord{}
@@ -149,14 +150,14 @@ func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) st
 	row := state.db.QueryRowContext(ctx, `SELECT title, content_hash FROM records WHERE ref = ?`, ref)
 	if err := row.Scan(&title, &contentHash); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			// Best-effort: swallow read errors so reuse stays non-blocking.
-			_ = err
+			state.disable()
 		}
 		return storedRecord{}
 	}
 
 	chunks, err := loadStoredChunksForRecord(ctx, state.db, ref, title)
 	if err != nil {
+		state.disable()
 		return storedRecord{}
 	}
 	return storedRecord{
@@ -164,6 +165,16 @@ func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) st
 		title:       title,
 		chunks:      chunks,
 	}
+}
+
+// disable closes the read-only handle and nils it out so subsequent reuse
+// lookups short-circuit to an empty storedRecord. Idempotent.
+func (s *reuseState) disable() {
+	if s == nil || s.db == nil {
+		return
+	}
+	_ = s.db.Close()
+	s.db = nil
 }
 
 func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title string) (map[string][]byte, error) {

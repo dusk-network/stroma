@@ -221,6 +221,14 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 		}
 	}
 
+	// Release the reuse snapshot before swapping the staged index into
+	// place: on Windows, replaceFile cannot rename over an open SQLite
+	// handle, and for self-reuse rebuilds (Path == ReuseFromPath) the
+	// open reuse connection points at the file being replaced.
+	if err := inputs.reuseState.Close(); err != nil {
+		return nil, fmt.Errorf("close reuse snapshot: %w", err)
+	}
+
 	metadata := map[string]string{
 		"schema_version":       schemaVersion,
 		"embedder_dimension":   strconv.Itoa(inputs.dimension),
