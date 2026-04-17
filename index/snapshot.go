@@ -17,6 +17,10 @@ import (
 type Snapshot struct {
 	path string
 	db   *sql.DB
+	// hasContextPrefix is derived from the accept-listed schema_version at
+	// OpenSnapshot time so read paths do not need to reprobe PRAGMA
+	// table_info(chunks) on every Sections()/reuse call.
+	hasContextPrefix bool
 }
 
 // SnapshotSearchQuery defines one text search against an opened snapshot.
@@ -112,7 +116,11 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
 	}
-	return &Snapshot{path: path, db: db}, nil
+	return &Snapshot{
+		path:             path,
+		db:               db,
+		hasContextPrefix: schemaHasContextPrefix(trimmedSchema),
+	}, nil
 }
 
 // Close releases the opened snapshot handle.
@@ -294,11 +302,7 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 		}
 	}
 
-	hasPrefix, err := hasChunkColumn(ctx, s.db, "context_prefix")
-	if err != nil {
-		return nil, fmt.Errorf("probe chunks.context_prefix: %w", err)
-	}
-	sqlText, args := buildSectionsQuery(query, hasPrefix)
+	sqlText, args := buildSectionsQuery(query, s.hasContextPrefix)
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query sections: %w", err)
