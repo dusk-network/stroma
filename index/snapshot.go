@@ -248,6 +248,28 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 		}
 	}
 
+	sqlText, args := buildSectionsQuery(query)
+	rows, err := s.db.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query sections: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	result := make([]Section, 0)
+	for rows.Next() {
+		section, err := scanSectionRow(rows, query.IncludeEmbeddings, quantization)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, section)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sections: %w", err)
+	}
+	return result, nil
+}
+
+func buildSectionsQuery(query SectionQuery) (string, []any) {
 	var builder strings.Builder
 	args := make([]any, 0, len(query.Refs)+len(query.Kinds))
 	builder.WriteString(`
@@ -276,52 +298,43 @@ WHERE 1 = 1`)
 	appendRecordQueryFilter(&builder, &args, "r.kind", query.Kinds)
 	builder.WriteString(`
 ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
+	return builder.String(), args
+}
 
-	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string) (Section, error) {
+	var (
+		section     Section
+		metadataRaw string
+		blob        []byte
+	)
+	scanArgs := []any{
+		&section.ChunkID,
+		&section.Ref,
+		&section.Kind,
+		&section.Title,
+		&section.SourceRef,
+		&section.Heading,
+		&section.Content,
+		&metadataRaw,
+	}
+	if includeEmbeddings {
+		scanArgs = append(scanArgs, &blob)
+	}
+	if err := rows.Scan(scanArgs...); err != nil {
+		return Section{}, fmt.Errorf("scan section: %w", err)
+	}
+	metadata, err := unmarshalMetadata(section.Ref, metadataRaw)
 	if err != nil {
-		return nil, fmt.Errorf("query sections: %w", err)
+		return Section{}, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	result := make([]Section, 0)
-	for rows.Next() {
-		var (
-			section     Section
-			metadataRaw string
-			blob        []byte
-		)
-		scanArgs := []any{
-			&section.ChunkID,
-			&section.Ref,
-			&section.Kind,
-			&section.Title,
-			&section.SourceRef,
-			&section.Heading,
-			&section.Content,
-			&metadataRaw,
-		}
-		if query.IncludeEmbeddings {
-			scanArgs = append(scanArgs, &blob)
-		}
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("scan section: %w", err)
-		}
-		section.Metadata, err = unmarshalMetadata(section.Ref, metadataRaw)
+	section.Metadata = metadata
+	if includeEmbeddings {
+		section.Embedding, err = decodeVector(blob, quantization)
 		if err != nil {
-			return nil, err
+			return Section{}, fmt.Errorf("decode section embedding for %s: %w", section.Ref, err)
 		}
-		if query.IncludeEmbeddings {
-			section.Embedding, err = decodeVector(blob, quantization)
-			if err != nil {
-				return nil, fmt.Errorf("decode section embedding for %s: %w", section.Ref, err)
-			}
-		}
-		result = append(result, section)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate sections: %w", err)
-	}
-	return result, nil
+	return section, nil
 }
 
 // Search runs a hybrid text search (vector + FTS5) against the opened snapshot.
