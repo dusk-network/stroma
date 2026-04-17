@@ -853,6 +853,16 @@ func runContextualizer(ctx context.Context, contextualizer ChunkContextualizer, 
 		return nil, fmt.Errorf("contextualizer returned %d prefixes for %d sections on %s",
 			len(prefixes), len(sections), record.Ref)
 	}
+	// Normalize whitespace-only prefixes to "" at the source so the reuse
+	// key, persisted column, FTS content, and embedding text all agree on
+	// the empty case. Without this, a prefix of " " would skip embedding
+	// augmentation (contextualEmbeddingText trims) but still persist a
+	// non-empty context_prefix and flow into FTS, diverging silently.
+	for i, p := range prefixes {
+		if strings.TrimSpace(p) == "" {
+			prefixes[i] = ""
+		}
+	}
 	return prefixes, nil
 }
 
@@ -869,10 +879,11 @@ func sectionPrefix(prefixes []string, i int) string {
 // contextualEmbeddingText prepends the contextualizer's prefix to the
 // standard embedding text so callers can feed the same string to both the
 // vector and FTS arms. When prefix is empty the result matches the
-// non-contextual path exactly.
+// non-contextual path exactly. Whitespace normalization happens upstream
+// in runContextualizer, so any non-empty prefix here is a real prefix.
 func contextualEmbeddingText(prefix, title string, section chunk.Section) string {
 	base := textForEmbedding(title, section)
-	if strings.TrimSpace(prefix) == "" {
+	if prefix == "" {
 		return base
 	}
 	return prefix + "\n\n" + base
