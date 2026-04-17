@@ -138,6 +138,21 @@ type SearchQuery struct {
 	Kinds    []string
 	Embedder embed.Embedder
 	Reranker Reranker
+
+	// SearchDimension optionally runs a truncated-prefix vector prefilter
+	// at this dimension, then rescores the shortlist with full-dim cosine.
+	// Zero (default) uses the full stored dimension throughout. Positive
+	// values must be <= the stored embedder dimension. Only valid when the
+	// stored quantization is float32; returns an error against int8 indexes.
+	// This is the shape Matryoshka Representation Learning (MRL) embeddings
+	// rely on — callers who use non-MRL embeddings should leave it zero.
+	//
+	// The truncated path is a brute-force scan over chunks_vec, not a
+	// vec0 kNN MATCH, so it is not asymptotically cheaper than the default
+	// path: its win is constant-factor (fewer floats per cosine) and only
+	// pays off when the truncated prefix preserves ranking. Treat this as
+	// a tuning knob for MRL snapshots rather than a blanket speedup.
+	SearchDimension int
 }
 
 // SearchHit is one retrieved section.
@@ -499,11 +514,12 @@ func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
 	}
 	defer func() { _ = snapshot.Close() }()
 	return snapshot.Search(ctx, SnapshotSearchQuery{
-		Text:     query.Text,
-		Limit:    query.Limit,
-		Kinds:    query.Kinds,
-		Embedder: query.Embedder,
-		Reranker: query.Reranker,
+		Text:            query.Text,
+		Limit:           query.Limit,
+		Kinds:           query.Kinds,
+		Embedder:        query.Embedder,
+		Reranker:        query.Reranker,
+		SearchDimension: query.SearchDimension,
 	})
 }
 
@@ -1183,6 +1199,92 @@ ORDER BY vh.distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
 	args = append(args, query.Limit)
 	return builder.String(), args
+}
+
+// matryoshkaPrefilterMultiplier scales the prefilter shortlist up from the
+// caller-requested candidate limit so that good candidates that only the
+// truncated prefix ranks lower still have a chance to survive into the
+// full-dim rescore. The final LIMIT then trims back to the caller's count.
+const matryoshkaPrefilterMultiplier = 3
+
+// buildMatryoshkaSearchSQL builds the truncated-prefix prefilter + full-dim
+// rescore query. The prefilter scans every chunks_vec row with cosine over
+// the first searchDim floats; the rescore recomputes full-dim cosine on
+// just the prefilter shortlist. When a kind filter is supplied it is
+// applied inside the prefilter CTE so selective queries do not get starved
+// by unrelated kinds dominating the truncated-prefix ranking.
+//
+// Performance note: this path does not use vec0's native MATCH kNN
+// (sqlite-vec 0.1.6 does not offer an ANN index yet), so it is a linear
+// scan even without Matryoshka. At the same dim, the MATCH path can still
+// be faster because sqlite-vec exposes tighter SIMD for its kNN
+// implementation. Setting SearchDimension is expected to pay off only when
+// the truncated dim is meaningfully smaller than the stored dim AND the
+// embedder was trained with MRL so the truncated prefix preserves
+// ranking. For non-MRL embedders this is actively harmful.
+func buildMatryoshkaSearchSQL(limit int, kinds []string, queryBlob []byte, searchDim int) (querySQL string, args []any, err error) {
+	// Truncate the full-dim float32 query blob to the first searchDim floats.
+	// The stored vectors are sliced in SQL via vec_slice, keeping the
+	// representation on both sides identical. Guard the slice explicitly
+	// so a misbehaving embedder that returns fewer dims than the snapshot
+	// was built with surfaces a clear error instead of panicking on the
+	// out-of-bounds reslice.
+	needed := searchDim * 4
+	if len(queryBlob) < needed {
+		return "", nil, fmt.Errorf("query vector blob has %d bytes, need at least %d for SearchDimension=%d", len(queryBlob), needed, searchDim)
+	}
+	truncatedQuery := queryBlob[:needed]
+	prefilterLimit := limit * matryoshkaPrefilterMultiplier
+
+	var builder strings.Builder
+	args = make([]any, 0, 5+len(kinds))
+
+	hasKindFilter := len(kinds) > 0
+	builder.WriteString(`
+WITH prefilter AS (
+  SELECT v.chunk_id, v.embedding
+  FROM chunks_vec v`)
+	if hasKindFilter {
+		// Join through chunks → records inside the CTE so the kind
+		// predicate prunes the prefilter search space itself. Applying
+		// the kind filter after the truncated shortlist was selected
+		// would silently drop candidates of the requested kind whenever
+		// another kind dominated the top matryoshkaPrefilterMultiplier×
+		// limit rows.
+		builder.WriteString(`
+  JOIN chunks c ON c.id = v.chunk_id
+  JOIN records r ON r.ref = c.record_ref
+  WHERE r.kind IN (`)
+		for i, kind := range kinds {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString("?")
+			args = append(args, strings.TrimSpace(kind))
+		}
+		builder.WriteString(")")
+	}
+	builder.WriteString(`
+  ORDER BY vec_distance_cosine(vec_slice(v.embedding, 0, ?), ?)
+  LIMIT ?
+)
+SELECT
+  pf.chunk_id,
+  r.ref,
+  r.kind,
+  r.title,
+  r.source_ref,
+  c.heading,
+  c.content,
+  r.metadata_json,
+  vec_distance_cosine(pf.embedding, ?) AS distance
+FROM prefilter pf
+JOIN chunks c ON c.id = pf.chunk_id
+JOIN records r ON r.ref = c.record_ref
+ORDER BY distance ASC, r.ref ASC, c.chunk_index ASC
+LIMIT ?`)
+	args = append(args, searchDim, truncatedQuery, prefilterLimit, queryBlob, limit)
+	return builder.String(), args, nil
 }
 
 // binaryRescoreMultiplier scales the hamming prefilter shortlist up from the

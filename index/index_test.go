@@ -2114,6 +2114,254 @@ func TestOpenSnapshotRejectsIncompleteBinaryCompanion(t *testing.T) {
 	}
 }
 
+func TestSearchMatryoshkaTruncatedPrefilterRescoresAtFullDim(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	records := []corpus.Record{
+		{
+			Ref:        "sync-guide",
+			Kind:       "guide",
+			Title:      "Sync Guide",
+			SourceRef:  "file://docs/sync-guide.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Overview\n\nBackground workers process items in batches.\n\n## Scheduling\n\nRun every hour.",
+		},
+		{
+			Ref:        "status-note",
+			Kind:       "note",
+			Title:      "Status Note",
+			SourceRef:  "file://docs/status.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Health checks run every minute.",
+		},
+		{
+			Ref:        "retry-guide",
+			Kind:       "guide",
+			Title:      "Retry Guide",
+			SourceRef:  "file://docs/retry.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Retries\n\nBackoff windows govern retry cadence.",
+		},
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	baseline, err := Search(context.Background(), SearchQuery{
+		Path:     path,
+		Text:     "background workers batches",
+		Limit:    3,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search(baseline) error = %v", err)
+	}
+	if len(baseline) == 0 {
+		t.Fatal("baseline returned no hits")
+	}
+
+	// Truncated prefilter at half the stored dimension. The rescore still
+	// runs full-dim cosine, so any chunk that survives the prefilter into
+	// the rescored result should carry the same score the baseline path
+	// assigned to it.
+	truncated, err := Search(context.Background(), SearchQuery{
+		Path:            path,
+		Text:            "background workers batches",
+		Limit:           3,
+		Embedder:        fixture,
+		SearchDimension: 8,
+	})
+	if err != nil {
+		t.Fatalf("Search(SearchDimension=8) error = %v", err)
+	}
+	if len(truncated) == 0 {
+		t.Fatal("Matryoshka path returned no hits")
+	}
+
+	baselineScores := make(map[int64]float64, len(baseline))
+	for _, hit := range baseline {
+		baselineScores[hit.ChunkID] = hit.Score
+	}
+	for _, hit := range truncated {
+		want, ok := baselineScores[hit.ChunkID]
+		if !ok {
+			continue
+		}
+		if hit.Score != want {
+			t.Fatalf("chunk %d Matryoshka score = %v, baseline = %v (full-dim rescore must match)",
+				hit.ChunkID, hit.Score, want)
+		}
+	}
+
+	// SearchDimension == stored dim is a no-op: it must collapse to the
+	// same result set as the baseline search.
+	noop, err := Search(context.Background(), SearchQuery{
+		Path:            path,
+		Text:            "background workers batches",
+		Limit:           3,
+		Embedder:        fixture,
+		SearchDimension: 16,
+	})
+	if err != nil {
+		t.Fatalf("Search(SearchDimension=16) error = %v", err)
+	}
+	if len(noop) != len(baseline) {
+		t.Fatalf("no-op truncation returned %d hits, baseline returned %d", len(noop), len(baseline))
+	}
+	for i := range noop {
+		if noop[i].ChunkID != baseline[i].ChunkID || noop[i].Score != baseline[i].Score {
+			t.Fatalf("no-op truncation hit %d = (%d, %v), baseline = (%d, %v)",
+				i, noop[i].ChunkID, noop[i].Score, baseline[i].ChunkID, baseline[i].Score)
+		}
+	}
+}
+
+func TestSearchMatryoshkaRejectsInvalidDimension(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	records := []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	if _, err := Search(context.Background(), SearchQuery{
+		Path:            path,
+		Text:            "alpha",
+		Limit:           3,
+		Embedder:        fixture,
+		SearchDimension: 17,
+	}); err == nil || !strings.Contains(err.Error(), "exceeds stored embedder_dimension") {
+		t.Fatalf("oversized SearchDimension err = %v, want exceeds-stored error", err)
+	}
+}
+
+func TestSearchMatryoshkaRejectsInt8Index(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	records := []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "int8",
+	}); err != nil {
+		t.Fatalf("Rebuild(int8) error = %v", err)
+	}
+
+	if _, err := Search(context.Background(), SearchQuery{
+		Path:            path,
+		Text:            "alpha",
+		Limit:           3,
+		Embedder:        fixture,
+		SearchDimension: 8,
+	}); err == nil || !strings.Contains(err.Error(), "only supported for float32") {
+		t.Fatalf("int8 SearchDimension err = %v, want float32-only error", err)
+	}
+}
+
+func TestSearchMatryoshkaHonorsKindFilterInsidePrefilter(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+
+	// Build a corpus where the "note" kind is a tiny minority against a
+	// large block of "noise" chunks. If the Matryoshka prefilter applied
+	// the kind filter after truncation, the single note chunk could
+	// easily fall outside the shortlist and the search would silently
+	// return zero hits even though a matching kind exists.
+	records := []corpus.Record{{
+		Ref:        "target-note",
+		Kind:       "note",
+		Title:      "Target Note",
+		SourceRef:  "file://notes/target.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "Background workers process items in batches every hour.",
+	}}
+	for i := 0; i < 50; i++ {
+		records = append(records, corpus.Record{
+			Ref:        "noise-" + strconv.Itoa(i),
+			Kind:       "noise",
+			Title:      "Noise " + strconv.Itoa(i),
+			SourceRef:  "file://noise/" + strconv.Itoa(i) + ".txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Unrelated filler text number " + strconv.Itoa(i) + ".",
+		})
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	hits, err := Search(context.Background(), SearchQuery{
+		Path:            path,
+		Text:            "background workers batches",
+		Limit:           3,
+		Kinds:           []string{"note"},
+		Embedder:        fixture,
+		SearchDimension: 8,
+	})
+	if err != nil {
+		t.Fatalf("Search(Kinds=note, SearchDimension=8) error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("Matryoshka + kind filter returned no hits; the prefilter must apply the kind restriction before truncation, not after")
+	}
+	if hits[0].Ref != "target-note" || hits[0].Kind != "note" {
+		t.Fatalf("first hit = (%s, %s), want (target-note, note)", hits[0].Ref, hits[0].Kind)
+	}
+	for _, hit := range hits {
+		if hit.Kind != "note" {
+			t.Fatalf("kind filter leaked: hit %s has kind %q", hit.Ref, hit.Kind)
+		}
+	}
+}
+
 func TestRebuildSelfReuseReplacesSnapshotInPlace(t *testing.T) {
 	t.Parallel()
 

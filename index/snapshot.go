@@ -26,6 +26,11 @@ type SnapshotSearchQuery struct {
 	Kinds    []string
 	Embedder embed.Embedder
 	Reranker Reranker
+
+	// SearchDimension optionally runs a truncated-prefix vector prefilter
+	// at this dimension, then rescores the shortlist with full-dim cosine.
+	// See SearchQuery.SearchDimension for the full contract.
+	SearchDimension int
 }
 
 // VectorSearchQuery defines one vector search against an opened snapshot.
@@ -359,6 +364,51 @@ func (s *Snapshot) resolveQuantization(ctx context.Context) (string, error) {
 	return normalizeQuantization(raw)
 }
 
+// resolveSearchDimension validates SearchDimension against the stored
+// embedder dimension and quantization. Zero means "no truncation"; any
+// positive value must be <= stored dim. Matryoshka-style truncation is
+// only supported for float32 indexes because the sqlite-vec int8 storage
+// path packs vec_int8 bytes and vec_slice over that packed form would
+// not yield a valid truncated int8 vector for cosine distance.
+func (s *Snapshot) resolveSearchDimension(ctx context.Context, requested int, quantization string) (int, error) {
+	if requested <= 0 {
+		return 0, nil
+	}
+	if quantization != store.QuantizationFloat32 {
+		return 0, fmt.Errorf("SearchDimension is only supported for float32 indexes, got %q", quantization)
+	}
+	storedDim, err := s.resolveDimension(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("resolve search dimension: %w", err)
+	}
+	if requested > storedDim {
+		return 0, fmt.Errorf("SearchDimension %d exceeds stored embedder_dimension %d", requested, storedDim)
+	}
+	if requested == storedDim {
+		// No-op truncation: skip the Matryoshka path and fall back to the
+		// existing vec0 MATCH route so callers do not pay the scan cost
+		// just because they passed the stored dim explicitly.
+		return 0, nil
+	}
+	return requested, nil
+}
+
+// resolveDimension reads the snapshot's stored embedder dimension.
+func (s *Snapshot) resolveDimension(ctx context.Context) (int, error) {
+	raw, err := readMetadataValue(ctx, s.db, "embedder_dimension")
+	if err != nil {
+		return 0, err
+	}
+	dim, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("parse embedder_dimension %q: %w", raw, err)
+	}
+	if dim <= 0 {
+		return 0, fmt.Errorf("stored embedder_dimension %d is non-positive", dim)
+	}
+	return dim, nil
+}
+
 func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string) (Section, error) {
 	var (
 		section     Section
@@ -431,9 +481,14 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 		return nil, fmt.Errorf("embedder returned %d query vectors, want 1", len(vectors))
 	}
 
+	searchDim, err := s.resolveSearchDimension(ctx, query.SearchDimension, quantization)
+	if err != nil {
+		return nil, err
+	}
+
 	candidateCount := candidateLimit(query.Limit)
 
-	vectorHits, err := s.searchVectorCandidates(ctx, vectors[0], candidateCount, query.Kinds, quantization)
+	vectorHits, err := s.searchVectorCandidates(ctx, vectors[0], candidateCount, query.Kinds, quantization, searchDim)
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +524,7 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	if err != nil {
 		return nil, err
 	}
-	hits, err := s.searchVectorCandidates(ctx, query.Embedding, candidateLimit(query.Limit), query.Kinds, quantization)
+	hits, err := s.searchVectorCandidates(ctx, query.Embedding, candidateLimit(query.Limit), query.Kinds, quantization, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -479,20 +534,29 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	return hits, nil
 }
 
-func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float64, limit int, kinds []string, quantization string) ([]SearchHit, error) {
+func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float64, limit int, kinds []string, quantization string, searchDimension int) ([]SearchHit, error) {
 	queryBlob, err := encodeVector(embedding, quantization)
 	if err != nil {
 		return nil, fmt.Errorf("encode query vector: %w", err)
 	}
 	var sqlText string
 	var args []any
-	if quantization == store.QuantizationBinary {
+	switch {
+	case searchDimension > 0:
+		// Matryoshka is already validated as float32-only upstream in
+		// resolveSearchDimension, so this and the binary branch below
+		// are mutually exclusive by contract.
+		sqlText, args, err = buildMatryoshkaSearchSQL(limit, kinds, queryBlob, searchDimension)
+		if err != nil {
+			return nil, err
+		}
+	case quantization == store.QuantizationBinary:
 		fullQueryBlob, err := store.EncodeVectorBlob(embedding)
 		if err != nil {
 			return nil, fmt.Errorf("encode full-precision query vector: %w", err)
 		}
 		sqlText, args = buildBinarySearchSQL(limit, kinds, queryBlob, fullQueryBlob)
-	} else {
+	default:
 		sqlText, args = buildSearchSQL(SearchQuery{
 			Limit: limit,
 			Kinds: kinds,
