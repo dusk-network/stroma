@@ -1,6 +1,8 @@
 package chunk
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -89,7 +91,10 @@ func TestMarkdownWithOptionsZeroValueMatchesMarkdown(t *testing.T) {
 
 	body := "# Overview\n\nShort text.\n\n## Details\n\nMore detail."
 	base := Markdown("Title", body)
-	opts := MarkdownWithOptions("Title", body, Options{})
+	opts, err := MarkdownWithOptions("Title", body, Options{})
+	if err != nil {
+		t.Fatalf("MarkdownWithOptions(zero) error = %v", err)
+	}
 	if !reflect.DeepEqual(base, opts) {
 		t.Fatalf("MarkdownWithOptions(zero) = %#v, want %#v", opts, base)
 	}
@@ -105,7 +110,10 @@ func TestMarkdownWithOptionsSplitsLongSection(t *testing.T) {
 	}
 	body := "## Section\n\n" + joinWords(words)
 
-	sections := MarkdownWithOptions("Title", body, Options{MaxTokens: 8})
+	sections, err := MarkdownWithOptions("Title", body, Options{MaxTokens: 8})
+	if err != nil {
+		t.Fatalf("MarkdownWithOptions() error = %v", err)
+	}
 	if len(sections) < 3 {
 		t.Fatalf("expected at least 3 sub-sections, got %d: %#v", len(sections), sections)
 	}
@@ -126,7 +134,10 @@ func TestMarkdownWithOptionsOverlap(t *testing.T) {
 	words := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 	body := "## H\n\n" + joinWords(words)
 
-	sections := MarkdownWithOptions("T", body, Options{MaxTokens: 5, OverlapTokens: 2})
+	sections, err := MarkdownWithOptions("T", body, Options{MaxTokens: 5, OverlapTokens: 2})
+	if err != nil {
+		t.Fatalf("MarkdownWithOptions() error = %v", err)
+	}
 	if len(sections) < 2 {
 		t.Fatalf("expected at least 2 sections, got %d", len(sections))
 	}
@@ -144,9 +155,56 @@ func TestMarkdownWithOptionsPreservesShortSections(t *testing.T) {
 	t.Parallel()
 
 	body := "## A\n\nShort.\n\n## B\n\nAlso short."
-	sections := MarkdownWithOptions("T", body, Options{MaxTokens: 100})
+	sections, err := MarkdownWithOptions("T", body, Options{MaxTokens: 100})
+	if err != nil {
+		t.Fatalf("MarkdownWithOptions() error = %v", err)
+	}
 	if len(sections) != 2 {
 		t.Fatalf("expected 2 sections, got %d", len(sections))
+	}
+}
+
+// TestMarkdownWithOptionsRejectsTooManySections locks the DoS guard: a
+// pathological body that produces more sections than opts.MaxSections
+// allows must fail loudly rather than admit 10^6 rows + embedder calls.
+func TestMarkdownWithOptionsRejectsTooManySections(t *testing.T) {
+	t.Parallel()
+
+	var builder strings.Builder
+	const headings = 10_001
+	for i := 0; i < headings; i++ {
+		fmt.Fprintf(&builder, "## H%d\n\nbody %d\n\n", i, i)
+	}
+	sections, err := MarkdownWithOptions("T", builder.String(), Options{MaxSections: 10_000})
+	if err == nil {
+		t.Fatalf("MarkdownWithOptions() succeeded with %d sections, want ErrTooManySections", len(sections))
+	}
+	if !errors.Is(err, ErrTooManySections) {
+		t.Fatalf("MarkdownWithOptions() err = %v, want wraps ErrTooManySections", err)
+	}
+	if sections != nil {
+		t.Fatalf("MarkdownWithOptions returned %d sections on error, want nil", len(sections))
+	}
+}
+
+// TestMarkdownWithOptionsZeroMaxSectionsMeansUnlimited locks the
+// backward-compatible default: a zero MaxSections lets any number of
+// sections through, so direct callers of chunk (without the index-layer
+// default) keep their pre-patch behaviour.
+func TestMarkdownWithOptionsZeroMaxSectionsMeansUnlimited(t *testing.T) {
+	t.Parallel()
+
+	var builder strings.Builder
+	const headings = 200
+	for i := 0; i < headings; i++ {
+		fmt.Fprintf(&builder, "## H%d\n\nbody %d\n\n", i, i)
+	}
+	sections, err := MarkdownWithOptions("T", builder.String(), Options{})
+	if err != nil {
+		t.Fatalf("MarkdownWithOptions(MaxSections=0) error = %v, want nil (unlimited)", err)
+	}
+	if len(sections) != headings {
+		t.Fatalf("sections = %d, want %d", len(sections), headings)
 	}
 }
 
