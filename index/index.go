@@ -132,6 +132,12 @@ type SearchQuery struct {
 	// stored quantization is float32; returns an error against int8 indexes.
 	// This is the shape Matryoshka Representation Learning (MRL) embeddings
 	// rely on — callers who use non-MRL embeddings should leave it zero.
+	//
+	// The truncated path is a brute-force scan over chunks_vec, not a
+	// vec0 kNN MATCH, so it is not asymptotically cheaper than the default
+	// path: its win is constant-factor (fewer floats per cosine) and only
+	// pays off when the truncated prefix preserves ranking. Treat this as
+	// a tuning knob for MRL snapshots rather than a blanket speedup.
 	SearchDimension int
 }
 
@@ -967,11 +973,20 @@ LIMIT ?`)
 const matryoshkaPrefilterMultiplier = 3
 
 // buildMatryoshkaSearchSQL builds the truncated-prefix prefilter + full-dim
-// rescore query. The prefilter scans every chunk_vec row with cosine over
+// rescore query. The prefilter scans every chunks_vec row with cosine over
 // the first searchDim floats; the rescore recomputes full-dim cosine on
-// just the prefilter shortlist. Kind filtering is applied after the
-// prefilter, matching buildSearchSQL's placement so Matryoshka and the
-// vec0 MATCH path have the same kind-interaction semantics.
+// just the prefilter shortlist. When a kind filter is supplied it is
+// applied inside the prefilter CTE so selective queries do not get starved
+// by unrelated kinds dominating the truncated-prefix ranking.
+//
+// Performance note: this path does not use vec0's native MATCH kNN
+// (sqlite-vec 0.1.6 does not offer an ANN index yet), so it is a linear
+// scan even without Matryoshka. At the same dim, the MATCH path can still
+// be faster because sqlite-vec exposes tighter SIMD for its kNN
+// implementation. Setting SearchDimension is expected to pay off only when
+// the truncated dim is meaningfully smaller than the stored dim AND the
+// embedder was trained with MRL so the truncated prefix preserves
+// ranking. For non-MRL embedders this is actively harmful.
 func buildMatryoshkaSearchSQL(limit int, kinds []string, queryBlob []byte, searchDim int) (querySQL string, args []any) {
 	// Truncate the full-dim float32 query blob to the first searchDim floats.
 	// The stored vectors are sliced in SQL via vec_slice, keeping the
@@ -981,11 +996,34 @@ func buildMatryoshkaSearchSQL(limit int, kinds []string, queryBlob []byte, searc
 
 	var builder strings.Builder
 	args = make([]any, 0, 5+len(kinds))
+
+	hasKindFilter := len(kinds) > 0
 	builder.WriteString(`
 WITH prefilter AS (
-  SELECT chunk_id, embedding
-  FROM chunks_vec
-  ORDER BY vec_distance_cosine(vec_slice(embedding, 0, ?), ?)
+  SELECT v.chunk_id, v.embedding
+  FROM chunks_vec v`)
+	if hasKindFilter {
+		// Join through chunks → records inside the CTE so the kind
+		// predicate prunes the prefilter search space itself. Applying
+		// the kind filter after the truncated shortlist was selected
+		// would silently drop candidates of the requested kind whenever
+		// another kind dominated the top matryoshkaPrefilterMultiplier×
+		// limit rows.
+		builder.WriteString(`
+  JOIN chunks c ON c.id = v.chunk_id
+  JOIN records r ON r.ref = c.record_ref
+  WHERE r.kind IN (`)
+		for i, kind := range kinds {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString("?")
+			args = append(args, strings.TrimSpace(kind))
+		}
+		builder.WriteString(")")
+	}
+	builder.WriteString(`
+  ORDER BY vec_distance_cosine(vec_slice(v.embedding, 0, ?), ?)
   LIMIT ?
 )
 SELECT
@@ -1001,25 +1039,9 @@ SELECT
 FROM prefilter pf
 JOIN chunks c ON c.id = pf.chunk_id
 JOIN records r ON r.ref = c.record_ref
-WHERE 1 = 1`)
-	args = append(args, searchDim, truncatedQuery, prefilterLimit, queryBlob)
-
-	if len(kinds) > 0 {
-		builder.WriteString(" AND r.kind IN (")
-		for i, kind := range kinds {
-			if i > 0 {
-				builder.WriteString(", ")
-			}
-			builder.WriteString("?")
-			args = append(args, strings.TrimSpace(kind))
-		}
-		builder.WriteString(")")
-	}
-
-	builder.WriteString(`
 ORDER BY distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
-	args = append(args, limit)
+	args = append(args, searchDim, truncatedQuery, prefilterLimit, queryBlob, limit)
 	return builder.String(), args
 }
 

@@ -1605,6 +1605,71 @@ func TestSearchMatryoshkaRejectsInt8Index(t *testing.T) {
 	}
 }
 
+func TestSearchMatryoshkaHonorsKindFilterInsidePrefilter(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+
+	// Build a corpus where the "note" kind is a tiny minority against a
+	// large block of "noise" chunks. If the Matryoshka prefilter applied
+	// the kind filter after truncation, the single note chunk could
+	// easily fall outside the shortlist and the search would silently
+	// return zero hits even though a matching kind exists.
+	records := []corpus.Record{{
+		Ref:        "target-note",
+		Kind:       "note",
+		Title:      "Target Note",
+		SourceRef:  "file://notes/target.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "Background workers process items in batches every hour.",
+	}}
+	for i := 0; i < 50; i++ {
+		records = append(records, corpus.Record{
+			Ref:        "noise-" + strconv.Itoa(i),
+			Kind:       "noise",
+			Title:      "Noise " + strconv.Itoa(i),
+			SourceRef:  "file://noise/" + strconv.Itoa(i) + ".txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Unrelated filler text number " + strconv.Itoa(i) + ".",
+		})
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	hits, err := Search(context.Background(), SearchQuery{
+		Path:            path,
+		Text:            "background workers batches",
+		Limit:           3,
+		Kinds:           []string{"note"},
+		Embedder:        fixture,
+		SearchDimension: 8,
+	})
+	if err != nil {
+		t.Fatalf("Search(Kinds=note, SearchDimension=8) error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("Matryoshka + kind filter returned no hits; the prefilter must apply the kind restriction before truncation, not after")
+	}
+	if hits[0].Ref != "target-note" || hits[0].Kind != "note" {
+		t.Fatalf("first hit = (%s, %s), want (target-note, note)", hits[0].Ref, hits[0].Kind)
+	}
+	for _, hit := range hits {
+		if hit.Kind != "note" {
+			t.Fatalf("kind filter leaked: hit %s has kind %q", hit.Ref, hit.Kind)
+		}
+	}
+}
+
 func TestRebuildSelfReuseReplacesSnapshotInPlace(t *testing.T) {
 	t.Parallel()
 
