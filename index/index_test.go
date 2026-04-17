@@ -14,7 +14,10 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
-const testSyncGuideRef = "sync-guide"
+const (
+	testSyncGuideRef = "sync-guide"
+	testAlphaRef     = "alpha"
+)
 
 type reverseReranker struct {
 	seenQuery      string
@@ -1420,6 +1423,408 @@ func TestRebuildStreamingReuseAcrossManyRecords(t *testing.T) {
 	if result.ReusedRecordCount != unchangedCount {
 		t.Fatalf("ReusedRecordCount = %d, want %d", result.ReusedRecordCount, unchangedCount)
 	}
+}
+
+// prefixContextualizer is a deterministic fixture that emits a per-record
+// prefix derived from the record ref, so tests can both reason about what
+// gets persisted and detect when the contextualizer "changes" across
+// rebuilds (by swapping the tag).
+type prefixContextualizer struct {
+	tag   string
+	calls int
+}
+
+func (p *prefixContextualizer) ContextualizeChunks(_ context.Context, record corpus.Record, sections []chunk.Section) ([]string, error) {
+	p.calls++
+	out := make([]string, len(sections))
+	for i := range sections {
+		out[i] = p.tag + ":" + record.Ref
+	}
+	return out, nil
+}
+
+func TestRebuildContextualizerPersistsPrefix(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	contextualizer := &prefixContextualizer{tag: "ctx"}
+	records := []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "Alpha handles queue admission.",
+	}}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:           path,
+		Embedder:       fixture,
+		Contextualizer: contextualizer,
+	}); err != nil {
+		t.Fatalf("Rebuild(contextualizer) error = %v", err)
+	}
+	if contextualizer.calls == 0 {
+		t.Fatal("contextualizer.calls = 0, want >=1 (Rebuild must invoke Contextualizer when configured)")
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	sections, err := snapshot.Sections(context.Background(), SectionQuery{})
+	if err != nil {
+		t.Fatalf("Sections() error = %v", err)
+	}
+	if len(sections) == 0 {
+		t.Fatal("Sections() returned no sections")
+	}
+	want := "ctx:alpha"
+	for _, section := range sections {
+		if section.ContextPrefix != want {
+			t.Fatalf("section %s ContextPrefix = %q, want %q", section.Ref, section.ContextPrefix, want)
+		}
+	}
+}
+
+func TestSearchFTSMatchesContextualPrefix(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	records := []corpus.Record{
+		{
+			Ref:        testAlphaRef,
+			Kind:       "note",
+			Title:      "Alpha",
+			SourceRef:  "file://alpha.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Widgets are processed in batches every hour.",
+		},
+		{
+			Ref:        "beta",
+			Kind:       "note",
+			Title:      "Beta",
+			SourceRef:  "file://beta.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Unrelated text about retries.",
+		},
+	}
+
+	// Contextualizer appends a distinct token ("contextAlphaToken") only
+	// on the alpha record. An FTS search for that token must find alpha,
+	// proving the prefix ended up in the FTS5 index even though it is
+	// absent from the stored content column.
+	contextualizer := contextualizerFunc(func(_ context.Context, record corpus.Record, sections []chunk.Section) ([]string, error) {
+		out := make([]string, len(sections))
+		for i := range sections {
+			if record.Ref == testAlphaRef {
+				out[i] = "contextAlphaToken"
+			}
+		}
+		return out, nil
+	})
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:           path,
+		Embedder:       fixture,
+		Contextualizer: contextualizer,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	hits, err := Search(context.Background(), SearchQuery{
+		Path:     path,
+		Text:     "contextAlphaToken",
+		Limit:    5,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("Search() returned no hits for contextualizer-only token")
+	}
+	if hits[0].Ref != testAlphaRef {
+		t.Fatalf("first hit ref = %q, want alpha (FTS must match the contextual prefix)", hits[0].Ref)
+	}
+	// The stored content column must stay the original body, not the
+	// prefix-augmented text surfaced through FTS.
+	if strings.Contains(hits[0].Content, "contextAlphaToken") {
+		t.Fatalf("hit content leaks context prefix: %q", hits[0].Content)
+	}
+}
+
+func TestRebuildContextualizerChangeInvalidatesReuse(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	pathA := dir + "/a.db"
+	pathB := dir + "/b.db"
+
+	records := []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "Alpha handles queue admission.",
+	}}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:           pathA,
+		Embedder:       fixture,
+		Contextualizer: &prefixContextualizer{tag: "v1"},
+	}); err != nil {
+		t.Fatalf("Rebuild(v1) error = %v", err)
+	}
+
+	// A contextualizer that emits a different prefix for the same record
+	// changes the reuse key. Reuse must not carry over stale embeddings.
+	resultSwap, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:           pathB,
+		ReuseFromPath:  pathA,
+		Embedder:       fixture,
+		Contextualizer: &prefixContextualizer{tag: "v2"},
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(v2 reusing v1) error = %v", err)
+	}
+	if resultSwap.ReusedChunkCount != 0 {
+		t.Fatalf("ReusedChunkCount = %d, want 0 (different prefix must miss the reuse key)",
+			resultSwap.ReusedChunkCount)
+	}
+
+	// Sanity: the same contextualizer version reuses the same chunks.
+	pathC := dir + "/c.db"
+	resultSame, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:           pathC,
+		ReuseFromPath:  pathA,
+		Embedder:       fixture,
+		Contextualizer: &prefixContextualizer{tag: "v1"},
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(v1 reusing v1) error = %v", err)
+	}
+	if resultSame.ReusedChunkCount != resultSame.ChunkCount {
+		t.Fatalf("ReusedChunkCount = %d, ChunkCount = %d, want equal (matching prefix must hit reuse)",
+			resultSame.ReusedChunkCount, resultSame.ChunkCount)
+	}
+}
+
+func TestRebuildContextualizerRejectsWrongLengthPrefixes(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	broken := contextualizerFunc(func(_ context.Context, _ corpus.Record, _ []chunk.Section) ([]string, error) {
+		return []string{"only-one-prefix"}, nil
+	})
+
+	_, err = Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "guide",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "# One\n\nfirst.\n\n# Two\n\nsecond.",
+	}}, BuildOptions{
+		Path:           path,
+		Embedder:       fixture,
+		Contextualizer: broken,
+	})
+	if err == nil || !strings.Contains(err.Error(), "prefixes for") {
+		t.Fatalf("Rebuild(broken contextualizer) err = %v, want length-mismatch error", err)
+	}
+}
+
+func TestOpenSnapshotV2BackwardCompatibleSections(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	snap, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(v2) error = %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+
+	sections, err := snap.Sections(context.Background(), SectionQuery{})
+	if err != nil {
+		t.Fatalf("Sections(v2) error = %v", err)
+	}
+	if len(sections) == 0 {
+		t.Fatal("Sections(v2) returned no sections")
+	}
+	for _, section := range sections {
+		if section.ContextPrefix != "" {
+			t.Fatalf("v2 section %s ContextPrefix = %q, want empty", section.Ref, section.ContextPrefix)
+		}
+	}
+}
+
+func TestUpdateMigratesV2ToV3AndStaysUsable(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	if _, err := Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Update(v2→v3 migration) error = %v", err)
+	}
+
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.SchemaVersion != "3" {
+		t.Fatalf("SchemaVersion = %q after Update migration, want 3", stats.SchemaVersion)
+	}
+}
+
+func TestRebuildReuseFromV2SnapshotStillHits(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	pathA := dir + "/a.db"
+	pathB := dir + "/b.db"
+
+	records := []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     pathA,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(A) error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(pathA); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          pathB,
+		ReuseFromPath: pathA,
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(B reusing v2 A) error = %v", err)
+	}
+	if result.ReusedChunkCount == 0 {
+		t.Fatal("ReusedChunkCount = 0 against v2 reuse source; v2 must stay reuse-compatible when no Contextualizer is configured")
+	}
+	if result.ReusedChunkCount != result.ChunkCount {
+		t.Fatalf("ReusedChunkCount = %d, ChunkCount = %d, want equal", result.ReusedChunkCount, result.ChunkCount)
+	}
+}
+
+// rewriteSnapshotToV2 converts a freshly-built v3 snapshot into a v2 one
+// by dropping the context_prefix column and rewinding schema_version, so
+// the v2-backcompat tests can run against the same build surface that
+// produced the snapshot in the first place.
+func rewriteSnapshotToV2(path string) error {
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	for _, stmt := range []string{
+		`ALTER TABLE chunks DROP COLUMN context_prefix`,
+		`UPDATE metadata SET value = '2' WHERE key = 'schema_version'`,
+	} {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// contextualizerFunc adapts a function literal to ChunkContextualizer for
+// test fixtures that only need a one-off implementation.
+type contextualizerFunc func(ctx context.Context, record corpus.Record, sections []chunk.Section) ([]string, error)
+
+func (f contextualizerFunc) ContextualizeChunks(ctx context.Context, record corpus.Record, sections []chunk.Section) ([]string, error) {
+	return f(ctx, record, sections)
 }
 
 func TestRebuildBinaryQuantizationReturnsClosestHit(t *testing.T) {
