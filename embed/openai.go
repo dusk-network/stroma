@@ -70,10 +70,13 @@ func (c OpenAIConfig) String() string {
 
 // GoString returns a redacted Go-syntax rendering of the config for %#v.
 // Without this, %#v falls back to reflection and surfaces the raw
-// APIToken field value.
+// APIToken field value. Timeout is formatted as time.Duration(ns) so
+// the result stays a valid Go composite literal a reader could paste
+// back into source (Duration's default %s form "2s" is human-readable
+// but not Go-parseable).
 func (c OpenAIConfig) GoString() string {
-	return fmt.Sprintf("embed.OpenAIConfig{BaseURL:%q, Model:%q, Timeout:%s, APIToken:%q}",
-		c.BaseURL, c.Model, c.Timeout, redactedToken(c.APIToken))
+	return fmt.Sprintf("embed.OpenAIConfig{BaseURL:%q, Model:%q, Timeout:time.Duration(%d), APIToken:%q}",
+		c.BaseURL, c.Model, int64(c.Timeout), redactedToken(c.APIToken))
 }
 
 // LogValue implements slog.LogValuer so slog handlers — including the
@@ -238,7 +241,11 @@ func (e *OpenAI) parseEmbedResponse(body io.Reader, inputCount int) ([][]float64
 			Index     int       `json:"index"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	// json.Decoder matches the previous json.NewDecoder(body).Decode
+	// behaviour — it tolerates trailing whitespace or filler after the
+	// first complete JSON value, which nonconforming self-hosted
+	// gateways sometimes emit. json.Unmarshal would reject those.
+	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("stroma/embed: decode openai response: %w", err)
 	}
 	if len(payload.Data) != inputCount {
