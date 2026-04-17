@@ -31,10 +31,10 @@ type BuildOptions struct {
 	// stored embedding whenever its title, heading, and body match a
 	// section already present in the prior snapshot. Records that are
 	// fully unchanged are the maximal case, but sections carried over
-	// from an edited record still reuse their embeddings. The reuse
-	// snapshot is loaded fully into memory (roughly embedding-size bytes
-	// per stored chunk); at very large corpora this can be a meaningful
-	// RAM cost. Leave empty to disable reuse.
+	// from an edited record still reuse their embeddings. The snapshot is
+	// opened read-only and queried per-record during the rebuild, so
+	// resident memory scales with a single record's chunks rather than
+	// with the whole corpus. Leave empty to disable reuse.
 	ReuseFromPath string
 
 	Embedder embed.Embedder
@@ -154,6 +154,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = inputs.reuseState.Close() }()
 
 	if err := os.MkdirAll(filepath.Dir(inputs.indexPath), 0o750); err != nil {
 		return nil, fmt.Errorf("create index directory: %w", err)
@@ -218,6 +219,14 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 		if stats.recordUnchanged {
 			result.ReusedRecordCount++
 		}
+	}
+
+	// Release the reuse snapshot before swapping the staged index into
+	// place: on Windows, replaceFile cannot rename over an open SQLite
+	// handle, and for self-reuse rebuilds (Path == ReuseFromPath) the
+	// open reuse connection points at the file being replaced.
+	if err := inputs.reuseState.Close(); err != nil {
+		return nil, fmt.Errorf("close reuse snapshot: %w", err)
 	}
 
 	metadata := map[string]string{
@@ -330,6 +339,7 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 			cfg.dimension,
 			cfg.quantization,
 		)
+		defer func() { _ = cfg.reuse.Close() }()
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -659,7 +669,7 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		return stats, err
 	}
 
-	plan := planRecordReuse(record, storedRecordForReuse(s.reuse, record.Ref), s.chunkOpts)
+	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), s.chunkOpts)
 	sections := plan.sections
 	stats.sections = len(sections)
 	stats.reusedChunks = plan.reusedChunkCount

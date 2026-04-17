@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1321,6 +1322,166 @@ func TestUpdateMixedOperationsMatchEquivalentRebuild(t *testing.T) {
 	rebuildRefs := searchRefs(rebuildHits)
 	if !reflect.DeepEqual(updateRefs, rebuildRefs) {
 		t.Fatalf("update search refs = %v, want %v", updateRefs, rebuildRefs)
+	}
+}
+
+func TestRebuildStreamingReuseAcrossManyRecords(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	pathA := dir + "/a.db"
+	pathB := dir + "/b.db"
+
+	const (
+		unchangedCount = 20
+		editedCount    = 5
+		addedCount     = 5
+	)
+
+	baseRecord := func(i int) corpus.Record {
+		return corpus.Record{
+			Ref:        "rec-" + strconv.Itoa(i),
+			Kind:       "guide",
+			Title:      "Record " + strconv.Itoa(i),
+			SourceRef:  "file://docs/rec-" + strconv.Itoa(i) + ".md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText: "# Overview\n\nRecord " + strconv.Itoa(i) + " covers queue admission and limits.\n\n" +
+				"## Limits\n\nRecord " + strconv.Itoa(i) + " enforces hourly quotas.",
+		}
+	}
+
+	initial := make([]corpus.Record, 0, unchangedCount+editedCount)
+	for i := 0; i < unchangedCount+editedCount; i++ {
+		initial = append(initial, baseRecord(i))
+	}
+
+	if _, err := Rebuild(context.Background(), initial, BuildOptions{
+		Path:     pathA,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(A) error = %v", err)
+	}
+
+	// Build set B: keep the first `unchangedCount` records identical,
+	// edit the second section on the next `editedCount`, and append
+	// `addedCount` brand-new records.
+	next := make([]corpus.Record, 0, unchangedCount+editedCount+addedCount)
+	for i := 0; i < unchangedCount; i++ {
+		next = append(next, baseRecord(i))
+	}
+	for i := unchangedCount; i < unchangedCount+editedCount; i++ {
+		edited := baseRecord(i)
+		edited.BodyText = "# Overview\n\nRecord " + strconv.Itoa(i) + " covers queue admission and limits.\n\n" +
+			"## Limits\n\nRecord " + strconv.Itoa(i) + " enforces per-tenant quotas."
+		next = append(next, edited)
+	}
+	for i := 0; i < addedCount; i++ {
+		next = append(next, corpus.Record{
+			Ref:        "new-" + strconv.Itoa(i),
+			Kind:       "note",
+			Title:      "Note " + strconv.Itoa(i),
+			SourceRef:  "file://docs/new-" + strconv.Itoa(i) + ".txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Newly added note " + strconv.Itoa(i) + " records retry budgets.",
+		})
+	}
+
+	result, err := Rebuild(context.Background(), next, BuildOptions{
+		Path:          pathB,
+		ReuseFromPath: pathA,
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(B, reuse A) error = %v", err)
+	}
+
+	// Chunks in B: unchanged (2 each) + edited (2 each) + added (1 each).
+	wantChunks := unchangedCount*2 + editedCount*2 + addedCount
+	if result.ChunkCount != wantChunks {
+		t.Fatalf("ChunkCount = %d, want %d", result.ChunkCount, wantChunks)
+	}
+	// Reused chunks: both sections of each unchanged record plus the
+	// unchanged "Overview" section on each edited record.
+	wantReusedChunks := unchangedCount*2 + editedCount
+	if result.ReusedChunkCount != wantReusedChunks {
+		t.Fatalf("ReusedChunkCount = %d, want %d", result.ReusedChunkCount, wantReusedChunks)
+	}
+	// Embedded chunks: the rewritten "Limits" section on each edited
+	// record plus the single section per added plaintext record.
+	wantEmbedded := editedCount + addedCount
+	if result.EmbeddedChunkCount != wantEmbedded {
+		t.Fatalf("EmbeddedChunkCount = %d, want %d", result.EmbeddedChunkCount, wantEmbedded)
+	}
+	if result.ReusedRecordCount != unchangedCount {
+		t.Fatalf("ReusedRecordCount = %d, want %d", result.ReusedRecordCount, unchangedCount)
+	}
+}
+
+func TestRebuildSelfReuseReplacesSnapshotInPlace(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	path := dir + "/index.db"
+
+	records := []corpus.Record{
+		{
+			Ref:        "alpha",
+			Kind:       "guide",
+			Title:      "Alpha",
+			SourceRef:  "file://docs/alpha.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Overview\n\nAlpha handles queue admission.\n\n## Limits\n\nAlpha applies hourly quotas.",
+		},
+		{
+			Ref:        "beta",
+			Kind:       "note",
+			Title:      "Beta",
+			SourceRef:  "file://docs/beta.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Beta performs background health checks.",
+		},
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(initial) error = %v", err)
+	}
+
+	// Rebuilding into the same path while reusing from it must close the
+	// read-only reuse handle before replaceFile renames the staged file
+	// into place, otherwise the rebuild races an open handle against the
+	// atomic swap (fatal on Windows).
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          path,
+		ReuseFromPath: path,
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(self-reuse) error = %v", err)
+	}
+	if result.ReusedRecordCount != len(records) {
+		t.Fatalf("ReusedRecordCount = %d, want %d (all records carry over on self-reuse)",
+			result.ReusedRecordCount, len(records))
+	}
+	if result.EmbeddedChunkCount != 0 {
+		t.Fatalf("EmbeddedChunkCount = %d, want 0 (all chunks reused on self-reuse)",
+			result.EmbeddedChunkCount)
+	}
+	if result.ReusedChunkCount != result.ChunkCount {
+		t.Fatalf("ReusedChunkCount = %d, ChunkCount = %d, want equal on self-reuse",
+			result.ReusedChunkCount, result.ChunkCount)
 	}
 }
 

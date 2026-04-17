@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -15,8 +16,11 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
+// reuseState holds a live read-only handle to the prior snapshot. Record and
+// chunk rows are fetched on demand by storedRecordForReuse, so resident memory
+// scales with one record's chunks instead of the whole corpus.
 type reuseState struct {
-	records map[string]storedRecord
+	db *sql.DB
 }
 
 type storedRecord struct {
@@ -37,7 +41,7 @@ type recordReusePlan struct {
 }
 
 func loadReuseState(ctx context.Context, path, embedderFingerprint string, embedderDimension int, quantization string) *reuseState {
-	empty := &reuseState{records: map[string]storedRecord{}}
+	empty := &reuseState{}
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return empty
@@ -57,17 +61,23 @@ func loadReuseState(ctx context.Context, path, embedderFingerprint string, embed
 	if err != nil {
 		return empty
 	}
-	defer func() { _ = db.Close() }()
 
 	if !isCompatibleReuseSnapshot(ctx, db, embedderFingerprint, embedderDimension, quantization) {
+		_ = db.Close()
 		return empty
 	}
 
-	state, err := loadStoredReuseRecords(ctx, db)
-	if err != nil {
-		return empty
+	return &reuseState{db: db}
+}
+
+// Close releases the underlying read-only connection. Nil-safe and idempotent.
+func (s *reuseState) Close() error {
+	if s == nil || s.db == nil {
+		return nil
 	}
-	return state
+	err := s.db.Close()
+	s.db = nil
+	return err
 }
 
 func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int, quantization string) bool {
@@ -93,67 +103,6 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 		return false
 	}
 	return true
-}
-
-func loadStoredReuseRecords(ctx context.Context, db *sql.DB) (*reuseState, error) {
-	rows, err := db.QueryContext(ctx, `SELECT ref, title, content_hash FROM records`)
-	if err != nil {
-		return nil, fmt.Errorf("query stored records: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	state := &reuseState{records: make(map[string]storedRecord)}
-	for rows.Next() {
-		var (
-			ref         string
-			title       string
-			contentHash string
-		)
-		if err := rows.Scan(&ref, &title, &contentHash); err != nil {
-			return nil, fmt.Errorf("scan stored record: %w", err)
-		}
-		state.records[ref] = storedRecord{
-			contentHash: contentHash,
-			title:       title,
-			chunks:      map[string][]byte{},
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate stored records: %w", err)
-	}
-
-	rows, err = db.QueryContext(ctx, `
-SELECT c.record_ref, c.heading, c.content, v.embedding
-FROM chunks c
-JOIN chunks_vec v ON v.chunk_id = c.id
-ORDER BY c.record_ref, c.chunk_index ASC, c.id ASC`)
-	if err != nil {
-		return nil, fmt.Errorf("query stored chunks: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		var (
-			ref       string
-			heading   string
-			content   string
-			embedding []byte
-		)
-		if err := rows.Scan(&ref, &heading, &content, &embedding); err != nil {
-			return nil, fmt.Errorf("scan stored chunk: %w", err)
-		}
-		record, ok := state.records[ref]
-		if !ok {
-			continue
-		}
-		record.chunks[reuseChunkKey(record.title, heading, content)] = append([]byte(nil), embedding...)
-		state.records[ref] = record
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate stored chunks: %w", err)
-	}
-
-	return state, nil
 }
 
 func planRecordReuse(record corpus.Record, stored storedRecord, chunkOpts chunk.Options) recordReusePlan {
@@ -183,11 +132,79 @@ func planRecordReuse(record corpus.Record, stored storedRecord, chunkOpts chunk.
 	return plan
 }
 
-func storedRecordForReuse(state *reuseState, ref string) storedRecord {
-	if state == nil || state.records == nil {
+// storedRecordForReuse fetches the stored record's content hash and its chunk
+// embeddings for ref, on demand. A clean "no row" fall-through still misses a
+// reuse opportunity without blocking the write path; any other read error
+// disables reuse for the remainder of this session so embedder cost stays
+// predictable instead of producing a half-reused build under transient
+// SQLITE_BUSY or corruption.
+func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) storedRecord {
+	if state == nil || state.db == nil {
 		return storedRecord{}
 	}
-	return state.records[ref]
+
+	var (
+		title       string
+		contentHash string
+	)
+	row := state.db.QueryRowContext(ctx, `SELECT title, content_hash FROM records WHERE ref = ?`, ref)
+	if err := row.Scan(&title, &contentHash); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			state.disable()
+		}
+		return storedRecord{}
+	}
+
+	chunks, err := loadStoredChunksForRecord(ctx, state.db, ref, title)
+	if err != nil {
+		state.disable()
+		return storedRecord{}
+	}
+	return storedRecord{
+		contentHash: contentHash,
+		title:       title,
+		chunks:      chunks,
+	}
+}
+
+// disable closes the read-only handle and nils it out so subsequent reuse
+// lookups short-circuit to an empty storedRecord. Idempotent.
+func (s *reuseState) disable() {
+	if s == nil || s.db == nil {
+		return
+	}
+	_ = s.db.Close()
+	s.db = nil
+}
+
+func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title string) (map[string][]byte, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT c.heading, c.content, v.embedding
+FROM chunks c
+JOIN chunks_vec v ON v.chunk_id = c.id
+WHERE c.record_ref = ?
+ORDER BY c.chunk_index ASC, c.id ASC`, ref)
+	if err != nil {
+		return nil, fmt.Errorf("query stored chunks for %s: %w", ref, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[string][]byte)
+	for rows.Next() {
+		var (
+			heading   string
+			content   string
+			embedding []byte
+		)
+		if err := rows.Scan(&heading, &content, &embedding); err != nil {
+			return nil, fmt.Errorf("scan stored chunk for %s: %w", ref, err)
+		}
+		out[reuseChunkKey(title, heading, content)] = append([]byte(nil), embedding...)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stored chunks for %s: %w", ref, err)
+	}
+	return out, nil
 }
 
 func reuseChunkKey(title, heading, body string) string {
