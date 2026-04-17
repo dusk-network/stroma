@@ -46,6 +46,14 @@ type SectionQuery struct {
 	Refs              []string
 	Kinds             []string
 	IncludeEmbeddings bool
+
+	// embeddingsFromFullTable, when true, pulls embeddings from the
+	// chunks_vec_full companion table (binary quantization only) so the
+	// returned vectors are the stored float32 source of truth instead of
+	// the sign-packed bit blob held in chunks_vec. Internal; callers
+	// continue to set IncludeEmbeddings and the Sections() method
+	// decides which column to read.
+	embeddingsFromFullTable bool
 }
 
 // Section is one stored section from a Stroma snapshot.
@@ -246,6 +254,14 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 		if err != nil {
 			return nil, err
 		}
+		if quantization == store.QuantizationBinary {
+			// Read from the full-precision companion so callers get
+			// the real float32 vector, not its sign-packed stub, and
+			// switch the decode path to float32 so scanSectionRow
+			// interprets the blob correctly.
+			query.embeddingsFromFullTable = true
+			quantization = store.QuantizationFloat32
+		}
 	}
 
 	sqlText, args := buildSectionsQuery(query)
@@ -289,8 +305,16 @@ SELECT
 FROM chunks c
 JOIN records r ON r.ref = c.record_ref`)
 	if query.IncludeEmbeddings {
-		builder.WriteString(`
+		// Binary snapshots surface full-precision vectors via the
+		// chunks_vec_full companion so IncludeEmbeddings yields usable
+		// float32 values instead of sign-expanded {-1, 1} stubs.
+		if query.embeddingsFromFullTable {
+			builder.WriteString(`
+JOIN chunks_vec_full v ON v.chunk_id = c.id`)
+		} else {
+			builder.WriteString(`
 JOIN chunks_vec v ON v.chunk_id = c.id`)
+		}
 	}
 	builder.WriteString(`
 WHERE 1 = 1`)
@@ -439,10 +463,20 @@ func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float
 	if err != nil {
 		return nil, fmt.Errorf("encode query vector: %w", err)
 	}
-	sqlText, args := buildSearchSQL(SearchQuery{
-		Limit: limit,
-		Kinds: kinds,
-	}, queryBlob, quantization)
+	var sqlText string
+	var args []any
+	if quantization == store.QuantizationBinary {
+		fullQueryBlob, err := store.EncodeVectorBlob(embedding)
+		if err != nil {
+			return nil, fmt.Errorf("encode full-precision query vector: %w", err)
+		}
+		sqlText, args = buildBinarySearchSQL(limit, kinds, queryBlob, fullQueryBlob)
+	} else {
+		sqlText, args = buildSearchSQL(SearchQuery{
+			Limit: limit,
+			Kinds: kinds,
+		}, queryBlob, quantization)
+	}
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("run search query: %w", err)

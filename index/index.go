@@ -497,10 +497,11 @@ func normalizeRecords(records []corpus.Record) ([]corpus.Record, error) {
 }
 
 func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization string) error {
-	vecType := fmt.Sprintf("float[%d]", dimension)
-	if quantization == store.QuantizationInt8 {
-		vecType = fmt.Sprintf("int8[%d]", dimension)
+	if quantization == store.QuantizationBinary && dimension%8 != 0 {
+		return fmt.Errorf("binary quantization requires embedder dimension divisible by 8, got %d", dimension)
 	}
+
+	vecTableStmt := buildChunksVecDDL(dimension, quantization)
 
 	statements := []string{
 		`CREATE TABLE records (
@@ -521,10 +522,7 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 			content     TEXT NOT NULL,
 			FOREIGN KEY (record_ref) REFERENCES records(ref) ON DELETE CASCADE
 		)`,
-		fmt.Sprintf(`CREATE VIRTUAL TABLE chunks_vec USING vec0(
-			chunk_id INTEGER PRIMARY KEY,
-			embedding %s distance_metric=cosine
-		)`, vecType),
+		vecTableStmt,
 		`CREATE TABLE metadata (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -533,6 +531,17 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 		`CREATE INDEX idx_records_kind ON records(kind)`,
 		`CREATE INDEX idx_chunks_record_ref ON chunks(record_ref)`,
 	}
+	if quantization == store.QuantizationBinary {
+		// Companion full-precision column for the rescore pass. The
+		// primary chunks_vec holds sign-packed bits for the hamming
+		// prefilter, and chunks_vec_full holds the float32 blob
+		// sqlite-vec consumes as a cosine-distance argument.
+		statements = append(statements, `CREATE TABLE chunks_vec_full (
+			chunk_id  INTEGER PRIMARY KEY,
+			embedding BLOB NOT NULL,
+			FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+		)`)
+	}
 
 	for _, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
@@ -540,6 +549,27 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 		}
 	}
 	return nil
+}
+
+func buildChunksVecDDL(dimension int, quantization string) string {
+	switch quantization {
+	case store.QuantizationInt8:
+		return fmt.Sprintf(`CREATE VIRTUAL TABLE chunks_vec USING vec0(
+			chunk_id INTEGER PRIMARY KEY,
+			embedding int8[%d] distance_metric=cosine
+		)`, dimension)
+	case store.QuantizationBinary:
+		// sqlite-vec infers hamming distance for bit[N] columns.
+		return fmt.Sprintf(`CREATE VIRTUAL TABLE chunks_vec USING vec0(
+			chunk_id INTEGER PRIMARY KEY,
+			embedding bit[%d]
+		)`, dimension)
+	default:
+		return fmt.Sprintf(`CREATE VIRTUAL TABLE chunks_vec USING vec0(
+			chunk_id INTEGER PRIMARY KEY,
+			embedding float[%d] distance_metric=cosine
+		)`, dimension)
+	}
 }
 
 func insertRecord(ctx context.Context, stmt *sql.Stmt, record corpus.Record) error {
@@ -594,10 +624,11 @@ type indexSession struct {
 	dimension    int
 	quantization string
 
-	recordStmt *sql.Stmt
-	chunkStmt  *sql.Stmt
-	vectorStmt *sql.Stmt
-	ftsStmt    *sql.Stmt
+	recordStmt     *sql.Stmt
+	chunkStmt      *sql.Stmt
+	vectorStmt     *sql.Stmt
+	vectorFullStmt *sql.Stmt // nil unless quantization == binary
+	ftsStmt        *sql.Stmt
 }
 
 func newIndexSession(ctx context.Context, tx *sql.Tx, cfg sessionConfig) (*indexSession, error) {
@@ -631,13 +662,25 @@ record_ref, chunk_index, heading, content
 	}
 
 	vectorInsertSQL := `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)`
-	if cfg.quantization == store.QuantizationInt8 {
+	switch cfg.quantization {
+	case store.QuantizationInt8:
 		vectorInsertSQL = `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_int8(?))`
+	case store.QuantizationBinary:
+		vectorInsertSQL = `INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_bit(?))`
 	}
 	s.vectorStmt, err = tx.PrepareContext(ctx, vectorInsertSQL)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("prepare vector insert: %w", err)
+	}
+
+	if cfg.quantization == store.QuantizationBinary {
+		s.vectorFullStmt, err = tx.PrepareContext(ctx,
+			`INSERT INTO chunks_vec_full (chunk_id, embedding) VALUES (?, ?)`)
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("prepare full-precision vector insert: %w", err)
+		}
 	}
 
 	s.ftsStmt, err = tx.PrepareContext(ctx, `INSERT INTO fts_chunks(rowid, title, heading, content) VALUES (?, ?, ?, ?)`)
@@ -654,7 +697,7 @@ func (s *indexSession) Close() {
 	if s == nil {
 		return
 	}
-	for _, stmt := range []**sql.Stmt{&s.recordStmt, &s.chunkStmt, &s.vectorStmt, &s.ftsStmt} {
+	for _, stmt := range []**sql.Stmt{&s.recordStmt, &s.chunkStmt, &s.vectorStmt, &s.vectorFullStmt, &s.ftsStmt} {
 		if *stmt != nil {
 			_ = (*stmt).Close()
 			*stmt = nil
@@ -715,6 +758,7 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		s.chunkStmt,
 		s.ftsStmt,
 		s.vectorStmt,
+		s.vectorFullStmt,
 	); err != nil {
 		return stats, err
 	}
@@ -730,7 +774,7 @@ func insertChunks(
 	vectors [][]float64,
 	dimension int,
 	quantization string,
-	chunkStmt, ftsStmt, vectorStmt *sql.Stmt,
+	chunkStmt, ftsStmt, vectorStmt, vectorFullStmt *sql.Stmt,
 ) error {
 	newVectorIndex := 0
 	for index, section := range sections {
@@ -745,8 +789,12 @@ func insertChunks(
 		if _, err := ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, section.Body); err != nil {
 			return fmt.Errorf("insert fts for %s chunk %d: %w", record.Ref, index, err)
 		}
-		if blob, ok := plan.reusedEmbeddings[plan.keys[index]]; ok {
-			if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
+		if reused, ok := plan.reusedEmbeddings[plan.keys[index]]; ok {
+			primary, full, err := reusedBlobsFor(quantization, reused)
+			if err != nil {
+				return fmt.Errorf("prepare reused embedding for %s chunk %d: %w", record.Ref, index, err)
+			}
+			if err := insertVectorBlobs(ctx, chunkID, primary, full, vectorStmt, vectorFullStmt); err != nil {
 				return fmt.Errorf("insert reused embedding for %s chunk %d: %w", record.Ref, index, err)
 			}
 			continue
@@ -757,14 +805,65 @@ func insertChunks(
 		if len(vectors[newVectorIndex]) != dimension {
 			return fmt.Errorf("record %s section %d embedding has dimension %d, want %d", record.Ref, index, len(vectors[newVectorIndex]), dimension)
 		}
-		blob, err := encodeVector(vectors[newVectorIndex], quantization)
+		primary, full, err := newBlobsFor(quantization, vectors[newVectorIndex])
 		if err != nil {
 			return fmt.Errorf("encode embedding for %s chunk %d: %w", record.Ref, index, err)
 		}
-		if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
+		if err := insertVectorBlobs(ctx, chunkID, primary, full, vectorStmt, vectorFullStmt); err != nil {
 			return fmt.Errorf("insert embedding for %s chunk %d: %w", record.Ref, index, err)
 		}
 		newVectorIndex++
+	}
+	return nil
+}
+
+// newBlobsFor encodes a newly-embedded vector into the primary (vec0) blob
+// and, when binary quantization is active, the full-precision companion
+// blob consumed by the rescore pass.
+func newBlobsFor(quantization string, vector []float64) (primary, full []byte, err error) {
+	primary, err = encodeVector(vector, quantization)
+	if err != nil {
+		return nil, nil, err
+	}
+	if quantization == store.QuantizationBinary {
+		full, err = store.EncodeVectorBlob(vector)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return primary, full, nil
+}
+
+// reusedBlobsFor splits a reused embedding blob into the primary and full
+// columns. For float32 and int8 modes the reused blob is already the
+// primary blob. For binary mode the reused blob is the full-precision
+// float32 companion, and the primary bit blob is re-derived from it.
+func reusedBlobsFor(quantization string, reused []byte) (primary, full []byte, err error) {
+	if quantization != store.QuantizationBinary {
+		return reused, nil, nil
+	}
+	vector, err := store.DecodeVectorBlob(reused)
+	if err != nil {
+		return nil, nil, err
+	}
+	primary, err = store.EncodeVectorBlobBinary(vector)
+	if err != nil {
+		return nil, nil, err
+	}
+	return primary, reused, nil
+}
+
+func insertVectorBlobs(ctx context.Context, chunkID int64, primary, full []byte, vectorStmt, vectorFullStmt *sql.Stmt) error {
+	if _, err := vectorStmt.ExecContext(ctx, chunkID, primary); err != nil {
+		return err
+	}
+	if full != nil {
+		if vectorFullStmt == nil {
+			return fmt.Errorf("missing prepared statement for full-precision companion insert")
+		}
+		if _, err := vectorFullStmt.ExecContext(ctx, chunkID, full); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -950,6 +1049,70 @@ LIMIT ?`)
 	return builder.String(), args
 }
 
+// binaryRescoreMultiplier scales the hamming prefilter shortlist up from the
+// caller-requested candidate limit so good candidates that the 1-bit
+// prefilter under-ranks still have a chance to survive into the full-dim
+// cosine rescore.
+const binaryRescoreMultiplier = 3
+
+// buildBinarySearchSQL builds the two-stage binary search: a hamming-distance
+// prefilter over chunks_vec's bit[N] column, followed by a full-precision
+// cosine rescore against chunks_vec_full. The final rescored distance is
+// cosine, so downstream score normalization and fusion stay consistent with
+// the float32 and int8 paths.
+func buildBinarySearchSQL(limit int, kinds []string, bitQueryBlob, floatQueryBlob []byte) (querySQL string, args []any) {
+	prefilterLimit := limit * binaryRescoreMultiplier
+
+	var builder strings.Builder
+	args = make([]any, 0, 4+len(kinds))
+	builder.WriteString(`
+WITH prefilter AS (
+  SELECT chunk_id
+  FROM chunks_vec
+  WHERE embedding MATCH vec_bit(?) AND k = ?
+  ORDER BY distance
+),
+rescored AS (
+  SELECT pf.chunk_id,
+         vec_distance_cosine(vf.embedding, ?) AS distance
+  FROM prefilter pf
+  JOIN chunks_vec_full vf ON vf.chunk_id = pf.chunk_id
+)
+SELECT
+  rs.chunk_id,
+  r.ref,
+  r.kind,
+  r.title,
+  r.source_ref,
+  c.heading,
+  c.content,
+  r.metadata_json,
+  rs.distance
+FROM rescored rs
+JOIN chunks c ON c.id = rs.chunk_id
+JOIN records r ON r.ref = c.record_ref
+WHERE 1 = 1`)
+	args = append(args, bitQueryBlob, prefilterLimit, floatQueryBlob)
+
+	if len(kinds) > 0 {
+		builder.WriteString(" AND r.kind IN (")
+		for i, kind := range kinds {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString("?")
+			args = append(args, strings.TrimSpace(kind))
+		}
+		builder.WriteString(")")
+	}
+
+	builder.WriteString(`
+ORDER BY distance ASC, r.ref ASC, c.chunk_index ASC
+LIMIT ?`)
+	args = append(args, limit)
+	return builder.String(), args
+}
+
 func ensureExistingIndex(path string) error {
 	info, err := os.Stat(path)
 	switch {
@@ -962,6 +1125,19 @@ func ensureExistingIndex(path string) error {
 	default:
 		return nil
 	}
+}
+
+// hasTable probes sqlite_master for a table named `name`. Used to keep
+// quantization-agnostic code paths from crashing against snapshots that do
+// not carry the binary-only chunks_vec_full companion table.
+func hasTable(ctx context.Context, q queryContextRunner, name string) (bool, error) {
+	var count int
+	row := q.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name)
+	if err := row.Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func normalizeRemovedRefs(refs []string) []string {
@@ -1078,6 +1254,18 @@ func deleteRecord(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
 		return false, fmt.Errorf("delete vectors for %s: %w", ref, err)
 	}
+	// chunks_vec_full only exists in binary mode. Check the catalogue
+	// first so the quantization-agnostic delete path doesn't fail to
+	// compile against float32 / int8 snapshots.
+	hasFullTable, err := hasTable(ctx, tx, "chunks_vec_full")
+	if err != nil {
+		return false, fmt.Errorf("probe chunks_vec_full for %s: %w", ref, err)
+	}
+	if hasFullTable {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_vec_full WHERE chunk_id IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
+			return false, fmt.Errorf("delete full-precision vectors for %s: %w", ref, err)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fts_chunks WHERE rowid IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
 		return false, fmt.Errorf("delete fts rows for %s: %w", ref, err)
 	}
@@ -1165,21 +1353,32 @@ func normalizeQuantization(q string) (string, error) {
 		return store.QuantizationFloat32, nil
 	case store.QuantizationInt8:
 		return store.QuantizationInt8, nil
+	case store.QuantizationBinary:
+		return store.QuantizationBinary, nil
 	default:
-		return "", fmt.Errorf("unsupported quantization mode %q (must be %q or %q)", q, store.QuantizationFloat32, store.QuantizationInt8)
+		return "", fmt.Errorf("unsupported quantization mode %q (must be %q, %q, or %q)",
+			q, store.QuantizationFloat32, store.QuantizationInt8, store.QuantizationBinary)
 	}
 }
 
 func encodeVector(vector []float64, quantization string) ([]byte, error) {
-	if quantization == store.QuantizationInt8 {
+	switch quantization {
+	case store.QuantizationInt8:
 		return store.EncodeVectorBlobInt8(vector)
+	case store.QuantizationBinary:
+		return store.EncodeVectorBlobBinary(vector)
+	default:
+		return store.EncodeVectorBlob(vector)
 	}
-	return store.EncodeVectorBlob(vector)
 }
 
 func decodeVector(blob []byte, quantization string) ([]float64, error) {
-	if quantization == store.QuantizationInt8 {
+	switch quantization {
+	case store.QuantizationInt8:
 		return store.DecodeVectorBlobInt8(blob)
+	case store.QuantizationBinary:
+		return store.DecodeVectorBlobBinary(blob)
+	default:
+		return store.DecodeVectorBlob(blob)
 	}
-	return store.DecodeVectorBlob(blob)
 }
