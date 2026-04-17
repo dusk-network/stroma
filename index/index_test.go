@@ -1821,6 +1821,157 @@ func rewriteSnapshotToV2(path string) error {
 	return nil
 }
 
+func TestOpenSnapshotRejectsUnknownSchemaVersion(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE metadata SET value = '99' WHERE key = 'schema_version'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("rewrite schema_version = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	_, err = OpenSnapshot(context.Background(), path)
+	if err == nil {
+		t.Fatal("OpenSnapshot() succeeded on schema_version=99, want ErrUnsupportedSchemaVersion")
+	}
+	if !errors.Is(err, ErrUnsupportedSchemaVersion) {
+		t.Fatalf("OpenSnapshot() err = %v, want wraps ErrUnsupportedSchemaVersion", err)
+	}
+	if !strings.Contains(err.Error(), `"99"`) {
+		t.Fatalf("OpenSnapshot() err = %v, want message to include observed version %q", err, "99")
+	}
+}
+
+func TestMigrateV2ToV3IsCrashSafe(t *testing.T) {
+	// Not parallel: mutates the package-level migrateV2ToV3InjectFault hook.
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	injected := errors.New("simulated crash between ALTER and UPDATE")
+	migrateV2ToV3InjectFault = func() error { return injected }
+	t.Cleanup(func() { migrateV2ToV3InjectFault = nil })
+
+	_, err = Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded with injected fault, want failure")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("Update() err = %v, want wraps injected fault", err)
+	}
+
+	// The BEGIN IMMEDIATE transaction must roll back both the ALTER and the
+	// UPDATE, so the snapshot is back to a pristine v2 (no context_prefix
+	// column yet and schema_version still "2").
+	checkDB, err := store.OpenReadOnlyContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnlyContext() error = %v", err)
+	}
+	hasPrefix, err := hasChunkColumn(context.Background(), checkDB, "context_prefix")
+	if err != nil {
+		_ = checkDB.Close()
+		t.Fatalf("hasChunkColumn() error = %v", err)
+	}
+	if hasPrefix {
+		_ = checkDB.Close()
+		t.Fatal("context_prefix column present after rolled-back migration; ALTER leaked past ROLLBACK")
+	}
+	schema, err := readMetadataValue(context.Background(), checkDB, "schema_version")
+	if err != nil {
+		_ = checkDB.Close()
+		t.Fatalf("readMetadataValue() error = %v", err)
+	}
+	if strings.TrimSpace(schema) != prevSchemaVersion {
+		_ = checkDB.Close()
+		t.Fatalf("schema_version = %q after rollback, want %q", schema, prevSchemaVersion)
+	}
+	if err := checkDB.Close(); err != nil {
+		t.Fatalf("checkDB.Close() error = %v", err)
+	}
+
+	// Clear the fault and retry. A fresh Update must complete the migration
+	// cleanly, proving the rollback left the file re-openable.
+	migrateV2ToV3InjectFault = nil
+	if _, err := Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Update() retry error = %v", err)
+	}
+
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.SchemaVersion != schemaVersion {
+		t.Fatalf("SchemaVersion = %q after retry, want %q", stats.SchemaVersion, schemaVersion)
+	}
+}
+
 // contextualizerFunc adapts a function literal to ChunkContextualizer for
 // test fixtures that only need a one-off implementation.
 type contextualizerFunc func(ctx context.Context, record corpus.Record, sections []chunk.Section) ([]string, error)
