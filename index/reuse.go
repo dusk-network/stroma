@@ -27,6 +27,11 @@ import (
 type reuseState struct {
 	db           *sql.DB
 	quantization string
+	// hasContextPrefix is derived from the accept-listed schema_version at
+	// reuse-open time so per-record chunk queries do not reprobe PRAGMA
+	// table_info(chunks) — which used to fire once per record during a
+	// rebuild with reuse enabled.
+	hasContextPrefix bool
 }
 
 type storedRecord struct {
@@ -71,7 +76,8 @@ func loadReuseState(ctx context.Context, path, embedderFingerprint string, embed
 		return empty
 	}
 
-	if !isCompatibleReuseSnapshot(ctx, db, embedderFingerprint, embedderDimension, quantization) {
+	compatible, hasPrefix := isCompatibleReuseSnapshot(ctx, db, embedderFingerprint, embedderDimension, quantization)
+	if !compatible {
 		_ = db.Close()
 		return empty
 	}
@@ -81,7 +87,7 @@ func loadReuseState(ctx context.Context, path, embedderFingerprint string, embed
 		_ = db.Close()
 		return empty
 	}
-	return &reuseState{db: db, quantization: normQ}
+	return &reuseState{db: db, quantization: normQ, hasContextPrefix: hasPrefix}
 }
 
 // Close releases the underlying read-only connection. Nil-safe and idempotent.
@@ -94,10 +100,15 @@ func (s *reuseState) Close() error {
 	return err
 }
 
-func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int, quantization string) bool {
+// isCompatibleReuseSnapshot reports whether the prior snapshot can seed the
+// reuse cache, and — when compatible — whether it carries the v3
+// chunks.context_prefix column. Returning the column flag here avoids a
+// second schema_version round-trip in loadReuseState and lets per-record
+// chunk queries skip PRAGMA table_info(chunks).
+func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int, quantization string) (compatible, hasContextPrefix bool) {
 	schema, err := readMetadataValue(ctx, db, "schema_version")
 	if err != nil {
-		return false
+		return false, false
 	}
 	// v2 snapshots pre-date context_prefix. They are reuse-compatible
 	// because loadStoredChunksForRecord defaults the missing prefix to
@@ -107,26 +118,26 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	// simply miss and get re-embedded.
 	trimmed := strings.TrimSpace(schema)
 	if trimmed != schemaVersion && trimmed != prevSchemaVersion {
-		return false
+		return false, false
 	}
 	storedFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
 	if err != nil || strings.TrimSpace(storedFingerprint) != strings.TrimSpace(embedderFingerprint) {
-		return false
+		return false, false
 	}
 	storedDimension, err := readMetadataValue(ctx, db, "embedder_dimension")
 	if err != nil || strings.TrimSpace(storedDimension) != strconv.Itoa(embedderDimension) {
-		return false
+		return false, false
 	}
 	storedQuantization, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
 	if err != nil {
-		return false
+		return false, false
 	}
 	normStored, err1 := normalizeQuantization(storedQuantization)
 	normTarget, err2 := normalizeQuantization(quantization)
 	if err1 != nil || err2 != nil || normStored != normTarget {
-		return false
+		return false, false
 	}
-	return true
+	return true, schemaHasContextPrefix(trimmed)
 }
 
 // planRecordReuse builds a per-record plan given the resolved sections and
@@ -187,7 +198,7 @@ func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) st
 		return storedRecord{}
 	}
 
-	chunks, err := loadStoredChunksForRecord(ctx, state.db, ref, title, state.quantization)
+	chunks, err := loadStoredChunksForRecord(ctx, state.db, ref, title, state.quantization, state.hasContextPrefix)
 	if err != nil {
 		state.disable()
 		return storedRecord{}
@@ -209,16 +220,14 @@ func (s *reuseState) disable() {
 	s.db = nil
 }
 
-func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title, quantization string) (map[string][]byte, error) {
-	hasPrefix, err := hasChunkColumn(ctx, db, "context_prefix")
-	if err != nil {
-		return nil, fmt.Errorf("probe chunks.context_prefix for %s: %w", ref, err)
-	}
+func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title, quantization string, hasContextPrefix bool) (map[string][]byte, error) {
 	// v2 snapshots lack context_prefix; project an empty string so the
 	// scan shape is uniform and reuse keys computed with prefix="" stay
 	// in sync with the new-side keys when no Contextualizer is configured.
+	// hasContextPrefix comes from reuseState, which derives it from the
+	// accept-listed schema_version read at open time — no PRAGMA probe.
 	prefixExpr := "'' AS context_prefix"
-	if hasPrefix {
+	if hasContextPrefix {
 		prefixExpr = "c.context_prefix"
 	}
 	// Binary mode stores the primary chunks_vec row as a sign-packed bit

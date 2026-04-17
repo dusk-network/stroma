@@ -17,6 +17,10 @@ import (
 type Snapshot struct {
 	path string
 	db   *sql.DB
+	// hasContextPrefix is derived from the accept-listed schema_version at
+	// OpenSnapshot time so read paths do not need to reprobe PRAGMA
+	// table_info(chunks) on every Sections()/reuse call.
+	hasContextPrefix bool
 }
 
 // SnapshotSearchQuery defines one text search against an opened snapshot.
@@ -112,7 +116,30 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
 	}
-	return &Snapshot{path: path, db: db}, nil
+	// Verify the chunks table shape agrees with the accept-listed
+	// schema_version before we cache hasContextPrefix. Any divergence —
+	// metadata says v3 but the column is missing, or metadata says v2 but
+	// the column is present — means read paths would silently misread
+	// (empty prefixes on a v3 file, or random column data on a v2 file).
+	// Fail at open time instead of deferring to a cryptic Sections() error
+	// or, worse, silent empty reads. This is a one-time PRAGMA per handle,
+	// not per Sections() call.
+	expectContextPrefix := schemaHasContextPrefix(trimmedSchema)
+	hasColumn, err := hasChunkColumn(ctx, db, "context_prefix")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: probe chunks.context_prefix: %w", path, err)
+	}
+	if hasColumn != expectContextPrefix {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: schema_version=%q but chunks.context_prefix presence=%t (want %t); snapshot metadata and table shape disagree",
+			path, trimmedSchema, hasColumn, expectContextPrefix)
+	}
+	return &Snapshot{
+		path:             path,
+		db:               db,
+		hasContextPrefix: expectContextPrefix,
+	}, nil
 }
 
 // Close releases the opened snapshot handle.
@@ -294,11 +321,7 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 		}
 	}
 
-	hasPrefix, err := hasChunkColumn(ctx, s.db, "context_prefix")
-	if err != nil {
-		return nil, fmt.Errorf("probe chunks.context_prefix: %w", err)
-	}
-	sqlText, args := buildSectionsQuery(query, hasPrefix)
+	sqlText, args := buildSectionsQuery(query, s.hasContextPrefix)
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query sections: %w", err)

@@ -32,6 +32,15 @@ const (
 	prevSchemaVersion = "2"
 )
 
+// schemaHasContextPrefix reports whether a snapshot at the given schema
+// version carries the chunks.context_prefix column. The v2→v3 bump added
+// that column as its only schema change, so the flag is fully determined by
+// the accept-listed schema_version — read paths can cache it at handle-open
+// time instead of probing PRAGMA table_info(chunks) on every query.
+func schemaHasContextPrefix(schema string) bool {
+	return strings.TrimSpace(schema) == schemaVersion
+}
+
 // ErrUnsupportedSchemaVersion is returned when an operation encounters a
 // snapshot whose schema_version is neither the current schema nor one the
 // library knows how to migrate from. It is surfaced by OpenSnapshot and

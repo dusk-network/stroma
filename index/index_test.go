@@ -1800,6 +1800,179 @@ func TestRebuildReuseFromV2SnapshotStillHits(t *testing.T) {
 	}
 }
 
+// TestSchemaHasContextPrefixMapping locks the direct mapping
+// schemaVersion → true, prevSchemaVersion → false that read paths now
+// rely on in place of runtime PRAGMA probes. If a future schema bump adds
+// another accept-listed version, this test forces the mapping to be
+// reconsidered explicitly rather than silently inheriting one side's
+// default.
+func TestSchemaHasContextPrefixMapping(t *testing.T) {
+	t.Parallel()
+
+	if !schemaHasContextPrefix(schemaVersion) {
+		t.Fatalf("schemaHasContextPrefix(%q) = false, want true (v3 carries context_prefix)", schemaVersion)
+	}
+	if schemaHasContextPrefix(prevSchemaVersion) {
+		t.Fatalf("schemaHasContextPrefix(%q) = true, want false (v2 predates context_prefix)", prevSchemaVersion)
+	}
+	// Whitespace tolerance matches the open-time check, which reads
+	// schema_version via readMetadataValue and trims before compare.
+	if !schemaHasContextPrefix("  " + schemaVersion + "  ") {
+		t.Fatalf("schemaHasContextPrefix did not trim whitespace around %q", schemaVersion)
+	}
+}
+
+// TestOpenSnapshotCachesContextPrefixFlag verifies that OpenSnapshot
+// derives hasContextPrefix from the accept-listed schema_version at
+// handle-open time, so Sections()/reuse paths never need to probe
+// PRAGMA table_info(chunks) per call.
+func TestOpenSnapshotCachesContextPrefixFlag(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	// Fresh rebuilds are always v3.
+	snapV3, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(v3) error = %v", err)
+	}
+	if !snapV3.hasContextPrefix {
+		t.Fatal("Snapshot.hasContextPrefix = false on v3 snapshot, want true")
+	}
+	if err := snapV3.Close(); err != nil {
+		t.Fatalf("close v3 snapshot: %v", err)
+	}
+
+	// Rewrite to v2 (drops the column, rewinds schema_version) and confirm
+	// the open-time flag flips.
+	if err := rewriteSnapshotToV2(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+	snapV2, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(v2) error = %v", err)
+	}
+	defer func() { _ = snapV2.Close() }()
+	if snapV2.hasContextPrefix {
+		t.Fatal("Snapshot.hasContextPrefix = true on v2 snapshot, want false")
+	}
+}
+
+// TestOpenSnapshotRejectsSchemaTableShapeDivergence locks the open-time
+// invariant that schema_version and chunks.context_prefix presence must
+// agree. Without it, a tampered or half-migrated snapshot could open
+// successfully and then either silently misread (v3 metadata + v2 shape →
+// empty prefixes) or produce garbage from a column that was not managed
+// by the v2→v3 migration path.
+func TestOpenSnapshotRejectsSchemaTableShapeDivergence(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	t.Run("v3_metadata_v2_shape", func(t *testing.T) {
+		t.Parallel()
+
+		path := t.TempDir() + "/stroma.db"
+		if _, err := Rebuild(context.Background(), []corpus.Record{{
+			Ref:        testAlphaRef,
+			Kind:       "note",
+			Title:      "Alpha",
+			SourceRef:  "file://alpha.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "alpha content",
+		}}, BuildOptions{
+			Path:     path,
+			Embedder: fixture,
+		}); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		// Drop the column but leave schema_version = "3": metadata claims
+		// v3, chunks shape is v2. Read paths relying on the cached flag
+		// would try to SELECT a missing column; catch it at open time.
+		rwDB, err := store.OpenReadWriteContext(context.Background(), path)
+		if err != nil {
+			t.Fatalf("OpenReadWriteContext() error = %v", err)
+		}
+		if _, err := rwDB.ExecContext(context.Background(), `ALTER TABLE chunks DROP COLUMN context_prefix`); err != nil {
+			t.Fatalf("drop context_prefix: %v", err)
+		}
+		if err := rwDB.Close(); err != nil {
+			t.Fatalf("close rw db: %v", err)
+		}
+
+		_, err = OpenSnapshot(context.Background(), path)
+		if err == nil {
+			t.Fatal("OpenSnapshot() succeeded with v3 metadata + v2 shape, want divergence error")
+		}
+		if !strings.Contains(err.Error(), "schema_version") || !strings.Contains(err.Error(), "context_prefix") {
+			t.Fatalf("OpenSnapshot() err = %v, want divergence error mentioning schema_version and context_prefix", err)
+		}
+	})
+
+	t.Run("v2_metadata_v3_shape", func(t *testing.T) {
+		t.Parallel()
+
+		path := t.TempDir() + "/stroma.db"
+		if _, err := Rebuild(context.Background(), []corpus.Record{{
+			Ref:        testAlphaRef,
+			Kind:       "note",
+			Title:      "Alpha",
+			SourceRef:  "file://alpha.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "alpha content",
+		}}, BuildOptions{
+			Path:     path,
+			Embedder: fixture,
+		}); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		// Keep the v3 column, rewind schema_version to "2". Old behavior:
+		// Sections silently projects '' despite real data. New behavior:
+		// fail at open time so the inconsistency is surfaced.
+		rwDB, err := store.OpenReadWriteContext(context.Background(), path)
+		if err != nil {
+			t.Fatalf("OpenReadWriteContext() error = %v", err)
+		}
+		if _, err := rwDB.ExecContext(context.Background(), `UPDATE metadata SET value = '2' WHERE key = 'schema_version'`); err != nil {
+			t.Fatalf("rewind schema_version: %v", err)
+		}
+		if err := rwDB.Close(); err != nil {
+			t.Fatalf("close rw db: %v", err)
+		}
+
+		_, err = OpenSnapshot(context.Background(), path)
+		if err == nil {
+			t.Fatal("OpenSnapshot() succeeded with v2 metadata + v3 shape, want divergence error")
+		}
+		if !strings.Contains(err.Error(), "schema_version") || !strings.Contains(err.Error(), "context_prefix") {
+			t.Fatalf("OpenSnapshot() err = %v, want divergence error mentioning schema_version and context_prefix", err)
+		}
+	})
+}
+
 // rewriteSnapshotToV2 converts a freshly-built v3 snapshot into a v2 one
 // by dropping the context_prefix column and rewinding schema_version, so
 // the v2-backcompat tests can run against the same build surface that
