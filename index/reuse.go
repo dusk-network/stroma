@@ -19,8 +19,14 @@ import (
 // reuseState holds a live read-only handle to the prior snapshot. Record and
 // chunk rows are fetched on demand by storedRecordForReuse, so resident memory
 // scales with one record's chunks instead of the whole corpus.
+//
+// quantization is captured at open time so the per-record query knows whether
+// to read embeddings from chunks_vec (float32/int8) or chunks_vec_full
+// (binary, where the primary chunks_vec row is a sign-packed bit blob that
+// would need rederivation on reuse).
 type reuseState struct {
-	db *sql.DB
+	db           *sql.DB
+	quantization string
 }
 
 type storedRecord struct {
@@ -70,7 +76,12 @@ func loadReuseState(ctx context.Context, path, embedderFingerprint string, embed
 		return empty
 	}
 
-	return &reuseState{db: db}
+	normQ, err := normalizeQuantization(quantization)
+	if err != nil {
+		_ = db.Close()
+		return empty
+	}
+	return &reuseState{db: db, quantization: normQ}
 }
 
 // Close releases the underlying read-only connection. Nil-safe and idempotent.
@@ -176,7 +187,7 @@ func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) st
 		return storedRecord{}
 	}
 
-	chunks, err := loadStoredChunksForRecord(ctx, state.db, ref, title)
+	chunks, err := loadStoredChunksForRecord(ctx, state.db, ref, title, state.quantization)
 	if err != nil {
 		state.disable()
 		return storedRecord{}
@@ -198,7 +209,7 @@ func (s *reuseState) disable() {
 	s.db = nil
 }
 
-func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title string) (map[string][]byte, error) {
+func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title, quantization string) (map[string][]byte, error) {
 	hasPrefix, err := hasChunkColumn(ctx, db, "context_prefix")
 	if err != nil {
 		return nil, fmt.Errorf("probe chunks.context_prefix for %s: %w", ref, err)
@@ -210,12 +221,22 @@ func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title strin
 	if hasPrefix {
 		prefixExpr = "c.context_prefix"
 	}
+	// Binary mode stores the primary chunks_vec row as a sign-packed bit
+	// blob and keeps the float32 source of truth in chunks_vec_full. Reuse
+	// loads the full-precision blob so the write path can re-derive the
+	// bit blob (via sign packing) without the lossy bit → float fallback.
+	embeddingSource := "v.embedding"
+	joinClause := "JOIN chunks_vec v ON v.chunk_id = c.id"
+	if quantization == store.QuantizationBinary {
+		embeddingSource = "vf.embedding"
+		joinClause = "JOIN chunks_vec_full vf ON vf.chunk_id = c.id"
+	}
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-SELECT c.heading, c.content, %s, v.embedding
+SELECT c.heading, c.content, %s, %s
 FROM chunks c
-JOIN chunks_vec v ON v.chunk_id = c.id
+%s
 WHERE c.record_ref = ?
-ORDER BY c.chunk_index ASC, c.id ASC`, prefixExpr), ref)
+ORDER BY c.chunk_index ASC, c.id ASC`, prefixExpr, embeddingSource, joinClause), ref)
 	if err != nil {
 		return nil, fmt.Errorf("query stored chunks for %s: %w", ref, err)
 	}

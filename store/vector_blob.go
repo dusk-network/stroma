@@ -13,6 +13,12 @@ const (
 
 	// QuantizationInt8 uses signed 8-bit scalar quantization.
 	QuantizationInt8 = "int8"
+
+	// QuantizationBinary uses sign-based 1-bit quantization for the
+	// prefilter and pairs it with a full-precision float32 companion
+	// column for rescoring. The embedder dimension must be a multiple of
+	// 8 because each byte of the packed blob carries 8 consecutive dims.
+	QuantizationBinary = "binary"
 )
 
 // EncodeVectorBlob encodes float64 embeddings into the sqlite-vec blob format.
@@ -76,6 +82,46 @@ func DecodeVectorBlobInt8(blob []byte) ([]float64, error) {
 	vector := make([]float64, len(blob))
 	for i, b := range blob {
 		vector[i] = float64(int8(b)) / 127.0 //nolint:gosec // intentional unsigned-to-signed reinterpret
+	}
+	return vector, nil
+}
+
+// EncodeVectorBlobBinary packs the vector into a sqlite-vec bit blob using
+// sign-based quantization: each output bit is 1 when the corresponding
+// component is non-negative, 0 otherwise. The dimension must be a multiple
+// of 8. The bit ordering matches sqlite-vec's vec_bit() parser: within each
+// byte, dimension k occupies bit (k % 8) counted from the LSB.
+func EncodeVectorBlobBinary(vector []float64) ([]byte, error) {
+	if len(vector) == 0 {
+		return nil, fmt.Errorf("binary quantization requires at least one dimension")
+	}
+	if len(vector)%8 != 0 {
+		return nil, fmt.Errorf("binary quantization requires dimension divisible by 8, got %d", len(vector))
+	}
+	buf := make([]byte, len(vector)/8)
+	for i, v := range vector {
+		if v >= 0 {
+			buf[i/8] |= 1 << (i % 8)
+		}
+	}
+	return buf, nil
+}
+
+// DecodeVectorBlobBinary expands a bit-packed vector blob back to {-1, 1}
+// float64 values. The returned vector has length blob-bytes * 8.
+func DecodeVectorBlobBinary(blob []byte) ([]float64, error) {
+	if len(blob) == 0 {
+		return nil, fmt.Errorf("empty binary vector blob")
+	}
+	vector := make([]float64, len(blob)*8)
+	for byteIdx, b := range blob {
+		for bit := 0; bit < 8; bit++ {
+			if b&(1<<bit) != 0 {
+				vector[byteIdx*8+bit] = 1
+			} else {
+				vector[byteIdx*8+bit] = -1
+			}
+		}
 	}
 	return vector, nil
 }

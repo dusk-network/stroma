@@ -1827,6 +1827,293 @@ func (f contextualizerFunc) ContextualizeChunks(ctx context.Context, record corp
 	return f(ctx, record, sections)
 }
 
+func TestRebuildBinaryQuantizationReturnsClosestHit(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	records := []corpus.Record{
+		{
+			Ref:        testSyncGuideRef,
+			Kind:       "guide",
+			Title:      "Sync Guide",
+			SourceRef:  "file://docs/sync-guide.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Overview\n\nBackground workers process items in batches.\n\n## Scheduling\n\nRun every hour.",
+		},
+		{
+			Ref:        "status-note",
+			Kind:       "note",
+			Title:      "Status Note",
+			SourceRef:  "file://docs/status.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Health checks run every minute.",
+		},
+	}
+
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "binary",
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(binary) error = %v", err)
+	}
+	if result.ChunkCount == 0 {
+		t.Fatal("Rebuild(binary) ChunkCount = 0, want >0")
+	}
+
+	hits, err := Search(context.Background(), SearchQuery{
+		Path:     path,
+		Text:     "background workers batches",
+		Limit:    3,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search(binary) error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("Search(binary) returned no hits")
+	}
+	if hits[0].Ref != testSyncGuideRef {
+		t.Fatalf("first hit ref = %q, want %s (binary hamming prefilter + cosine rescore should still rank the topical guide first)",
+			hits[0].Ref, testSyncGuideRef)
+	}
+}
+
+func TestRebuildBinaryRejectsDimensionNotDivisibleByEight(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 15)
+	if err != nil {
+		t.Fatalf("NewFixture(15) error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "binary",
+	}); err == nil || !strings.Contains(err.Error(), "divisible by 8") {
+		t.Fatalf("Rebuild(binary, dim=15) err = %v, want divisible-by-8 error", err)
+	}
+}
+
+func TestRebuildBinaryRejectsCrossQuantizationReuse(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	floatPath := dir + "/float.db"
+	binaryPath := dir + "/binary.db"
+
+	records := []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     floatPath,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(float32) error = %v", err)
+	}
+
+	// Rebuild binary while reusing from a float32 snapshot — the
+	// compatibility check must reject the reuse so we do not insert a
+	// float32 blob into the bit-column vec0 table.
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          binaryPath,
+		ReuseFromPath: floatPath,
+		Embedder:      fixture,
+		Quantization:  "binary",
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(binary, reuse float32) error = %v", err)
+	}
+	if result.ReusedChunkCount != 0 {
+		t.Fatalf("ReusedChunkCount = %d, want 0 (quantization mismatch must disable reuse)",
+			result.ReusedChunkCount)
+	}
+}
+
+func TestRebuildBinaryReuseAcrossBinarySnapshots(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	pathA := dir + "/a.db"
+	pathB := dir + "/b.db"
+
+	records := []corpus.Record{
+		{
+			Ref:        "alpha",
+			Kind:       "guide",
+			Title:      "Alpha",
+			SourceRef:  "file://alpha.md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText:   "# Overview\n\nAlpha handles queue admission.\n\n## Limits\n\nAlpha applies hourly quotas.",
+		},
+		{
+			Ref:        "beta",
+			Kind:       "note",
+			Title:      "Beta",
+			SourceRef:  "file://beta.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Beta performs background health checks.",
+		},
+	}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:         pathA,
+		Embedder:     fixture,
+		Quantization: "binary",
+	}); err != nil {
+		t.Fatalf("Rebuild(binary A) error = %v", err)
+	}
+
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          pathB,
+		ReuseFromPath: pathA,
+		Embedder:      fixture,
+		Quantization:  "binary",
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(binary B, reuse binary A) error = %v", err)
+	}
+	if result.ReusedChunkCount == 0 {
+		t.Fatalf("ReusedChunkCount = 0, want all chunks reused across binary→binary rebuild")
+	}
+	if result.ReusedChunkCount != result.ChunkCount {
+		t.Fatalf("ReusedChunkCount = %d, ChunkCount = %d, want equal", result.ReusedChunkCount, result.ChunkCount)
+	}
+}
+
+func TestSnapshotSectionsBinaryIncludesFloatEmbeddings(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "binary",
+	}); err != nil {
+		t.Fatalf("Rebuild(binary) error = %v", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	sections, err := snapshot.Sections(context.Background(), SectionQuery{IncludeEmbeddings: true})
+	if err != nil {
+		t.Fatalf("Sections(IncludeEmbeddings) error = %v", err)
+	}
+	if len(sections) == 0 {
+		t.Fatal("Sections() returned no sections")
+	}
+	seenNonBinary := false
+	for _, section := range sections {
+		if len(section.Embedding) != 16 {
+			t.Fatalf("section %s embedding len = %d, want 16", section.Ref, len(section.Embedding))
+		}
+		for _, v := range section.Embedding {
+			if v != 1 && v != -1 {
+				seenNonBinary = true
+				break
+			}
+		}
+	}
+	if !seenNonBinary {
+		t.Fatal("Sections(binary) returned only {-1, 1} values; expected float32 values from chunks_vec_full")
+	}
+}
+
+func TestOpenSnapshotRejectsIncompleteBinaryCompanion(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "binary",
+	}); err != nil {
+		t.Fatalf("Rebuild(binary) error = %v", err)
+	}
+
+	// Surgically drop a companion row behind stroma's back to simulate
+	// the exact corruption mode Codex flagged: chunks_vec_full missing a
+	// row that chunks still references. OpenSnapshot must refuse instead
+	// of silently losing the chunk through the inner-join read path.
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `DELETE FROM chunks_vec_full`); err != nil {
+		t.Fatalf("DELETE chunks_vec_full error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	_, err = OpenSnapshot(context.Background(), path)
+	if err == nil {
+		t.Fatal("OpenSnapshot(corrupt binary snapshot) err = nil, want completeness error")
+	}
+	if !strings.Contains(err.Error(), "chunks_vec_full") {
+		t.Fatalf("OpenSnapshot err = %v, want reference to chunks_vec_full", err)
+	}
+}
+
 func TestRebuildSelfReuseReplacesSnapshotInPlace(t *testing.T) {
 	t.Parallel()
 
