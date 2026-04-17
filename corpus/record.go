@@ -89,13 +89,20 @@ func (r Record) Validate() error {
 }
 
 // HashRecord returns a deterministic content hash for a normalized record.
+//
+// Each field contributes a `%q=%q` pair so the encoding is injective: no
+// combination of key/value strings (including ones that contain `=` or
+// newline characters) can produce the same serialized prefix as a different
+// field. Serialized parts are then sorted and SHA-256-joined in fingerprint.
+// Changing this encoding requires a schema_version bump and a migration
+// that rewrites persisted content_hash values (see migrateV3ToV4).
 func HashRecord(r Record) string {
 	parts := make([]string, 0, 4+len(r.Metadata))
 	parts = append(parts,
-		"kind="+strings.TrimSpace(r.Kind),
-		"title="+strings.TrimSpace(r.Title),
-		"body_format="+strings.TrimSpace(r.BodyFormat),
-		"body_text="+strings.TrimSpace(r.BodyText),
+		fmt.Sprintf("%q=%q", "kind", strings.TrimSpace(r.Kind)),
+		fmt.Sprintf("%q=%q", "title", strings.TrimSpace(r.Title)),
+		fmt.Sprintf("%q=%q", "body_format", strings.TrimSpace(r.BodyFormat)),
+		fmt.Sprintf("%q=%q", "body_text", strings.TrimSpace(r.BodyText)),
 	)
 	keys := make([]string, 0, len(r.Metadata))
 	for key := range r.Metadata {
@@ -103,22 +110,27 @@ func HashRecord(r Record) string {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		parts = append(parts, "metadata."+key+"="+r.Metadata[key])
+		parts = append(parts, fmt.Sprintf("%q=%q", "metadata."+key, r.Metadata[key]))
 	}
 	return fingerprint(parts)
 }
 
-// Fingerprint summarizes a set of records deterministically.
-func Fingerprint(records []Record) string {
+// Fingerprint summarizes a set of records deterministically and returns an
+// error if any record fails Normalized(). Prior versions silently skipped
+// invalid records, which meant "corpus with an invalid record" produced the
+// same digest as "same corpus without that record" — masking silent reuse of
+// a snapshot that was missing data the caller thought they had. The loud
+// failure forces callers to surface the problem instead.
+func Fingerprint(records []Record) (string, error) {
 	parts := make([]string, 0, len(records))
 	for _, record := range records {
 		normalized, err := record.Normalized()
 		if err != nil {
-			continue
+			return "", fmt.Errorf("fingerprint record %q: %w", record.Ref, err)
 		}
 		parts = append(parts, normalized.Ref+":"+normalized.ContentHash)
 	}
-	return fingerprint(parts)
+	return fingerprint(parts), nil
 }
 
 // RefHash is the minimal (Ref, ContentHash) pair needed to compute a corpus
@@ -129,24 +141,25 @@ type RefHash struct {
 }
 
 // FingerprintFromPairs returns the same digest as Fingerprint([]Record) for
-// already-normalized (Ref, ContentHash) inputs: non-empty after trimming, with
-// ContentHash already computed. Pairs with an empty Ref or ContentHash are
-// skipped — unlike Fingerprint([]Record), this helper cannot apply Normalized()
-// defaults or regenerate ContentHash via HashRecord from other fields, so its
-// output only matches Fingerprint when the inputs already satisfy that
-// invariant. Callers reading persisted rows must either enforce the invariant
-// at read time (as index.loadCurrentRefHashes does) or use Fingerprint instead.
-func FingerprintFromPairs(pairs []RefHash) string {
+// already-normalized (Ref, ContentHash) inputs: non-empty after trimming,
+// with ContentHash already computed. Pairs with an empty Ref or ContentHash
+// return an error — unlike Fingerprint([]Record), this helper cannot apply
+// Normalized() defaults or regenerate ContentHash via HashRecord from other
+// fields, so its output only matches Fingerprint when the inputs already
+// satisfy that invariant. Callers reading persisted rows must enforce the
+// invariant at read time (as index.loadCurrentRefHashes does) or use
+// Fingerprint instead.
+func FingerprintFromPairs(pairs []RefHash) (string, error) {
 	parts := make([]string, 0, len(pairs))
 	for _, p := range pairs {
 		ref := strings.TrimSpace(p.Ref)
 		hash := strings.TrimSpace(p.ContentHash)
 		if ref == "" || hash == "" {
-			continue
+			return "", fmt.Errorf("fingerprint pair has empty ref or content_hash (ref=%q)", p.Ref)
 		}
 		parts = append(parts, ref+":"+hash)
 	}
-	return fingerprint(parts)
+	return fingerprint(parts), nil
 }
 
 func normalizeMetadata(metadata map[string]string) map[string]string {

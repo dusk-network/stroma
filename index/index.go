@@ -22,23 +22,32 @@ import (
 
 const (
 	// schemaVersion is the current on-disk snapshot schema. Bumps require
-	// a forward migration (see migrateV2ToV3) and an extension of the
-	// OpenSnapshot accept-list.
-	schemaVersion = "3"
+	// a forward migration (see migrateV2ToV3, migrateV3ToV4) and an
+	// extension of the OpenSnapshot accept-list.
+	schemaVersion = "4"
 
 	// prevSchemaVersion is the most recent prior schema that OpenSnapshot
 	// still accepts read-only and that resolveUpdateSessionConfig can
-	// migrate forward in place. Older snapshots must be rebuilt.
-	prevSchemaVersion = "2"
+	// migrate forward in place. Older snapshots must be rebuilt or
+	// upgraded through a chain migration in the Update path.
+	prevSchemaVersion = "3"
+
+	// legacySchemaVersionV2 is the earliest schema that Update can still
+	// chain forward (v2 → v3 → v4). OpenSnapshot rejects it directly;
+	// callers must Update a v2 file before reading it in 1.0+.
+	legacySchemaVersionV2 = "2"
 )
 
 // schemaHasContextPrefix reports whether a snapshot at the given schema
 // version carries the chunks.context_prefix column. The v2→v3 bump added
-// that column as its only schema change, so the flag is fully determined by
-// the accept-listed schema_version — read paths can cache it at handle-open
+// that column; v3→v4 kept the same table shape (it re-hashed record
+// content under a new encoding, not a schema shape change). Both v3 and
+// v4 therefore carry the column, so the flag is fully determined by the
+// accept-listed schema_version — read paths can cache it at handle-open
 // time instead of probing PRAGMA table_info(chunks) on every query.
 func schemaHasContextPrefix(schema string) bool {
-	return strings.TrimSpace(schema) == schemaVersion
+	trimmed := strings.TrimSpace(schema)
+	return trimmed == schemaVersion || trimmed == prevSchemaVersion
 }
 
 // ErrUnsupportedSchemaVersion is returned when an operation encounters a
@@ -278,12 +287,16 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 	}
 	defer session.Close()
 
+	contentFingerprint, err := corpus.Fingerprint(inputs.normalized)
+	if err != nil {
+		return nil, fmt.Errorf("compute content fingerprint: %w", err)
+	}
 	result := &BuildResult{
 		Path:                inputs.indexPath,
 		RecordCount:         len(inputs.normalized),
 		EmbedderDimension:   inputs.dimension,
 		EmbedderFingerprint: options.Embedder.Fingerprint(),
-		ContentFingerprint:  corpus.Fingerprint(inputs.normalized),
+		ContentFingerprint:  contentFingerprint,
 	}
 
 	for _, record := range inputs.normalized {
@@ -509,7 +522,10 @@ func finalizeUpdate(ctx context.Context, db *sql.DB, tx *sql.Tx, cfg sessionConf
 		return err
 	}
 	result.RecordCount = len(pairs)
-	result.ContentFingerprint = corpus.FingerprintFromPairs(pairs)
+	result.ContentFingerprint, err = corpus.FingerprintFromPairs(pairs)
+	if err != nil {
+		return fmt.Errorf("compute content fingerprint: %w", err)
+	}
 	chunkCount, err := countChunks(ctx, tx)
 	if err != nil {
 		return err
@@ -1521,6 +1537,35 @@ func hasTable(ctx context.Context, q queryContextRunner, name string) (bool, err
 	return count > 0, nil
 }
 
+// migrateSchemaToCurrent brings the snapshot on tx forward to schemaVersion
+// using whichever chain of migrations applies. Every step runs against the
+// caller's transaction so the schema bump commits atomically with the rest
+// of Update — any later failure rolls everything back, preventing a
+// partial upgrade from stranding the file at an intermediate version.
+func migrateSchemaToCurrent(ctx context.Context, tx *sql.Tx) error {
+	schema, err := readMetadataValue(ctx, tx, "schema_version")
+	if err != nil {
+		return err
+	}
+	switch strings.TrimSpace(schema) {
+	case legacySchemaVersionV2:
+		// v2 predates context_prefix and the new content_hash encoding;
+		// chain v2→v3→v4 in one transaction.
+		if err := migrateV2ToV3(ctx, tx); err != nil {
+			return err
+		}
+		return migrateV3ToV4(ctx, tx)
+	case prevSchemaVersion:
+		// v3 carries the column already; only the content_hash encoding
+		// changes (#39) — re-hash every record row and bump metadata.
+		return migrateV3ToV4(ctx, tx)
+	case schemaVersion:
+		return nil
+	default:
+		return fmt.Errorf("%w: index=%q update=%q", ErrUnsupportedSchemaVersion, strings.TrimSpace(schema), schemaVersion)
+	}
+}
+
 // migrateV2ToV3InjectFault is a test-only seam that runs between the ALTER
 // and the metadata bump inside migrateV2ToV3. Production leaves it nil.
 // Tests set it to simulate a crash mid-migration and assert that the
@@ -1530,12 +1575,16 @@ var migrateV2ToV3InjectFault func() error
 // migrateV2ToV3 adds the context_prefix column to chunks and bumps the
 // stored schema_version metadata to "3" on the provided transaction, so
 // the migration commits atomically with whatever surrounding work the
-// caller is running (today: Update's main tx). A crash between the ALTER
-// and the UPDATE — or a failure anywhere in the caller's transaction
-// afterwards — rolls back both statements instead of leaving the file
-// with the new column but schema_version="2". The column-add is
-// idempotent (skipped if a prior run already applied it) and the helper
-// is safe to call against a snapshot that is already v3.
+// caller is running (today: Update's main tx, chained with migrateV3ToV4
+// when starting from v2). A crash between the ALTER and the UPDATE — or
+// a failure anywhere in the caller's transaction afterwards — rolls back
+// both statements instead of leaving the file with the new column but
+// schema_version="2". The column-add is idempotent (skipped if a prior
+// run already applied it), so the helper is safe if re-entered on a v3
+// snapshot. It must not be called on v4 or later: the schema_version
+// bump is hard-coded to prevSchemaVersion and would effectively
+// downgrade metadata. migrateSchemaToCurrent enforces the v2-only
+// entry point.
 func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
 	hasPrefix, err := hasChunkColumn(ctx, tx, "context_prefix")
 	if err != nil {
@@ -1553,10 +1602,107 @@ func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, schemaVersion); err != nil {
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, prevSchemaVersion); err != nil {
 		return fmt.Errorf("migrate v2 to v3: bump schema_version: %w", err)
 	}
 	return nil
+}
+
+// migrateV3ToV4InjectFault is a test-only seam that runs between the
+// per-row re-hash and the metadata bump inside migrateV3ToV4. Production
+// leaves it nil. Tests set it to simulate a crash mid-migration and assert
+// the enclosing transaction rolls back cleanly.
+var migrateV3ToV4InjectFault func() error
+
+// migrateV3ToV4BatchSize bounds how many records migrateV3ToV4 reads into
+// memory at once. Keeping it small means peak overhead is O(batchSize *
+// row_size) rather than O(N * row_size) — important for multi-million-
+// record snapshots where the whole corpus could otherwise blow up heap
+// mid-migration. Chosen as a pragmatic balance between SELECT overhead
+// and bounded memory; overridable at test time.
+var migrateV3ToV4BatchSize = 1000
+
+// migrateV3ToV4 re-hashes every record's content_hash under the new
+// injective encoding (see corpus.HashRecord #39) and bumps the stored
+// schema_version metadata to "4". Records are streamed in batches so
+// peak memory is O(batch), not O(N): SQLite won't let us issue UPDATEs
+// on the same connection while a SELECT cursor is open on it, so each
+// batch reads-then-updates sequentially and advances via ref > last.
+// The content_fingerprint metadata key is left for finalizeUpdate to
+// rewrite at commit time — it runs off the new content_hash values via
+// loadCurrentRefHashes and picks up the post-migration state
+// automatically.
+//
+// The ALTER-free shape means this migration doesn't touch table schema;
+// it only rewrites row content and bumps metadata. Idempotent against a
+// snapshot already at v4 (a no-op second pass re-hashes to the same
+// values, then the metadata update is a same-value re-apply).
+func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error {
+	var lastRef string
+	for {
+		batch, err := migrateV3ToV4ReadBatch(ctx, tx, lastRef, migrateV3ToV4BatchSize)
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, r := range batch {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE records SET content_hash = ? WHERE ref = ?`, r.hash, r.ref); err != nil {
+				return fmt.Errorf("migrate v3 to v4: rewrite content_hash for %q: %w", r.ref, err)
+			}
+		}
+		lastRef = batch[len(batch)-1].ref
+		if len(batch) < migrateV3ToV4BatchSize {
+			break
+		}
+	}
+
+	if migrateV3ToV4InjectFault != nil {
+		if err := migrateV3ToV4InjectFault(); err != nil {
+			return fmt.Errorf("migrate v3 to v4: injected fault: %w", err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, schemaVersion); err != nil {
+		return fmt.Errorf("migrate v3 to v4: bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// migrateV3ToV4ReadBatch reads up to limit records after lastRef (exclusive)
+// and returns their (ref, new-algo content_hash) pairs. Factored out so
+// the SELECT cursor is fully consumed and closed before migrateV3ToV4
+// starts issuing UPDATEs on the same transaction.
+func migrateV3ToV4ReadBatch(ctx context.Context, tx *sql.Tx, lastRef string, limit int) ([]struct{ ref, hash string }, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_json
+FROM records
+WHERE ref > ?
+ORDER BY ref ASC
+LIMIT ?`, lastRef, limit)
+	if err != nil {
+		return nil, fmt.Errorf("migrate v3 to v4: query records: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	batch := make([]struct{ ref, hash string }, 0, limit)
+	for rows.Next() {
+		record, err := scanRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("migrate v3 to v4: scan record: %w", err)
+		}
+		batch = append(batch, struct{ ref, hash string }{
+			ref:  record.Ref,
+			hash: corpus.HashRecord(record),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("migrate v3 to v4: iterate records: %w", err)
+	}
+	return batch, nil
 }
 
 // hasChunkColumn probes PRAGMA table_info(chunks) for the named column.
@@ -1626,26 +1772,8 @@ func validateUpdateInputs(added []corpus.Record, removed []string) error {
 }
 
 func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.Record, options UpdateOptions) (sessionConfig, error) {
-	schema, err := readMetadataValue(ctx, tx, "schema_version")
-	if err != nil {
+	if err := migrateSchemaToCurrent(ctx, tx); err != nil {
 		return sessionConfig{}, err
-	}
-	trimmedSchema := strings.TrimSpace(schema)
-	switch trimmedSchema {
-	case prevSchemaVersion:
-		// Migrate v2 → v3 in place so existing indexes stay updatable
-		// after this library upgrade. migrateV2ToV3 runs against the
-		// caller's transaction, so the column add and the
-		// schema_version bump commit atomically with the rest of
-		// Update; any later failure rolls everything back, preventing
-		// a failed update from stranding the file at v3 on disk.
-		if err := migrateV2ToV3(ctx, tx); err != nil {
-			return sessionConfig{}, err
-		}
-	case schemaVersion:
-		// already current
-	default:
-		return sessionConfig{}, fmt.Errorf("%w: index=%q update=%q", ErrUnsupportedSchemaVersion, trimmedSchema, schemaVersion)
 	}
 
 	embedderFingerprint, err := readMetadataValue(ctx, tx, "embedder_fingerprint")

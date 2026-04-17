@@ -53,8 +53,74 @@ func TestFingerprintIsOrderIndependent(t *testing.T) {
 		{Ref: "b", SourceRef: "b", BodyText: "two"},
 		{Ref: "a", SourceRef: "a", BodyText: "one"},
 	}
-	if Fingerprint(left) != Fingerprint(right) {
+	leftFP, err := Fingerprint(left)
+	if err != nil {
+		t.Fatalf("Fingerprint(left) error = %v", err)
+	}
+	rightFP, err := Fingerprint(right)
+	if err != nil {
+		t.Fatalf("Fingerprint(right) error = %v", err)
+	}
+	if leftFP != rightFP {
 		t.Fatalf("Fingerprint() changed with record order")
+	}
+}
+
+// TestFingerprintSurfacesMalformedRecords locks the loud-failure contract:
+// previously, Fingerprint silently dropped records that failed Normalized(),
+// so a corpus with an invalid record produced the same digest as the same
+// corpus without that record. Combined with ReuseFromPath, that masked
+// silent reuse of snapshots missing data the caller thought they had.
+func TestFingerprintSurfacesMalformedRecords(t *testing.T) {
+	t.Parallel()
+
+	_, err := Fingerprint([]Record{
+		{Ref: "alpha", SourceRef: "alpha", BodyText: "a"},
+		{Ref: "bravo", SourceRef: "bravo", BodyFormat: "html"}, // unsupported body_format
+	})
+	if err == nil {
+		t.Fatal("Fingerprint() succeeded on malformed record, want error")
+	}
+}
+
+// TestHashRecordEncodingIsInjective guards the content_hash encoding fix
+// in #39. Under the old encoding each part was rendered as plain
+// "key=value" and parts were joined by '\n' — so a value containing '\n'
+// could inject text that parsed as a neighboring part after the join, and
+// two distinct records could in principle serialize to the same byte
+// string. The new %q=%q encoding quotes both the field name and the
+// value, which makes strconv.Quote's escaping the sole source of
+// injectivity: no value can forge another field's delimited form.
+//
+// This test constructs two records that differ in field content but
+// share a newline-boundary ambiguity — under the new encoding their
+// hashes must differ. Whether the old encoding happened to collide for
+// this specific pair is secondary; the point is that the new encoding
+// hashes them distinctly by construction.
+func TestHashRecordEncodingIsInjective(t *testing.T) {
+	t.Parallel()
+
+	genuine := Record{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "real-title",
+		SourceRef:  "alpha",
+		BodyFormat: FormatPlaintext,
+		BodyText:   "body",
+	}
+	spoofed := Record{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "ignored",
+		SourceRef:  "alpha",
+		BodyFormat: FormatPlaintext,
+		BodyText:   "body",
+		Metadata: map[string]string{
+			"k": "\ntitle=real-title",
+		},
+	}
+	if HashRecord(genuine) == HashRecord(spoofed) {
+		t.Fatal("HashRecord encoding is not injective: spoofed metadata produced the same digest as genuine field")
 	}
 }
 
@@ -83,27 +149,34 @@ func TestFingerprintFromPairsMatchesRecords(t *testing.T) {
 		pairs = append(pairs, RefHash{Ref: n.Ref, ContentHash: n.ContentHash})
 	}
 
-	want := Fingerprint(normalized)
-	got := FingerprintFromPairs(pairs)
+	want, err := Fingerprint(normalized)
+	if err != nil {
+		t.Fatalf("Fingerprint() error = %v", err)
+	}
+	got, err := FingerprintFromPairs(pairs)
+	if err != nil {
+		t.Fatalf("FingerprintFromPairs() error = %v", err)
+	}
 	if got != want {
 		t.Fatalf("FingerprintFromPairs = %q, want %q (must be byte-identical to Fingerprint for normalized records)", got, want)
 	}
 }
 
-func TestFingerprintFromPairsSkipsEmpty(t *testing.T) {
+// TestFingerprintFromPairsRejectsEmpty locks the loud-failure contract:
+// every persisted row that flows through loadCurrentRefHashes has been
+// guarded for non-empty content_hash, so a pair reaching this helper with
+// an empty field is a bug worth surfacing, not silently skipping.
+func TestFingerprintFromPairsRejectsEmpty(t *testing.T) {
 	t.Parallel()
 
-	pairs := []RefHash{
-		{Ref: "alpha", ContentHash: "a"},
+	for _, pair := range []RefHash{
+		{Ref: "", ContentHash: "a"},
 		{Ref: "   ", ContentHash: "b"},
-		{Ref: "gamma", ContentHash: "  "},
-		{Ref: "bravo", ContentHash: "c"},
-	}
-	kept := []RefHash{
-		{Ref: "alpha", ContentHash: "a"},
-		{Ref: "bravo", ContentHash: "c"},
-	}
-	if FingerprintFromPairs(pairs) != FingerprintFromPairs(kept) {
-		t.Fatal("FingerprintFromPairs did not skip pairs with empty Ref or ContentHash")
+		{Ref: "alpha", ContentHash: ""},
+		{Ref: "alpha", ContentHash: "  "},
+	} {
+		if _, err := FingerprintFromPairs([]RefHash{pair}); err == nil {
+			t.Fatalf("FingerprintFromPairs(%+v) succeeded, want error", pair)
+		}
 	}
 }
