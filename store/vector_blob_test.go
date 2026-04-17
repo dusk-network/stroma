@@ -89,6 +89,43 @@ func TestVectorBlobInt8NormalizesOutOfRange(t *testing.T) {
 	}
 }
 
+func TestVectorBlobBinaryRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	original := []float64{0.5, -0.1, 0.0, -2.0, 3.0, -0.2, 0.1, -0.9}
+	blob, err := EncodeVectorBlobBinary(original)
+	if err != nil {
+		t.Fatalf("EncodeVectorBlobBinary() error = %v", err)
+	}
+	if len(blob) != 1 {
+		t.Fatalf("blob len = %d, want 1 (8 dims → 1 byte)", len(blob))
+	}
+	decoded, err := DecodeVectorBlobBinary(blob)
+	if err != nil {
+		t.Fatalf("DecodeVectorBlobBinary() error = %v", err)
+	}
+	for i, v := range original {
+		wantSign := 1.0
+		if v < 0 {
+			wantSign = -1
+		}
+		if decoded[i] != wantSign {
+			t.Fatalf("decoded[%d] = %f, want %f (sign of %f)", i, decoded[i], wantSign, v)
+		}
+	}
+}
+
+func TestVectorBlobBinaryRejectsNonMultipleOfEight(t *testing.T) {
+	t.Parallel()
+
+	if _, err := EncodeVectorBlobBinary([]float64{0.1, -0.1, 0.1}); err == nil {
+		t.Fatal("EncodeVectorBlobBinary(len=3) error = nil, want multiple-of-8 error")
+	}
+	if _, err := EncodeVectorBlobBinary(nil); err == nil {
+		t.Fatal("EncodeVectorBlobBinary(nil) error = nil, want non-empty error")
+	}
+}
+
 func TestCosineScoreFromDistanceClampsToRange(t *testing.T) {
 	t.Parallel()
 

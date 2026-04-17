@@ -51,6 +51,14 @@ type SectionQuery struct {
 	Refs              []string
 	Kinds             []string
 	IncludeEmbeddings bool
+
+	// embeddingsFromFullTable, when true, pulls embeddings from the
+	// chunks_vec_full companion table (binary quantization only) so the
+	// returned vectors are the stored float32 source of truth instead of
+	// the sign-packed bit blob held in chunks_vec. Internal; callers
+	// continue to set IncludeEmbeddings and the Sections() method
+	// decides which column to read.
+	embeddingsFromFullTable bool
 }
 
 // Section is one stored section from a Stroma snapshot.
@@ -79,6 +87,14 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	db, err := store.OpenReadOnlyContext(ctx, path)
 	if err != nil {
 		return nil, err
+	}
+	// For binary snapshots, verify the full-precision companion table is
+	// complete at open time. Read paths rely on inner joins against
+	// chunks_vec_full, so a missing companion row would silently drop
+	// that chunk from search and Sections() without surfacing an error.
+	if err := checkChunksVecFullCompleteness(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
 	}
 	return &Snapshot{path: path, db: db}, nil
 }
@@ -252,6 +268,14 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 		if err != nil {
 			return nil, err
 		}
+		if quantization == store.QuantizationBinary {
+			// Read from the full-precision companion so callers get
+			// the real float32 vector, not its sign-packed stub, and
+			// switch the decode path to float32 so scanSectionRow
+			// interprets the blob correctly.
+			query.embeddingsFromFullTable = true
+			quantization = store.QuantizationFloat32
+		}
 	}
 
 	hasPrefix, err := hasChunkColumn(ctx, s.db, "context_prefix")
@@ -306,8 +330,16 @@ SELECT
 FROM chunks c
 JOIN records r ON r.ref = c.record_ref`)
 	if query.IncludeEmbeddings {
-		builder.WriteString(`
+		// Binary snapshots surface full-precision vectors via the
+		// chunks_vec_full companion so IncludeEmbeddings yields usable
+		// float32 values instead of sign-expanded {-1, 1} stubs.
+		if query.embeddingsFromFullTable {
+			builder.WriteString(`
+JOIN chunks_vec_full v ON v.chunk_id = c.id`)
+		} else {
+			builder.WriteString(`
 JOIN chunks_vec v ON v.chunk_id = c.id`)
+		}
 	}
 	builder.WriteString(`
 WHERE 1 = 1`)
@@ -509,12 +541,22 @@ func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float
 	}
 	var sqlText string
 	var args []any
-	if searchDimension > 0 {
+	switch {
+	case searchDimension > 0:
+		// Matryoshka is already validated as float32-only upstream in
+		// resolveSearchDimension, so this and the binary branch below
+		// are mutually exclusive by contract.
 		sqlText, args, err = buildMatryoshkaSearchSQL(limit, kinds, queryBlob, searchDimension)
 		if err != nil {
 			return nil, err
 		}
-	} else {
+	case quantization == store.QuantizationBinary:
+		fullQueryBlob, err := store.EncodeVectorBlob(embedding)
+		if err != nil {
+			return nil, fmt.Errorf("encode full-precision query vector: %w", err)
+		}
+		sqlText, args = buildBinarySearchSQL(limit, kinds, queryBlob, fullQueryBlob)
+	default:
 		sqlText, args = buildSearchSQL(SearchQuery{
 			Limit: limit,
 			Kinds: kinds,
