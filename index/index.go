@@ -491,9 +491,10 @@ func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result
 }
 
 func finalizeUpdate(ctx context.Context, db *sql.DB, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
-	// Read only (ref, content_hash) — the sole inputs corpus.Fingerprint needs.
-	// Loading full rows here scales as O(N * row_size) per Update and dominates
-	// latency on large corpora (see #37).
+	// Read only the persisted digest inputs (ref, content_hash) that
+	// corpus.FingerprintFromPairs consumes in this path. Loading full rows
+	// here scales as O(N * row_size) per Update and dominates latency on
+	// large corpora (see #37).
 	pairs, err := loadCurrentRefHashes(ctx, tx)
 	if err != nil {
 		return err

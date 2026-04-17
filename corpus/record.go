@@ -129,10 +129,13 @@ type RefHash struct {
 }
 
 // FingerprintFromPairs returns the same digest as Fingerprint([]Record) for
-// already-normalized (Ref, ContentHash) inputs. Pairs with an empty Ref or
-// ContentHash (after trimming) are skipped, mirroring Fingerprint's silent-skip
-// on records that fail Normalized(). Callers holding raw Record values must
-// use Fingerprint to preserve Normalized() defaults and validation.
+// already-normalized (Ref, ContentHash) inputs: non-empty after trimming, with
+// ContentHash already computed. Pairs with an empty Ref or ContentHash are
+// skipped — unlike Fingerprint([]Record), this helper cannot apply Normalized()
+// defaults or regenerate ContentHash via HashRecord from other fields, so its
+// output only matches Fingerprint when the inputs already satisfy that
+// invariant. Callers reading persisted rows must either enforce the invariant
+// at read time (as index.loadCurrentRefHashes does) or use Fingerprint instead.
 func FingerprintFromPairs(pairs []RefHash) string {
 	parts := make([]string, 0, len(pairs))
 	for _, p := range pairs {
