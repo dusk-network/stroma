@@ -242,7 +242,7 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	quantization := store.QuantizationFloat32
 	if query.IncludeEmbeddings {
 		var err error
-		quantization, err = readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+		quantization, err = s.resolveQuantization(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -300,6 +300,19 @@ WHERE 1 = 1`)
 ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
 	sqlText = builder.String()
 	return sqlText, args
+}
+
+// resolveQuantization reads the snapshot's quantization metadata and
+// validates it against the supported set. It fails fast on unsupported
+// values so callers cannot silently misdecode vectors against stale or
+// malformed metadata. An empty / missing key defaults to float32 via
+// readMetadataValueOptional, which then passes normalizeQuantization.
+func (s *Snapshot) resolveQuantization(ctx context.Context) (string, error) {
+	raw, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return "", err
+	}
+	return normalizeQuantization(raw)
 }
 
 func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string) (Section, error) {
@@ -361,7 +374,7 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 		return nil, err
 	}
 
-	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	quantization, err := s.resolveQuantization(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +420,7 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 		query.Limit = 10
 	}
 
-	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	quantization, err := s.resolveQuantization(ctx)
 	if err != nil {
 		return nil, err
 	}
