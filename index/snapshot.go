@@ -82,6 +82,14 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	// For binary snapshots, verify the full-precision companion table is
+	// complete at open time. Read paths rely on inner joins against
+	// chunks_vec_full, so a missing companion row would silently drop
+	// that chunk from search and Sections() without surfacing an error.
+	if err := checkChunksVecFullCompleteness(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
+	}
 	return &Snapshot{path: path, db: db}, nil
 }
 

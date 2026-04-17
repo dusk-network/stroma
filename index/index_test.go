@@ -1661,6 +1661,54 @@ func TestSnapshotSectionsBinaryIncludesFloatEmbeddings(t *testing.T) {
 	}
 }
 
+func TestOpenSnapshotRejectsIncompleteBinaryCompanion(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "binary",
+	}); err != nil {
+		t.Fatalf("Rebuild(binary) error = %v", err)
+	}
+
+	// Surgically drop a companion row behind stroma's back to simulate
+	// the exact corruption mode Codex flagged: chunks_vec_full missing a
+	// row that chunks still references. OpenSnapshot must refuse instead
+	// of silently losing the chunk through the inner-join read path.
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `DELETE FROM chunks_vec_full`); err != nil {
+		t.Fatalf("DELETE chunks_vec_full error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	_, err = OpenSnapshot(context.Background(), path)
+	if err == nil {
+		t.Fatal("OpenSnapshot(corrupt binary snapshot) err = nil, want completeness error")
+	}
+	if !strings.Contains(err.Error(), "chunks_vec_full") {
+		t.Fatalf("OpenSnapshot err = %v, want reference to chunks_vec_full", err)
+	}
+}
+
 func TestRebuildSelfReuseReplacesSnapshotInPlace(t *testing.T) {
 	t.Parallel()
 

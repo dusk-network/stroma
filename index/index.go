@@ -20,7 +20,7 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
-const schemaVersion = "2"
+const schemaVersion = "3"
 
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
@@ -945,7 +945,50 @@ func runIntegrityChecks(ctx context.Context, query queryContextRunner) error {
 		}
 		return fmt.Errorf("foreign_key_check failed: table=%s rowid=%d parent=%s fk=%d", table, rowID, parent, foreignKeyID)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return checkChunksVecFullCompleteness(ctx, query)
+}
+
+// checkChunksVecFullCompleteness is a no-op for non-binary snapshots; for
+// binary snapshots it verifies that every chunk has a companion
+// chunks_vec_full row and vice versa. Without this check a missing
+// companion row would silently drop that chunk from binary search (the
+// rescore join is an inner join) and from Sections(IncludeEmbeddings).
+func checkChunksVecFullCompleteness(ctx context.Context, query queryContextRunner) error {
+	has, err := hasTable(ctx, query, "chunks_vec_full")
+	if err != nil {
+		return fmt.Errorf("probe chunks_vec_full: %w", err)
+	}
+	if !has {
+		return nil
+	}
+	var missingCompanion int
+	row := query.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM chunks c
+LEFT JOIN chunks_vec_full v ON v.chunk_id = c.id
+WHERE v.chunk_id IS NULL`)
+	if err := row.Scan(&missingCompanion); err != nil {
+		return fmt.Errorf("count missing chunks_vec_full rows: %w", err)
+	}
+	if missingCompanion != 0 {
+		return fmt.Errorf("%d chunk(s) missing from chunks_vec_full; binary search would silently drop them", missingCompanion)
+	}
+	var orphanCompanion int
+	row = query.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM chunks_vec_full v
+LEFT JOIN chunks c ON c.id = v.chunk_id
+WHERE c.id IS NULL`)
+	if err := row.Scan(&orphanCompanion); err != nil {
+		return fmt.Errorf("count orphan chunks_vec_full rows: %w", err)
+	}
+	if orphanCompanion != 0 {
+		return fmt.Errorf("%d orphan row(s) in chunks_vec_full have no matching chunk", orphanCompanion)
+	}
+	return nil
 }
 
 func replaceFile(stagingPath, finalPath string) error {
