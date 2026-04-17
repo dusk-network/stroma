@@ -373,6 +373,148 @@ func TestOpenAIConfigRedactsAPIToken(t *testing.T) {
 	}
 }
 
+// TestOpenAIChunksOverMaxBatchSize locks the client-side batching
+// contract: EmbedDocuments with more inputs than MaxBatchSize must
+// split into ordered sub-requests of at most MaxBatchSize each and
+// concatenate the results in input order. The fake server records
+// every request's input slice so the test can assert both the
+// per-batch cap and the overall ordering.
+func TestOpenAIChunksOverMaxBatchSize(t *testing.T) {
+	t.Parallel()
+
+	server, received := startOpenAIEmbedderStub(t, stubResponse{dimension: 4})
+	defer server.Close()
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:      server.URL + "/v1",
+		Model:        "mami",
+		Timeout:      5 * time.Second,
+		MaxBatchSize: 3,
+	})
+
+	inputs := []string{"a", "b", "c", "d", "e", "f", "g"}
+	vectors, err := e.EmbedDocuments(context.Background(), inputs)
+	if err != nil {
+		t.Fatalf("EmbedDocuments() error = %v", err)
+	}
+	if len(vectors) != len(inputs) {
+		t.Fatalf("returned %d vectors, want %d", len(vectors), len(inputs))
+	}
+
+	// Three batches expected at batch size 3: [a b c], [d e f], [g].
+	if len(received.requests) != 3 {
+		t.Fatalf("server saw %d requests, want 3 (batches of 3/3/1)", len(received.requests))
+	}
+	for i, req := range received.requests {
+		if len(req.inputs) > 3 {
+			t.Fatalf("batch %d size = %d, want <= 3", i, len(req.inputs))
+		}
+	}
+	// Flatten in arrival order and assert it equals input order.
+	flat := make([]string, 0, len(inputs))
+	for _, req := range received.requests {
+		flat = append(flat, req.inputs...)
+	}
+	if len(flat) != len(inputs) {
+		t.Fatalf("flattened captured inputs has %d entries, want %d (batching dropped or duplicated an input)", len(flat), len(inputs))
+	}
+	for i, want := range inputs {
+		if flat[i] != want {
+			t.Fatalf("flattened[%d] = %q, want %q (order preservation across batches)", i, flat[i], want)
+		}
+	}
+}
+
+// TestOpenAIMaxBatchSizeDefaultsToConservativeValue locks the default
+// behaviour: a caller that doesn't set MaxBatchSize gets
+// defaultOpenAIMaxBatchSize (512), so a single large EmbedDocuments
+// call can't silently exceed the upstream's per-request limit.
+func TestOpenAIMaxBatchSizeDefaultsToConservativeValue(t *testing.T) {
+	t.Parallel()
+
+	e := NewOpenAI(OpenAIConfig{BaseURL: "http://example.test", Model: "mami"})
+	if got := e.Config().MaxBatchSize; got != defaultOpenAIMaxBatchSize {
+		t.Fatalf("Config().MaxBatchSize = %d, want %d (conservative default)", got, defaultOpenAIMaxBatchSize)
+	}
+}
+
+// TestOpenAIMultiBatchBoundsTotalTimeout verifies that a multi-batch
+// EmbedDocuments call respects the configured Timeout as a total
+// budget, not per-request. Before the fix, http.Client.Timeout
+// applied per HTTP request, so a 10-batch call could consume up to
+// 10 × Timeout before tripping — a behaviour regression vs the
+// pre-batching single-request contract where Timeout bounded the
+// whole call. This test sends 4 batches against a slow server; if
+// the total-timeout guard weren't in place, the operation would
+// succeed; with the guard, it must fail before all batches complete.
+func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
+	t.Parallel()
+
+	const perRequestDelay = 200 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		time.Sleep(perRequestDelay)
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer server.Close()
+
+	// 4 batches × 200ms per batch = 800ms of server work if all ran;
+	// the 300ms Timeout bounds the whole call, so ~2 batches can land
+	// before the deadline fires.
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:      server.URL + "/v1",
+		Model:        "mami",
+		Timeout:      300 * time.Millisecond,
+		MaxBatchSize: 2,
+	})
+	start := time.Now()
+	_, err := e.EmbedDocuments(context.Background(), []string{"a", "b", "c", "d", "e", "f", "g", "h"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("EmbedDocuments() succeeded on slow upstream, want deadline-exceeded error")
+	}
+	// Allow some slack for scheduling jitter; what we really care
+	// about is that we did not blow past the configured budget by
+	// a factor of (batch count).
+	if elapsed > 600*time.Millisecond {
+		t.Fatalf("EmbedDocuments() took %s, want bounded by total Timeout budget (~300ms + slack)", elapsed)
+	}
+}
+
+// TestOpenAIMaxBatchSizeExactBoundary covers the edge case where the
+// input count equals MaxBatchSize — a single request, not two (one
+// with the batch and one empty).
+func TestOpenAIMaxBatchSizeExactBoundary(t *testing.T) {
+	t.Parallel()
+
+	server, received := startOpenAIEmbedderStub(t, stubResponse{dimension: 4})
+	defer server.Close()
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:      server.URL + "/v1",
+		Model:        "mami",
+		Timeout:      2 * time.Second,
+		MaxBatchSize: 3,
+	})
+	if _, err := e.EmbedDocuments(context.Background(), []string{"a", "b", "c"}); err != nil {
+		t.Fatalf("EmbedDocuments() error = %v", err)
+	}
+	if len(received.requests) != 1 {
+		t.Fatalf("server saw %d requests, want 1 (exact boundary should not spill to a second call)", len(received.requests))
+	}
+}
+
 func fillVector(dim int) []float64 {
 	out := make([]float64, dim)
 	for i := range out {

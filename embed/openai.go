@@ -19,6 +19,14 @@ const (
 	openAIStrategyNomicPrefix = "nomic_search_prefix_v1"
 	defaultOpenAITimeout      = 15 * time.Second
 
+	// defaultOpenAIMaxBatchSize is the per-request cap applied when a
+	// caller leaves OpenAIConfig.MaxBatchSize unset. Real OpenAI
+	// embeddings accept up to 2048 inputs per request, but self-hosted
+	// OpenAI-compatible gateways vary; 512 is a conservative default
+	// that fits every deployment we've seen in the wild and keeps a
+	// single embed batch well under the 32 MiB response cap.
+	defaultOpenAIMaxBatchSize = 512
+
 	// maxEmbedResponseBytes caps how much of an embedder response body
 	// stroma will buffer before aborting the decode. Real OpenAI
 	// responses for a single embed batch are well under 1 MiB; 32 MiB
@@ -54,6 +62,15 @@ type OpenAIConfig struct {
 	Model    string
 	Timeout  time.Duration
 	APIToken string
+
+	// MaxBatchSize caps how many inputs are sent in a single embeddings
+	// request. EmbedDocuments and EmbedQueries chunk their input into
+	// sub-requests of at most this size and concatenate the results in
+	// order. Zero or negative values select defaultOpenAIMaxBatchSize
+	// (512), which is conservative for self-hosted gateways; real OpenAI
+	// accepts up to 2048 per request, and operators who know their
+	// upstream can raise this explicitly.
+	MaxBatchSize int
 }
 
 // Enabled reports whether the config is usable for requests.
@@ -64,8 +81,8 @@ func (c OpenAIConfig) Enabled() bool {
 // String returns a redacted, human-readable rendering of the config.
 // fmt verbs %v and %s route through this method.
 func (c OpenAIConfig) String() string {
-	return fmt.Sprintf("OpenAIConfig{BaseURL:%q Model:%q Timeout:%s APIToken:%q}",
-		c.BaseURL, c.Model, c.Timeout, redactedToken(c.APIToken))
+	return fmt.Sprintf("OpenAIConfig{BaseURL:%q Model:%q Timeout:%s MaxBatchSize:%d APIToken:%q}",
+		c.BaseURL, c.Model, c.Timeout, c.MaxBatchSize, redactedToken(c.APIToken))
 }
 
 // GoString returns a redacted Go-syntax rendering of the config for %#v.
@@ -75,8 +92,8 @@ func (c OpenAIConfig) String() string {
 // back into source (Duration's default %s form "2s" is human-readable
 // but not Go-parseable).
 func (c OpenAIConfig) GoString() string {
-	return fmt.Sprintf("embed.OpenAIConfig{BaseURL:%q, Model:%q, Timeout:time.Duration(%d), APIToken:%q}",
-		c.BaseURL, c.Model, int64(c.Timeout), redactedToken(c.APIToken))
+	return fmt.Sprintf("embed.OpenAIConfig{BaseURL:%q, Model:%q, Timeout:time.Duration(%d), MaxBatchSize:%d, APIToken:%q}",
+		c.BaseURL, c.Model, int64(c.Timeout), c.MaxBatchSize, redactedToken(c.APIToken))
 }
 
 // LogValue implements slog.LogValuer so slog handlers — including the
@@ -90,6 +107,7 @@ func (c OpenAIConfig) LogValue() slog.Value {
 		slog.String("base_url", c.BaseURL),
 		slog.String("model", c.Model),
 		slog.Duration("timeout", c.Timeout),
+		slog.Int("max_batch_size", c.MaxBatchSize),
 		slog.String("api_token", redactedToken(c.APIToken)),
 	)
 }
@@ -123,6 +141,9 @@ func NewOpenAI(cfg OpenAIConfig) *OpenAI {
 		timeout = defaultOpenAITimeout
 	}
 	cfg.Timeout = timeout
+	if cfg.MaxBatchSize <= 0 {
+		cfg.MaxBatchSize = defaultOpenAIMaxBatchSize
+	}
 	return &OpenAI{
 		config:   cfg,
 		strategy: openAIStrategyForModel(cfg.Model),
@@ -178,6 +199,56 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		ctx = context.Background()
 	}
 
+	// NewOpenAI ensures MaxBatchSize > 0; guard here for the "someone
+	// constructed OpenAI{} directly" path and for tests that mutate
+	// config post-construction.
+	batchSize := e.config.MaxBatchSize
+	if batchSize <= 0 {
+		batchSize = defaultOpenAIMaxBatchSize
+	}
+	if len(texts) <= batchSize {
+		return e.embedBatch(ctx, purpose, texts)
+	}
+
+	// http.Client.Timeout applies per request, so a multi-batch call
+	// would otherwise be able to consume up to N*Timeout before the
+	// caller's budget trips — a behavior regression vs the pre-batching
+	// single-request call, where Timeout was the total budget. Derive
+	// an overall deadline here; context.WithDeadline respects any
+	// tighter caller-supplied deadline, so we never extend the window
+	// a caller already wanted to close earlier.
+	if e.config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(e.config.Timeout))
+		defer cancel()
+	}
+
+	// Chunk into sub-requests of at most batchSize and concatenate the
+	// results in input order. Any sub-request failure fails the whole
+	// call; callers retry at the EmbedDocuments/EmbedQueries boundary.
+	// Note: earlier-batch vectors that already succeeded upstream are
+	// discarded on retry — embedders are idempotent so this is correct
+	// but wasteful. Richer per-batch progress/retry handling is out of
+	// scope for #41 part 1.
+	result := make([][]float64, 0, len(texts))
+	for start := 0; start < len(texts); start += batchSize {
+		end := start + batchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		vectors, err := e.embedBatch(ctx, purpose, texts[start:end])
+		if err != nil {
+			return nil, fmt.Errorf("stroma/embed: batch [%d:%d] of %d: %w", start, end, len(texts), err)
+		}
+		result = append(result, vectors...)
+	}
+	return result, nil
+}
+
+// embedBatch issues a single embeddings request. Callers guarantee
+// len(texts) is within the server's per-request limit; embed() handles
+// that via MaxBatchSize chunking.
+func (e *OpenAI) embedBatch(ctx context.Context, purpose string, texts []string) ([][]float64, error) {
 	req, inputCount, err := e.buildEmbedRequest(ctx, purpose, texts)
 	if err != nil {
 		return nil, err
