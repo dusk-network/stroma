@@ -103,10 +103,14 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
 	}
 	trimmedSchema := strings.TrimSpace(schema)
-	if trimmedSchema != schemaVersion && trimmedSchema != prevSchemaVersion {
+	// Read paths don't depend on the content_hash encoding — they consume
+	// stored values as-is — so legacy v2 snapshots keep opening for Stats,
+	// Records, Sections, and Search against v1.0+ code. Only the Update
+	// path forces the content_hash algo bump via migrateSchemaToCurrent.
+	if trimmedSchema != schemaVersion && trimmedSchema != prevSchemaVersion && trimmedSchema != legacySchemaVersionV2 {
 		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: %w: got %q, supported %q or %q",
-			path, ErrUnsupportedSchemaVersion, trimmedSchema, prevSchemaVersion, schemaVersion)
+		return nil, fmt.Errorf("open snapshot %s: %w: got %q, supported %q, %q, or %q",
+			path, ErrUnsupportedSchemaVersion, trimmedSchema, legacySchemaVersionV2, prevSchemaVersion, schemaVersion)
 	}
 	// For binary snapshots, verify the full-precision companion table is
 	// complete at open time. Read paths rely on inner joins against

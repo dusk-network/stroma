@@ -110,14 +110,18 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	if err != nil {
 		return false, false
 	}
-	// v2 snapshots pre-date context_prefix. They are reuse-compatible
+	// v2 snapshots pre-date context_prefix. They remain reuse-compatible
 	// because loadStoredChunksForRecord defaults the missing prefix to
 	// "" and reuseChunkKey with prefix="" matches what the new-side key
 	// produces when no Contextualizer is configured. Contextualizer-
 	// enabled rebuilds produce different new-side keys, so v2 chunks
-	// simply miss and get re-embedded.
+	// simply miss and get re-embedded. Record-level reuse (content_hash
+	// comparison) won't fire against a real pre-1.0 v2 file because its
+	// stored hashes are under the old encoding and the new-side
+	// HashRecord uses the new encoding; chunk-level reuse still picks up
+	// every unchanged chunk.
 	trimmed := strings.TrimSpace(schema)
-	if trimmed != schemaVersion && trimmed != prevSchemaVersion {
+	if trimmed != schemaVersion && trimmed != prevSchemaVersion && trimmed != legacySchemaVersionV2 {
 		return false, false
 	}
 	storedFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")

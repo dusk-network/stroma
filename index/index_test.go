@@ -1663,10 +1663,13 @@ func TestRebuildContextualizerRejectsWrongLengthPrefixes(t *testing.T) {
 	}
 }
 
-// TestOpenSnapshotRejectsV2 locks the 1.0 break: OpenSnapshot no longer
-// accepts v2 directly. Users with a v2 file must run Update first, which
-// chains v2→v3→v4 in a single transaction.
-func TestOpenSnapshotRejectsV2(t *testing.T) {
+// TestOpenSnapshotV2BackwardCompatibleSections locks the read-compat
+// contract: pre-1.0 v2 snapshots still open for read-only workloads
+// (Stats, Records, Sections, Search) under v1.0+ code. Read paths never
+// recompute HashRecord, so the content_hash encoding bump does not affect
+// them; only Update forces the migration chain. Sections() on a v2
+// snapshot projects '' for the missing context_prefix column.
+func TestOpenSnapshotV2BackwardCompatibleSections(t *testing.T) {
 	t.Parallel()
 
 	fixture, err := embed.NewFixture("fixture-a", 16)
@@ -1692,10 +1695,72 @@ func TestOpenSnapshotRejectsV2(t *testing.T) {
 		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
 	}
 
-	if _, err := OpenSnapshot(context.Background(), path); err == nil {
-		t.Fatal("OpenSnapshot(v2) succeeded, want ErrUnsupportedSchemaVersion")
-	} else if !errors.Is(err, ErrUnsupportedSchemaVersion) {
-		t.Fatalf("OpenSnapshot(v2) err = %v, want ErrUnsupportedSchemaVersion", err)
+	snap, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(v2) error = %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+
+	sections, err := snap.Sections(context.Background(), SectionQuery{})
+	if err != nil {
+		t.Fatalf("Sections(v2) error = %v", err)
+	}
+	if len(sections) == 0 {
+		t.Fatal("Sections(v2) returned no sections")
+	}
+	for _, section := range sections {
+		if section.ContextPrefix != "" {
+			t.Fatalf("v2 section %s ContextPrefix = %q, want empty", section.Ref, section.ContextPrefix)
+		}
+	}
+}
+
+// TestRebuildReuseFromV2SnapshotStillHits locks the read-compat contract
+// for reuse. A pre-1.0 v2 snapshot remains a valid ReuseFromPath source:
+// chunk-level reuse via reuseChunkKey (title/heading/body-keyed, algo-
+// independent) still fires on unchanged sections even though record-level
+// content_hash comparison can't (the v2 file's stored hashes are under the
+// old encoding, while the new-side recomputes under the new encoding).
+func TestRebuildReuseFromV2SnapshotStillHits(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	pathA := dir + "/a.db"
+	pathB := dir + "/b.db"
+
+	records := []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     pathA,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(A) error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(pathA); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          pathB,
+		ReuseFromPath: pathA,
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(B reusing v2 A) error = %v", err)
+	}
+	if result.ReusedChunkCount == 0 {
+		t.Fatal("ReusedChunkCount = 0 against v2 reuse source; chunk-level reuse must stay compatible when no Contextualizer is configured")
 	}
 }
 
