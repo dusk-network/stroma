@@ -1448,20 +1448,15 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 }
 
 func deleteRecord(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
+	// chunks_vec and fts_chunks are sqlite-vec / FTS5 virtual tables and
+	// do not participate in foreign-key cascades, so we delete their rows
+	// explicitly. chunks_vec_full is a regular table with
+	//   FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+	// and configureDB pins PRAGMA foreign_keys = ON, so the
+	// records → chunks → chunks_vec_full cascade cleans it up when the
+	// record is deleted below. No explicit delete needed.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
 		return false, fmt.Errorf("delete vectors for %s: %w", ref, err)
-	}
-	// chunks_vec_full only exists in binary mode. Check the catalogue
-	// first so the quantization-agnostic delete path doesn't fail to
-	// compile against float32 / int8 snapshots.
-	hasFullTable, err := hasTable(ctx, tx, "chunks_vec_full")
-	if err != nil {
-		return false, fmt.Errorf("probe chunks_vec_full for %s: %w", ref, err)
-	}
-	if hasFullTable {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_vec_full WHERE chunk_id IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
-			return false, fmt.Errorf("delete full-precision vectors for %s: %w", ref, err)
-		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fts_chunks WHERE rowid IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
 		return false, fmt.Errorf("delete fts rows for %s: %w", ref, err)
