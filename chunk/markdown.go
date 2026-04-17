@@ -2,10 +2,19 @@
 package chunk
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
+
+// ErrTooManySections is returned by MarkdownWithOptions when the input body
+// produces more sections than Options.MaxSections allows. Enclosing errors
+// wrap this sentinel via fmt.Errorf with %w so callers can use errors.Is
+// to distinguish a pathological-input rejection from other failures (e.g.,
+// to skip the record instead of aborting the whole rebuild).
+var ErrTooManySections = errors.New("chunk: section count exceeds configured limit")
 
 // Section is one heading-aware Markdown chunk.
 type Section struct {
@@ -26,6 +35,15 @@ type Options struct {
 	// Values greater than or equal to MaxTokens are treated as invalid and
 	// leave oversized sections unsplit.
 	OverlapTokens int
+
+	// MaxSections caps the number of heading-aware sections
+	// MarkdownWithOptions will emit for a single body. Zero means no
+	// cap (backward-compatible default for direct callers); any positive
+	// value causes MarkdownWithOptions to return ErrTooManySections when
+	// the body would produce more sections than the cap. Stroma's index
+	// layer applies a conservative default (see index.DefaultMaxChunkSections)
+	// so a pathological body can't DoS the embedder or balloon the snapshot.
+	MaxSections int
 }
 
 type heading struct {
@@ -131,11 +149,23 @@ func joinHeadings(stack []heading) string {
 // MarkdownWithOptions splits Markdown into heading-aware sections and then
 // applies token-budget splitting when sections exceed opts.MaxTokens, unless
 // opts.OverlapTokens is invalid for splitting. Zero-value options produce the
-// same output as Markdown.
-func MarkdownWithOptions(title, body string, opts Options) []Section {
+// same output as Markdown with a nil error.
+//
+// If opts.MaxSections is positive and either the heading-aware pass or the
+// post-split pass would produce more than that many sections, returns
+// ErrTooManySections (wrapped with the observed count and the cap) and a
+// nil slice so callers can surface the rejection cleanly. MaxSections is
+// checked on the heading pass too so a 10^6-heading body can't even
+// allocate the intermediate slice — the guard fires before the token-
+// budget pass, which might otherwise multiply the section count further.
+func MarkdownWithOptions(title, body string, opts Options) ([]Section, error) {
 	sections := Markdown(title, body)
+	if opts.MaxSections > 0 && len(sections) > opts.MaxSections {
+		return nil, fmt.Errorf("%w: heading-aware pass produced %d sections, limit is %d",
+			ErrTooManySections, len(sections), opts.MaxSections)
+	}
 	if opts.MaxTokens <= 0 {
-		return sections
+		return sections, nil
 	}
 
 	result := make([]Section, 0, len(sections))
@@ -145,8 +175,12 @@ func MarkdownWithOptions(title, body string, opts Options) []Section {
 			continue
 		}
 		result = append(result, SplitSection(s, opts.MaxTokens, opts.OverlapTokens)...)
+		if opts.MaxSections > 0 && len(result) > opts.MaxSections {
+			return nil, fmt.Errorf("%w: token-budget split produced %d sections, limit is %d",
+				ErrTooManySections, len(result), opts.MaxSections)
+		}
 	}
-	return result
+	return result, nil
 }
 
 func countWords(text string) int {

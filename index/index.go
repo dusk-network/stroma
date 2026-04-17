@@ -38,6 +38,28 @@ const (
 	legacySchemaVersionV2 = "2"
 )
 
+// DefaultMaxChunkSections caps the number of heading-aware sections a
+// single record can contribute to the index when the caller hasn't
+// overridden it. 10,000 is generous for legitimate technical documents
+// (few real specs exceed a few hundred headings) while still preventing
+// a pathological or hostile body from expanding into millions of
+// embedder calls + rows.
+const DefaultMaxChunkSections = 10_000
+
+// resolveMaxChunkSections maps a caller-provided MaxChunkSections knob
+// onto the chunk.Options.MaxSections value: zero → safe default,
+// negative → chunk-level "unlimited", positive → verbatim.
+func resolveMaxChunkSections(user int) int {
+	switch {
+	case user < 0:
+		return 0 // chunk.Options.MaxSections == 0 means unlimited
+	case user == 0:
+		return DefaultMaxChunkSections
+	default:
+		return user
+	}
+}
+
 // schemaHasContextPrefix reports whether a snapshot at the given schema
 // version carries the chunks.context_prefix column. The v2→v3 bump added
 // that column; v3→v4 kept the same table shape (it re-hashed record
@@ -103,6 +125,16 @@ type BuildOptions struct {
 	// overlap.
 	ChunkOverlapTokens int
 
+	// MaxChunkSections caps how many sections any single record is allowed
+	// to produce. A pathological Markdown body (e.g., 10^6 heading lines)
+	// would otherwise translate into 10^6 embedder calls and 10^6
+	// chunk/vector rows — a DoS vector for shared embedders. Zero means
+	// DefaultMaxChunkSections; a negative value disables the cap for
+	// callers who have their own upstream validation. When the cap is
+	// exceeded, Rebuild returns an error wrapping chunk.ErrTooManySections
+	// instead of silently admitting the record.
+	MaxChunkSections int
+
 	// Quantization controls the vector storage format. Supported values
 	// are "float32" (default) and "int8". Int8 reduces storage by 4x at
 	// the cost of minor precision loss.
@@ -142,6 +174,11 @@ type UpdateOptions struct {
 	// between adjacent sub-sections when a section is split. It should match
 	// the chunking policy used to build the current index.
 	ChunkOverlapTokens int
+
+	// MaxChunkSections mirrors BuildOptions.MaxChunkSections for the
+	// incremental-update path. Zero → DefaultMaxChunkSections; negative
+	// → no cap.
+	MaxChunkSections int
 
 	// Quantization, when provided, must match the existing index. Leaving it
 	// empty reuses the stored quantization metadata.
@@ -278,6 +315,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 		chunkOpts: chunk.Options{
 			MaxTokens:     options.MaxChunkTokens,
 			OverlapTokens: options.ChunkOverlapTokens,
+			MaxSections:   resolveMaxChunkSections(options.MaxChunkSections),
 		},
 		dimension:    inputs.dimension,
 		quantization: inputs.quantization,
@@ -833,7 +871,10 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		return stats, err
 	}
 
-	sections := sectionsForRecord(record, s.chunkOpts)
+	sections, err := sectionsForRecord(record, s.chunkOpts)
+	if err != nil {
+		return stats, err
+	}
 	prefixes, err := runContextualizer(ctx, s.contextualizer, record, sections)
 	if err != nil {
 		return stats, fmt.Errorf("contextualize record %s: %w", record.Ref, err)
@@ -999,12 +1040,12 @@ func insertVectorBlobs(ctx context.Context, chunkID int64, primary, full []byte,
 	return nil
 }
 
-func sectionsForRecord(record corpus.Record, opts chunk.Options) []chunk.Section {
+func sectionsForRecord(record corpus.Record, opts chunk.Options) ([]chunk.Section, error) {
 	switch record.BodyFormat {
 	case corpus.FormatPlaintext:
 		text := strings.TrimSpace(record.BodyText)
 		if text == "" {
-			return nil
+			return nil, nil
 		}
 		sections := []chunk.Section{{
 			Heading: record.Title,
@@ -1015,14 +1056,31 @@ func sectionsForRecord(record corpus.Record, opts chunk.Options) []chunk.Section
 			for _, s := range sections {
 				result = append(result, chunk.SplitSection(s, opts.MaxTokens, opts.OverlapTokens)...)
 			}
-			return result
+			sections = result
 		}
-		return sections
+		if opts.MaxSections > 0 && len(sections) > opts.MaxSections {
+			return nil, fmt.Errorf("record %q: %w: plaintext token-budget split produced %d sections, limit is %d",
+				record.Ref, chunk.ErrTooManySections, len(sections), opts.MaxSections)
+		}
+		return sections, nil
 	default:
+		// MarkdownWithOptions always enforces opts.MaxSections. When
+		// MaxTokens is zero we skip the token-budget pass by calling
+		// the plain Markdown and then re-applying the cap — a cheap
+		// length check rather than an extra split loop.
 		if opts.MaxTokens > 0 {
-			return chunk.MarkdownWithOptions(record.Title, record.BodyText, opts)
+			sections, err := chunk.MarkdownWithOptions(record.Title, record.BodyText, opts)
+			if err != nil {
+				return nil, fmt.Errorf("record %q: %w", record.Ref, err)
+			}
+			return sections, nil
 		}
-		return chunk.Markdown(record.Title, record.BodyText)
+		sections := chunk.Markdown(record.Title, record.BodyText)
+		if opts.MaxSections > 0 && len(sections) > opts.MaxSections {
+			return nil, fmt.Errorf("record %q: %w: heading-aware pass produced %d sections, limit is %d",
+				record.Ref, chunk.ErrTooManySections, len(sections), opts.MaxSections)
+		}
+		return sections, nil
 	}
 }
 
@@ -1815,6 +1873,7 @@ func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.
 		chunkOpts: chunk.Options{
 			MaxTokens:     options.MaxChunkTokens,
 			OverlapTokens: options.ChunkOverlapTokens,
+			MaxSections:   resolveMaxChunkSections(options.MaxChunkSections),
 		},
 	}
 

@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -288,10 +289,13 @@ func TestRebuildUsesContextualEmbedderWhenAvailable(t *testing.T) {
 		t.Fatalf("Rebuild() error = %v", err)
 	}
 
-	sections := sectionsForRecord(record, chunk.Options{
+	sections, err := sectionsForRecord(record, chunk.Options{
 		MaxTokens:     buildOpts.MaxChunkTokens,
 		OverlapTokens: buildOpts.ChunkOverlapTokens,
 	})
+	if err != nil {
+		t.Fatalf("sectionsForRecord() error = %v", err)
+	}
 	wantChunks := make([]string, 0, len(sections))
 	for _, section := range sections {
 		wantChunks = append(wantChunks, textForEmbedding(record.Title, section))
@@ -3469,5 +3473,87 @@ func TestUpdateRefusesEmptyContentHashPair(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "empty content_hash") {
 		t.Fatalf("Update() err = %v, want error mentioning empty content_hash", err)
+	}
+}
+
+// TestRebuildRejectsPathologicalSectionCount locks the DoS guard at the
+// index layer: a body with more headings than DefaultMaxChunkSections
+// must fail cleanly before any embedder calls or chunk inserts, not
+// silently admit 10^6 rows. We use a cap slightly under the default
+// via MaxChunkSections so the fixture stays small.
+func TestRebuildRejectsPathologicalSectionCount(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	var builder strings.Builder
+	const headings = 50
+	for i := 0; i < headings; i++ {
+		fmt.Fprintf(&builder, "## Section %d\n\nBody %d\n\n", i, i)
+	}
+	record := corpus.Record{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   builder.String(),
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	_, err = Rebuild(context.Background(), []corpus.Record{record}, BuildOptions{
+		Path:             path,
+		Embedder:         fixture,
+		MaxChunkSections: 10,
+	})
+	if err == nil {
+		t.Fatal("Rebuild() succeeded with pathological section count, want ErrTooManySections")
+	}
+	if !errors.Is(err, chunk.ErrTooManySections) {
+		t.Fatalf("Rebuild() err = %v, want wraps chunk.ErrTooManySections", err)
+	}
+}
+
+// TestRebuildNegativeMaxChunkSectionsDisablesGuard locks the escape
+// hatch for callers that do their own upstream validation: a negative
+// MaxChunkSections means "no cap", translating to chunk.Options.MaxSections = 0.
+func TestRebuildNegativeMaxChunkSectionsDisablesGuard(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	// Just enough headings to exceed the conservative index-layer cap
+	// defaults, but tractable for a unit test.
+	var builder strings.Builder
+	const headings = 200
+	for i := 0; i < headings; i++ {
+		fmt.Fprintf(&builder, "## Section %d\n\nBody %d\n\n", i, i)
+	}
+	record := corpus.Record{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   builder.String(),
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	result, err := Rebuild(context.Background(), []corpus.Record{record}, BuildOptions{
+		Path:             path,
+		Embedder:         fixture,
+		MaxChunkSections: -1,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(MaxChunkSections=-1) error = %v, want success (cap disabled)", err)
+	}
+	if result.ChunkCount != headings {
+		t.Fatalf("ChunkCount = %d, want %d (one chunk per heading)", result.ChunkCount, headings)
 	}
 }
