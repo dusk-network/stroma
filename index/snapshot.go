@@ -55,15 +55,16 @@ type SectionQuery struct {
 
 // Section is one stored section from a Stroma snapshot.
 type Section struct {
-	ChunkID   int64
-	Ref       string
-	Kind      string
-	Title     string
-	SourceRef string
-	Heading   string
-	Content   string
-	Metadata  map[string]string
-	Embedding []float64
+	ChunkID       int64
+	Ref           string
+	Kind          string
+	Title         string
+	SourceRef     string
+	Heading       string
+	Content       string
+	ContextPrefix string
+	Metadata      map[string]string
+	Embedding     []float64
 }
 
 // OpenSnapshot opens a read-only Stroma snapshot.
@@ -253,7 +254,11 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 		}
 	}
 
-	sqlText, args := buildSectionsQuery(query)
+	hasPrefix, err := hasChunkColumn(ctx, s.db, "context_prefix")
+	if err != nil {
+		return nil, fmt.Errorf("probe chunks.context_prefix: %w", err)
+	}
+	sqlText, args := buildSectionsQuery(query, hasPrefix)
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query sections: %w", err)
@@ -274,9 +279,15 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	return result, nil
 }
 
-func buildSectionsQuery(query SectionQuery) (sqlText string, args []any) {
+func buildSectionsQuery(query SectionQuery, hasContextPrefix bool) (sqlText string, args []any) {
 	var builder strings.Builder
 	args = make([]any, 0, len(query.Refs)+len(query.Kinds))
+	// v2 snapshots lack context_prefix; project an empty string so the
+	// row shape scanSectionRow expects stays stable across versions.
+	prefixExpr := "'' AS context_prefix"
+	if hasContextPrefix {
+		prefixExpr = "c.context_prefix"
+	}
 	builder.WriteString(`
 SELECT
   c.id,
@@ -286,6 +297,7 @@ SELECT
   r.source_ref,
   c.heading,
   c.content,
+  ` + prefixExpr + `,
   r.metadata_json`)
 	if query.IncludeEmbeddings {
 		builder.WriteString(", v.embedding")
@@ -379,6 +391,7 @@ func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string)
 		&section.SourceRef,
 		&section.Heading,
 		&section.Content,
+		&section.ContextPrefix,
 		&metadataRaw,
 	}
 	if includeEmbeddings {
