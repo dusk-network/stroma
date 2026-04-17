@@ -1750,6 +1750,18 @@ ORDER BY ref ASC`)
 		if err := rows.Scan(&pair.Ref, &pair.ContentHash); err != nil {
 			return nil, fmt.Errorf("scan ref/content_hash row: %w", err)
 		}
+		// Guard the byte-identity contract with corpus.Fingerprint([]Record).
+		// That path runs each record through Normalized(), which regenerates
+		// ContentHash via HashRecord when empty (an O(row_size) step we
+		// deliberately skip here). If a row ever lands with an empty
+		// content_hash — only possible via a writer bypass or external DB
+		// tampering — FingerprintFromPairs would silently drop it while
+		// Fingerprint([]Record) would include it with a regenerated hash,
+		// making the persisted fingerprint diverge from what Snapshot.Records
+		// callers would recompute. Fail loudly instead.
+		if strings.TrimSpace(pair.ContentHash) == "" {
+			return nil, fmt.Errorf("record %q has empty content_hash; refusing to recompute fingerprint over malformed state", pair.Ref)
+		}
 		pairs = append(pairs, pair)
 	}
 	if err := rows.Err(); err != nil {
