@@ -3,6 +3,7 @@ package embed
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -254,6 +255,130 @@ func startOpenAIEmbedderStub(t *testing.T, resp stubResponse) (*httptest.Server,
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
 	})
 	return httptest.NewServer(handler), received
+}
+
+// TestOpenAIBoundedResponseBody locks the byte-side guard: a misconfigured
+// or hostile upstream cannot stream an unbounded body through json.Decode
+// and OOM the host. The fake server writes more than maxEmbedResponseBytes;
+// EmbedDocuments must abort with a clear error rather than buffer it all.
+func TestOpenAIBoundedResponseBody(t *testing.T) {
+	t.Parallel()
+
+	// Stream a payload larger than the cap. We start a valid JSON
+	// document (so decoder doesn't bail early on a content-type
+	// mismatch) and then pad inside a string field. The handler does
+	// NOT set Content-Length so the client cannot short-circuit; it
+	// has to actually attempt the read.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := fmt.Fprint(w, `{"data":[{"embedding":[0.1],"index":0,"pad":"`); err != nil {
+			return
+		}
+		// Write pad in 64 KiB chunks until we exceed the cap.
+		chunk := strings.Repeat("a", 64<<10)
+		for written := 0; written <= maxEmbedResponseBytes; written += len(chunk) {
+			if _, err := fmt.Fprint(w, chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL: server.URL + "/v1",
+		Model:   "mami",
+		Timeout: 10 * time.Second,
+	})
+	_, err := e.EmbedDocuments(context.Background(), []string{"probe"})
+	if err == nil {
+		t.Fatal("EmbedDocuments() with oversized body succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("EmbedDocuments() err = %v, want error mentioning the size cap", err)
+	}
+}
+
+// TestOpenAIConfigRedactsAPIToken locks the four redaction paths —
+// Stringer (%v, %s), GoStringer (%#v), json.Marshal, and MarshalText —
+// that a structured logger or pretty-printer might reach into. Direct
+// field access still returns the raw token (that's how the embedder
+// signs requests); the redaction is defense-in-depth against accidental
+// disclosure.
+func TestOpenAIConfigRedactsAPIToken(t *testing.T) {
+	t.Parallel()
+
+	const secret = "sk-live-xxxxxxxxxxxxxxxxxxxxxx"
+	cfg := OpenAIConfig{
+		BaseURL:  "http://example.test/v1",
+		Model:    "mami",
+		Timeout:  2 * time.Second,
+		APIToken: secret,
+	}
+
+	// Each row deliberately exercises a different fmt verb; the gocritic
+	// "redundantSprint" hint would collapse them to cfg.String(), which
+	// defeats the point of asserting every verb routes through the
+	// redaction path.
+	//nolint:gocritic // testing fmt dispatch per-verb is intentional
+	renderings := []struct {
+		name string
+		got  string
+	}{
+		{"String", cfg.String()},
+		{"GoString", cfg.GoString()},
+		{"Sprintf-%v", fmt.Sprintf("%v", cfg)},
+		{"Sprintf-%s", fmt.Sprintf("%s", cfg)},
+		{"Sprintf-%+v", fmt.Sprintf("%+v", cfg)},
+		{"Sprintf-%#v", fmt.Sprintf("%#v", cfg)},
+	}
+	for _, rendering := range renderings {
+		if strings.Contains(rendering.got, secret) {
+			t.Errorf("%s leaked raw token: %q", rendering.name, rendering.got)
+		}
+		if !strings.Contains(rendering.got, redactedTokenPlaceholder) {
+			t.Errorf("%s missing redaction placeholder: %q", rendering.name, rendering.got)
+		}
+	}
+
+	// Marshaling a config with a live token through json.Marshal is
+	// exactly what this test exists to validate — the whole point is
+	// that MarshalJSON intercepts and redacts. gosec G117 flags the
+	// struct-with-APIToken pattern without seeing the redaction.
+	//nolint:gosec // redaction is asserted below
+	marshaled, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(marshaled), secret) {
+		t.Errorf("json.Marshal leaked raw token: %s", marshaled)
+	}
+	if !strings.Contains(string(marshaled), redactedTokenPlaceholder) {
+		t.Errorf("json.Marshal missing redaction placeholder: %s", marshaled)
+	}
+
+	text, err := cfg.MarshalText()
+	if err != nil {
+		t.Fatalf("MarshalText() error = %v", err)
+	}
+	if strings.Contains(string(text), secret) {
+		t.Errorf("MarshalText leaked raw token: %s", text)
+	}
+
+	// Direct field access still returns the raw token — redaction is
+	// defense-in-depth, not info-hiding, so the embedder can sign
+	// requests. Locks the current contract so future refactors don't
+	// accidentally remove field access.
+	if cfg.APIToken != secret {
+		t.Fatalf("APIToken field = %q, want raw %q", cfg.APIToken, secret)
+	}
+
+	// And a config without a token must not emit the placeholder —
+	// "unset" stays distinguishable from "set but hidden".
+	empty := OpenAIConfig{BaseURL: "http://example.test/v1", Model: "mami"}
+	if strings.Contains(empty.String(), redactedTokenPlaceholder) {
+		t.Errorf("empty-token config should not emit redaction marker: %q", empty.String())
+	}
 }
 
 func fillVector(dim int) []float64 {
