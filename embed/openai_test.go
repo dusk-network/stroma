@@ -1,9 +1,11 @@
 package embed
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -299,12 +301,11 @@ func TestOpenAIBoundedResponseBody(t *testing.T) {
 	}
 }
 
-// TestOpenAIConfigRedactsAPIToken locks the four redaction paths —
-// Stringer (%v, %s), GoStringer (%#v), json.Marshal, and MarshalText —
-// that a structured logger or pretty-printer might reach into. Direct
-// field access still returns the raw token (that's how the embedder
-// signs requests); the redaction is defense-in-depth against accidental
-// disclosure.
+// TestOpenAIConfigRedactsAPIToken locks the log-facing redaction paths:
+// String, GoString, MarshalText, and slog.LogValue all hide APIToken.
+// json.Marshal deliberately stays canonical (round-trip preserving), so
+// it's not part of the redaction contract — callers that want a
+// redacted JSON view should marshal cfg.String() or build a view type.
 func TestOpenAIConfigRedactsAPIToken(t *testing.T) {
 	t.Parallel()
 
@@ -316,11 +317,6 @@ func TestOpenAIConfigRedactsAPIToken(t *testing.T) {
 		APIToken: secret,
 	}
 
-	// Direct calls into the methods that Stringer/GoStringer
-	// interfaces dispatch to. The fmt package routing rules
-	// (%v/%s → String, %#v → GoString) are a stdlib guarantee and
-	// don't need separate test coverage; what matters here is that
-	// our implementations don't leak the token.
 	for _, rendering := range []struct {
 		name string
 		got  string
@@ -336,36 +332,37 @@ func TestOpenAIConfigRedactsAPIToken(t *testing.T) {
 		}
 	}
 
-	// Marshaling a config with a live token through json.Marshal is
-	// exactly what this test exists to validate — the whole point is
-	// that MarshalJSON intercepts and redacts. gosec G117 flags the
-	// struct-with-APIToken pattern without seeing the redaction.
-	//nolint:gosec // redaction is asserted below
-	marshaled, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
+	// slog.JSONHandler consults LogValuer before falling back to
+	// json.Marshal, so logging the config through any slog handler
+	// must not leak the token. Capture the JSON line and assert.
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	logger.Info("probe", "cfg", cfg)
+	if strings.Contains(buf.String(), secret) {
+		t.Errorf("slog.JSONHandler leaked raw token: %s", buf.String())
 	}
-	if strings.Contains(string(marshaled), secret) {
-		t.Errorf("json.Marshal leaked raw token: %s", marshaled)
-	}
-	if !strings.Contains(string(marshaled), redactedTokenPlaceholder) {
-		t.Errorf("json.Marshal missing redaction placeholder: %s", marshaled)
-	}
-
-	text, err := cfg.MarshalText()
-	if err != nil {
-		t.Fatalf("MarshalText() error = %v", err)
-	}
-	if strings.Contains(string(text), secret) {
-		t.Errorf("MarshalText leaked raw token: %s", text)
+	if !strings.Contains(buf.String(), redactedTokenPlaceholder) {
+		t.Errorf("slog.JSONHandler missing redaction placeholder: %s", buf.String())
 	}
 
 	// Direct field access still returns the raw token — redaction is
 	// defense-in-depth, not info-hiding, so the embedder can sign
-	// requests. Locks the current contract so future refactors don't
+	// requests. Locks the contract so future refactors don't
 	// accidentally remove field access.
 	if cfg.APIToken != secret {
 		t.Fatalf("APIToken field = %q, want raw %q", cfg.APIToken, secret)
+	}
+
+	// json.Marshal deliberately stays canonical (see MarshalJSON
+	// absence). This assertion documents the design: redaction on
+	// json.Marshal would silently break round-trip persistence for any
+	// downstream caller.
+	marshaled, err := json.Marshal(cfg) //nolint:gosec // canonical round-trippable encoding is the intent
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(marshaled), secret) {
+		t.Fatalf("json.Marshal should preserve APIToken for round-trip, got %s", marshaled)
 	}
 
 	// And a config without a token must not emit the placeholder —

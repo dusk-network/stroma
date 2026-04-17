@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,11 +36,19 @@ const (
 
 // OpenAIConfig configures an OpenAI-compatible embedder.
 //
-// APIToken is redacted from every standard text/JSON representation —
-// String, GoString, MarshalJSON, MarshalText all return the config with
-// the token replaced by "[REDACTED]". Direct field access still yields
-// the raw value so the embedder itself can sign requests; redaction is
-// defense-in-depth against accidental fmt/slog/json.Marshal disclosure.
+// APIToken is redacted from every log/display representation — String,
+// GoString, and slog.LogValuer all render the token as "[REDACTED]".
+// Direct field access still yields the raw value so the embedder
+// itself can sign requests; redaction is defense-in-depth against
+// accidental fmt.Printf / slog.Info / log line disclosure.
+//
+// json.Marshal and encoding.TextMarshaler deliberately stay canonical:
+// OpenAIConfig is a public configuration type, so overriding either
+// would silently break any caller persisting or round-tripping the
+// config (credential would vanish on encode, and TextMarshaler also
+// redirects json.Marshal output through its redacted form). Callers
+// that need a redacted view should marshal cfg.String() or build a
+// dedicated view type.
 type OpenAIConfig struct {
 	BaseURL  string
 	Model    string
@@ -67,25 +76,19 @@ func (c OpenAIConfig) GoString() string {
 		c.BaseURL, c.Model, c.Timeout, redactedToken(c.APIToken))
 }
 
-// MarshalJSON emits a JSON document with APIToken redacted. Any caller
-// that pretty-prints the config via json.Marshal — structured loggers,
-// diagnostics dumps, API responses — gets the redacted value. Uses a
-// map rather than an anonymous struct so no intermediate type carries
-// a field named APIToken that a static-analysis pattern matcher could
-// misclassify as a real secret.
-func (c OpenAIConfig) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]any{
-		"base_url":  c.BaseURL,
-		"model":     c.Model,
-		"timeout":   c.Timeout,
-		"api_token": redactedToken(c.APIToken),
-	})
-}
-
-// MarshalText emits a redacted text rendering for encoding.TextMarshaler
-// consumers (some log libraries prefer this path over Stringer).
-func (c OpenAIConfig) MarshalText() ([]byte, error) {
-	return []byte(c.String()), nil
+// LogValue implements slog.LogValuer so slog handlers — including the
+// default JSONHandler — render the config with APIToken redacted.
+// slog consults LogValuer before falling back to json.Marshal, so this
+// covers the structured-logging path without hijacking json.Marshal
+// itself (which stays canonical for callers that round-trip the
+// config through JSON).
+func (c OpenAIConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("base_url", c.BaseURL),
+		slog.String("model", c.Model),
+		slog.Duration("timeout", c.Timeout),
+		slog.String("api_token", redactedToken(c.APIToken)),
+	)
 }
 
 // redactedToken returns the placeholder when a token is set, or "" when
