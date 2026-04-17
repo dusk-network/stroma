@@ -75,7 +75,12 @@ type Section struct {
 	Embedding     []float64
 }
 
-// OpenSnapshot opens a read-only Stroma snapshot.
+// OpenSnapshot opens a read-only Stroma snapshot. The snapshot's
+// schema_version metadata must be either the current schemaVersion or
+// prevSchemaVersion (which the Update path knows how to migrate forward);
+// anything else returns ErrUnsupportedSchemaVersion wrapped with the
+// observed version, so callers can surface a clear upgrade/downgrade
+// message instead of silently misdecoding data against a future schema.
 func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -87,6 +92,17 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	db, err := store.OpenReadOnlyContext(ctx, path)
 	if err != nil {
 		return nil, err
+	}
+	schema, err := readMetadataValue(ctx, db, "schema_version")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
+	}
+	trimmedSchema := strings.TrimSpace(schema)
+	if trimmedSchema != schemaVersion && trimmedSchema != prevSchemaVersion {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: %w: got %q, supported %q or %q",
+			path, ErrUnsupportedSchemaVersion, trimmedSchema, prevSchemaVersion, schemaVersion)
 	}
 	// For binary snapshots, verify the full-precision companion table is
 	// complete at open time. Read paths rely on inner joins against

@@ -106,7 +106,7 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	// enabled rebuilds produce different new-side keys, so v2 chunks
 	// simply miss and get re-embedded.
 	trimmed := strings.TrimSpace(schema)
-	if trimmed != schemaVersion && trimmed != "2" {
+	if trimmed != schemaVersion && trimmed != prevSchemaVersion {
 		return false
 	}
 	storedFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
