@@ -83,11 +83,20 @@ func TestFingerprintSurfacesMalformedRecords(t *testing.T) {
 	}
 }
 
-// TestHashRecordEncodingIsInjective guards the content_hash encoding fix in
-// #39. The prior encoding ("key=value" lines joined by \n) let a metadata
-// value containing \ntitle=X collide with a record whose Title was actually
-// X. Quoted-pair encoding (%q=%q) makes every part self-delimiting, so no
-// attacker-crafted metadata value can mimic another field's serialization.
+// TestHashRecordEncodingIsInjective guards the content_hash encoding fix
+// in #39. Under the old encoding each part was rendered as plain
+// "key=value" and parts were joined by '\n' — so a value containing '\n'
+// could inject text that parsed as a neighboring part after the join, and
+// two distinct records could in principle serialize to the same byte
+// string. The new %q=%q encoding quotes both the field name and the
+// value, which makes strconv.Quote's escaping the sole source of
+// injectivity: no value can forge another field's delimited form.
+//
+// This test constructs two records that differ in field content but
+// share a newline-boundary ambiguity — under the new encoding their
+// hashes must differ. Whether the old encoding happened to collide for
+// this specific pair is secondary; the point is that the new encoding
+// hashes them distinctly by construction.
 func TestHashRecordEncodingIsInjective(t *testing.T) {
 	t.Parallel()
 
@@ -99,13 +108,6 @@ func TestHashRecordEncodingIsInjective(t *testing.T) {
 		BodyFormat: FormatPlaintext,
 		BodyText:   "body",
 	}
-	// In the old encoding, a metadata value that began with a newline and
-	// continued with `title="real-title"` would be serialized as
-	//   metadata.k=\ntitle=real-title
-	// which joins into a part that parses identically to the genuine record
-	// — different field, same serialization. The new %q=%q encoding quotes
-	// the field name and value, so the attacker part cannot forge the
-	// target part.
 	spoofed := Record{
 		Ref:        "alpha",
 		Kind:       "note",
@@ -114,11 +116,11 @@ func TestHashRecordEncodingIsInjective(t *testing.T) {
 		BodyFormat: FormatPlaintext,
 		BodyText:   "body",
 		Metadata: map[string]string{
-			"k": "\ntitle=\"real-title\"",
+			"k": "\ntitle=real-title",
 		},
 	}
 	if HashRecord(genuine) == HashRecord(spoofed) {
-		t.Fatal("HashRecord encoding is not injective: spoofed metadata collides with genuine field")
+		t.Fatal("HashRecord encoding is not injective: spoofed metadata produced the same digest as genuine field")
 	}
 }
 

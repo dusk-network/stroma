@@ -19,6 +19,12 @@ const (
 	testAlphaRef      = "alpha"
 	testNoteKind      = "note"
 	testTargetNoteRef = "target-note"
+
+	// testLegacyV3HashSentinel is the bogus content_hash migration tests
+	// write into every row to simulate an old-algorithm pre-1.0 v3
+	// snapshot. Any row still carrying this value after migration means
+	// the migration skipped it.
+	testLegacyV3HashSentinel = "legacy-v3-hash"
 )
 
 type reverseReranker struct {
@@ -1813,10 +1819,11 @@ func TestUpdateMigratesV2ToCurrentSchemaChain(t *testing.T) {
 	}
 }
 
-// TestSchemaHasContextPrefixMapping locks the direct mapping
-// schemaVersion → true, prevSchemaVersion → false that read paths now
-// rely on in place of runtime PRAGMA probes. If a future schema bump adds
-// another accept-listed version, this test forces the mapping to be
+// TestSchemaHasContextPrefixMapping locks the direct mapping read paths
+// now rely on in place of runtime PRAGMA probes: v3 and v4 both carry
+// context_prefix (the v3→v4 bump re-hashed records but kept the table
+// shape), and legacy v2 predates the column. If a future schema bump
+// adds another accept-listed version, this test forces the mapping to be
 // reconsidered explicitly rather than silently inheriting one side's
 // default.
 func TestSchemaHasContextPrefixMapping(t *testing.T) {
@@ -2139,7 +2146,7 @@ func TestUpdateMigratesV3ToV4RehashesRecords(t *testing.T) {
 		t.Fatalf("OpenReadWriteContext() error = %v", err)
 	}
 	if _, err := rwDB.ExecContext(context.Background(),
-		`UPDATE records SET content_hash = 'legacy-v3-hash'`); err != nil {
+		`UPDATE records SET content_hash = ?`, testLegacyV3HashSentinel); err != nil {
 		t.Fatalf("overwrite content_hash: %v", err)
 	}
 	if _, err := rwDB.ExecContext(context.Background(),
@@ -2189,7 +2196,7 @@ func TestUpdateMigratesV3ToV4RehashesRecords(t *testing.T) {
 	}
 
 	// And the on-disk content_hash for every record must be the new-algo
-	// hash, not the "legacy-v3-hash" sentinel we wrote.
+	// hash, not the testLegacyV3HashSentinel sentinel we wrote.
 	roDB, err := store.OpenReadOnlyContext(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadOnlyContext() error = %v", err)
@@ -2200,12 +2207,100 @@ func TestUpdateMigratesV3ToV4RehashesRecords(t *testing.T) {
 		`SELECT content_hash FROM records WHERE ref = ?`, testAlphaRef).Scan(&storedHash); err != nil {
 		t.Fatalf("read content_hash: %v", err)
 	}
-	if storedHash == "legacy-v3-hash" {
+	if storedHash == testLegacyV3HashSentinel {
 		t.Fatal("content_hash still equal to legacy sentinel; migration did not rewrite rows")
 	}
 	if storedHash != corpus.HashRecord(normalized[0]) {
 		t.Fatalf("stored content_hash = %q, want %q (new-algo HashRecord)",
 			storedHash, corpus.HashRecord(normalized[0]))
+	}
+}
+
+// TestMigrateV3ToV4BatchesAcrossMultiplePasses exercises the multi-batch
+// path: if the per-batch limit is smaller than the record count, the
+// migration advances via `WHERE ref > ?` seeks across several passes.
+// Without proper seek continuity, the second pass could either reprocess
+// the first-batch rows (wasted work, still correct) or skip the last
+// seen ref (leaves stale old-algo content_hashes on disk). This test
+// shrinks the batch to 1 so every row forces a fresh pass.
+func TestMigrateV3ToV4BatchesAcrossMultiplePasses(t *testing.T) {
+	// Not parallel: mutates the package-level migrateV3ToV4BatchSize.
+
+	original := migrateV3ToV4BatchSize
+	migrateV3ToV4BatchSize = 1
+	t.Cleanup(func() { migrateV3ToV4BatchSize = original })
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	seed := []corpus.Record{
+		{Ref: "alpha", Kind: "note", Title: "Alpha", SourceRef: "a", BodyFormat: corpus.FormatPlaintext, BodyText: "a"},
+		{Ref: "bravo", Kind: "note", Title: "Bravo", SourceRef: "b", BodyFormat: corpus.FormatPlaintext, BodyText: "b"},
+		{Ref: "charlie", Kind: "note", Title: "Charlie", SourceRef: "c", BodyFormat: corpus.FormatPlaintext, BodyText: "c"},
+	}
+	if _, err := Rebuild(context.Background(), seed, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	if _, err := rwDB.ExecContext(context.Background(),
+		`UPDATE records SET content_hash = ?`, testLegacyV3HashSentinel); err != nil {
+		t.Fatalf("overwrite content_hash: %v", err)
+	}
+	if _, err := rwDB.ExecContext(context.Background(),
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, prevSchemaVersion); err != nil {
+		t.Fatalf("rewind schema_version: %v", err)
+	}
+	if err := rwDB.Close(); err != nil {
+		t.Fatalf("close rw db: %v", err)
+	}
+
+	if _, err := Update(context.Background(), nil, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Update(v3→v4 with batchSize=1) error = %v", err)
+	}
+
+	// Every row must now carry a new-algo hash — none should still
+	// have the sentinel a missed-seek batch would have left behind.
+	roDB, err := store.OpenReadOnlyContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnlyContext() error = %v", err)
+	}
+	defer func() { _ = roDB.Close() }()
+	rows, err := roDB.QueryContext(context.Background(),
+		`SELECT ref, content_hash FROM records ORDER BY ref ASC`)
+	if err != nil {
+		t.Fatalf("query content_hash: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	seenByRef := make(map[string]string, len(seed))
+	for rows.Next() {
+		var ref, hash string
+		if err := rows.Scan(&ref, &hash); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if hash == testLegacyV3HashSentinel {
+			t.Fatalf("record %q still has legacy sentinel; multi-batch migration missed this row", ref)
+		}
+		seenByRef[ref] = hash
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err(): %v", err)
+	}
+	if len(seenByRef) != len(seed) {
+		t.Fatalf("migrated %d records, want %d", len(seenByRef), len(seed))
 	}
 }
 
@@ -2243,7 +2338,7 @@ func TestMigrateV3ToV4IsCrashSafe(t *testing.T) {
 		t.Fatalf("OpenReadWriteContext() error = %v", err)
 	}
 	if _, err := rwDB.ExecContext(context.Background(),
-		`UPDATE records SET content_hash = 'legacy-v3-hash'`); err != nil {
+		`UPDATE records SET content_hash = ?`, testLegacyV3HashSentinel); err != nil {
 		t.Fatalf("overwrite content_hash: %v", err)
 	}
 	if _, err := rwDB.ExecContext(context.Background(),
@@ -2290,7 +2385,7 @@ func TestMigrateV3ToV4IsCrashSafe(t *testing.T) {
 		`SELECT content_hash FROM records WHERE ref = ?`, testAlphaRef).Scan(&storedHash); err != nil {
 		t.Fatalf("read content_hash: %v", err)
 	}
-	if storedHash != "legacy-v3-hash" {
+	if storedHash != testLegacyV3HashSentinel {
 		t.Fatalf("content_hash = %q after rollback, want legacy sentinel preserved (rehash leaked past rollback)", storedHash)
 	}
 }
