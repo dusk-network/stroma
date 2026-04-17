@@ -185,23 +185,7 @@ ORDER BY ref ASC`)
 
 	result := make([]corpus.Record, 0)
 	for rows.Next() {
-		var (
-			record      corpus.Record
-			metadataRaw string
-		)
-		if err := rows.Scan(
-			&record.Ref,
-			&record.Kind,
-			&record.Title,
-			&record.SourceRef,
-			&record.BodyFormat,
-			&record.BodyText,
-			&record.ContentHash,
-			&metadataRaw,
-		); err != nil {
-			return nil, fmt.Errorf("scan record: %w", err)
-		}
-		record.Metadata, err = unmarshalMetadata(record.Ref, metadataRaw)
+		record, err := scanRecord(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -211,6 +195,34 @@ ORDER BY ref ASC`)
 		return nil, fmt.Errorf("iterate records: %w", err)
 	}
 	return result, nil
+}
+
+// scanRecord reads one row from a query that selects the full record column
+// set (ref, kind, title, source_ref, body_format, body_text, content_hash,
+// metadata_json) and returns the decoded record with metadata parsed.
+func scanRecord(rows *sql.Rows) (corpus.Record, error) {
+	var (
+		record      corpus.Record
+		metadataRaw string
+	)
+	if err := rows.Scan(
+		&record.Ref,
+		&record.Kind,
+		&record.Title,
+		&record.SourceRef,
+		&record.BodyFormat,
+		&record.BodyText,
+		&record.ContentHash,
+		&metadataRaw,
+	); err != nil {
+		return corpus.Record{}, fmt.Errorf("scan record: %w", err)
+	}
+	metadata, err := unmarshalMetadata(record.Ref, metadataRaw)
+	if err != nil {
+		return corpus.Record{}, err
+	}
+	record.Metadata = metadata
+	return record, nil
 }
 
 // Sections returns sections from the opened snapshot.
