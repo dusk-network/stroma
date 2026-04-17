@@ -1064,21 +1064,13 @@ func sectionsForRecord(record corpus.Record, opts chunk.Options) ([]chunk.Sectio
 		}
 		return sections, nil
 	default:
-		// MarkdownWithOptions always enforces opts.MaxSections. When
-		// MaxTokens is zero we skip the token-budget pass by calling
-		// the plain Markdown and then re-applying the cap — a cheap
-		// length check rather than an extra split loop.
-		if opts.MaxTokens > 0 {
-			sections, err := chunk.MarkdownWithOptions(record.Title, record.BodyText, opts)
-			if err != nil {
-				return nil, fmt.Errorf("record %q: %w", record.Ref, err)
-			}
-			return sections, nil
-		}
-		sections := chunk.Markdown(record.Title, record.BodyText)
-		if opts.MaxSections > 0 && len(sections) > opts.MaxSections {
-			return nil, fmt.Errorf("record %q: %w: heading-aware pass produced %d sections, limit is %d",
-				record.Ref, chunk.ErrTooManySections, len(sections), opts.MaxSections)
+		// Always route through MarkdownWithOptions so the parser-side
+		// MaxSections guard fires during section emission, not after
+		// the full list is materialized. MarkdownWithOptions with
+		// MaxTokens == 0 skips the token-budget pass automatically.
+		sections, err := chunk.MarkdownWithOptions(record.Title, record.BodyText, opts)
+		if err != nil {
+			return nil, fmt.Errorf("record %q: %w", record.Ref, err)
 		}
 		return sections, nil
 	}
