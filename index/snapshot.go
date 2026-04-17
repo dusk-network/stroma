@@ -130,31 +130,36 @@ func (s *Snapshot) Stats(ctx context.Context) (*Stats, error) {
 		return nil, fmt.Errorf("iterate kind counts: %w", err)
 	}
 
-	stats.SchemaVersion, err = readMetadataValue(ctx, s.db, "schema_version")
-	if err != nil {
-		return nil, err
-	}
-	dimensionValue, err := readMetadataValue(ctx, s.db, "embedder_dimension")
-	if err != nil {
-		return nil, err
-	}
-	stats.EmbedderDimension, err = strconv.Atoi(dimensionValue)
-	if err != nil {
-		return nil, fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
-	}
-	stats.EmbedderFingerprint, err = readMetadataValue(ctx, s.db, "embedder_fingerprint")
-	if err != nil {
-		return nil, err
-	}
-	stats.ContentFingerprint, err = readMetadataValue(ctx, s.db, "content_fingerprint")
-	if err != nil {
-		return nil, err
-	}
-	stats.CreatedAt, err = readMetadataValue(ctx, s.db, "created_at")
-	if err != nil {
+	if err := loadStatsMetadata(ctx, s.db, stats); err != nil {
 		return nil, err
 	}
 	return stats, nil
+}
+
+func loadStatsMetadata(ctx context.Context, db queryContextRunner, stats *Stats) error {
+	var err error
+	stats.SchemaVersion, err = readMetadataValue(ctx, db, "schema_version")
+	if err != nil {
+		return err
+	}
+	dimensionValue, err := readMetadataValue(ctx, db, "embedder_dimension")
+	if err != nil {
+		return err
+	}
+	stats.EmbedderDimension, err = strconv.Atoi(dimensionValue)
+	if err != nil {
+		return fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
+	}
+	stats.EmbedderFingerprint, err = readMetadataValue(ctx, db, "embedder_fingerprint")
+	if err != nil {
+		return err
+	}
+	stats.ContentFingerprint, err = readMetadataValue(ctx, db, "content_fingerprint")
+	if err != nil {
+		return err
+	}
+	stats.CreatedAt, err = readMetadataValue(ctx, db, "created_at")
+	return err
 }
 
 // Records returns records from the opened snapshot.
