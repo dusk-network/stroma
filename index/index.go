@@ -24,9 +24,20 @@ const schemaVersion = "2"
 
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
-	Path          string
+	Path string
+
+	// ReuseFromPath points at an existing Stroma snapshot whose embeddings
+	// should be reused at the section level: a new section reuses its
+	// stored embedding whenever its title, heading, and body match a
+	// section already present in the prior snapshot. Records that are
+	// fully unchanged are the maximal case, but sections carried over
+	// from an edited record still reuse their embeddings. The reuse
+	// snapshot is loaded fully into memory (roughly embedding-size bytes
+	// per stored chunk); at very large corpora this can be a meaningful
+	// RAM cost. Leave empty to disable reuse.
 	ReuseFromPath string
-	Embedder      embed.Embedder
+
+	Embedder embed.Embedder
 
 	// MaxChunkTokens sets the approximate maximum number of tokens (words)
 	// per chunk. Sections that exceed this limit are split into smaller
@@ -660,9 +671,8 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 	}
 
 	texts := make([]string, 0, len(sections))
-	for _, section := range sections {
-		key := reuseChunkKey(record.Title, section.Heading, section.Body)
-		if _, ok := plan.reusedEmbeddings[key]; ok {
+	for i, section := range sections {
+		if _, ok := plan.reusedEmbeddings[plan.keys[i]]; ok {
 			continue
 		}
 		texts = append(texts, textForEmbedding(record.Title, section))
@@ -725,8 +735,7 @@ func insertChunks(
 		if _, err := ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, section.Body); err != nil {
 			return fmt.Errorf("insert fts for %s chunk %d: %w", record.Ref, index, err)
 		}
-		key := reuseChunkKey(record.Title, section.Heading, section.Body)
-		if blob, ok := plan.reusedEmbeddings[key]; ok {
+		if blob, ok := plan.reusedEmbeddings[plan.keys[index]]; ok {
 			if _, err := vectorStmt.ExecContext(ctx, chunkID, blob); err != nil {
 				return fmt.Errorf("insert reused embedding for %s chunk %d: %w", record.Ref, index, err)
 			}
@@ -856,7 +865,6 @@ func readMetadataValue(ctx context.Context, query queryContextRunner, key string
 	return value, nil
 }
 
-//nolint:unparam // key will vary as more metadata fields are added
 func readMetadataValueOptional(ctx context.Context, query queryContextRunner, key, defaultValue string) (string, error) {
 	value, err := readMetadataValue(ctx, query, key)
 	switch {
@@ -1086,23 +1094,7 @@ ORDER BY ref ASC`)
 
 	records := make([]corpus.Record, 0)
 	for rows.Next() {
-		var (
-			record      corpus.Record
-			metadataRaw string
-		)
-		if err := rows.Scan(
-			&record.Ref,
-			&record.Kind,
-			&record.Title,
-			&record.SourceRef,
-			&record.BodyFormat,
-			&record.BodyText,
-			&record.ContentHash,
-			&metadataRaw,
-		); err != nil {
-			return nil, fmt.Errorf("scan current record: %w", err)
-		}
-		record.Metadata, err = unmarshalMetadata(record.Ref, metadataRaw)
+		record, err := scanRecord(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1133,13 +1125,24 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil 
 	return nil
 }
 
+const (
+	// candidateOverfetchMultiplier scales the caller's limit up before
+	// merging hybrid search candidates, so rank-fusion has room to reorder.
+	candidateOverfetchMultiplier = 5
+	// minCandidatePool is the floor for the candidate shortlist, keeping
+	// tiny limits (e.g., 1-2 hits) from starving rank fusion.
+	minCandidatePool = 25
+	// maxCandidatePool caps the shortlist to bound per-query cost.
+	maxCandidatePool = 250
+)
+
 func candidateLimit(limit int) int {
-	overfetch := limit * 5
+	overfetch := limit * candidateOverfetchMultiplier
 	switch {
-	case overfetch < 25:
-		return 25
-	case overfetch > 250:
-		return 250
+	case overfetch < minCandidatePool:
+		return minCandidatePool
+	case overfetch > maxCandidatePool:
+		return maxCandidatePool
 	default:
 		return overfetch
 	}

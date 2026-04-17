@@ -26,7 +26,10 @@ type storedRecord struct {
 }
 
 type recordReusePlan struct {
-	sections           []chunk.Section
+	sections []chunk.Section
+	// keys[i] is reuseChunkKey for sections[i]. Computed once in
+	// planRecordReuse so the write path does not re-hash each section.
+	keys               []string
 	reusedEmbeddings   map[string][]byte
 	reusedChunkCount   int
 	embeddedChunkCount int
@@ -155,8 +158,13 @@ ORDER BY c.record_ref, c.chunk_index ASC, c.id ASC`)
 
 func planRecordReuse(record corpus.Record, stored storedRecord, chunkOpts chunk.Options) recordReusePlan {
 	sections := sectionsForRecord(record, chunkOpts)
+	keys := make([]string, len(sections))
+	for i, section := range sections {
+		keys[i] = reuseChunkKey(record.Title, section.Heading, section.Body)
+	}
 	plan := recordReusePlan{
 		sections:         sections,
+		keys:             keys,
 		reusedEmbeddings: make(map[string][]byte),
 	}
 	if stored.contentHash == "" {
@@ -164,8 +172,7 @@ func planRecordReuse(record corpus.Record, stored storedRecord, chunkOpts chunk.
 		return plan
 	}
 
-	for _, section := range sections {
-		key := reuseChunkKey(record.Title, section.Heading, section.Body)
+	for _, key := range keys {
 		if embedding, ok := stored.chunks[key]; ok {
 			plan.reusedEmbeddings[key] = embedding
 			plan.reusedChunkCount++
