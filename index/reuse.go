@@ -33,7 +33,7 @@ type recordReusePlan struct {
 	recordUnchanged    bool
 }
 
-func loadReuseStateContext(ctx context.Context, path, embedderFingerprint string, embedderDimension int, quantization string) *reuseState {
+func loadReuseState(ctx context.Context, path, embedderFingerprint string, embedderDimension int, quantization string) *reuseState {
 	empty := &reuseState{records: map[string]storedRecord{}}
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -60,7 +60,7 @@ func loadReuseStateContext(ctx context.Context, path, embedderFingerprint string
 		return empty
 	}
 
-	state, err := loadStoredReuseRecordsContext(ctx, db)
+	state, err := loadStoredReuseRecords(ctx, db)
 	if err != nil {
 		return empty
 	}
@@ -92,7 +92,7 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	return true
 }
 
-func loadStoredReuseRecordsContext(ctx context.Context, db *sql.DB) (*reuseState, error) {
+func loadStoredReuseRecords(ctx context.Context, db *sql.DB) (*reuseState, error) {
 	rows, err := db.QueryContext(ctx, `SELECT ref, title, content_hash FROM records`)
 	if err != nil {
 		return nil, fmt.Errorf("query stored records: %w", err)

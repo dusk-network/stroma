@@ -160,7 +160,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 		_ = os.Remove(tmpPath)
 	}()
 
-	if err := createSchemaContext(ctx, db, inputs.dimension, inputs.quantization); err != nil {
+	if err := createSchema(ctx, db, inputs.dimension, inputs.quantization); err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
@@ -255,7 +255,7 @@ func prepareBuildInputs(ctx context.Context, records []corpus.Record, options Bu
 	if err != nil {
 		return rebuildInputs{}, err
 	}
-	reuseState := loadReuseStateContext(ctx, options.ReuseFromPath, options.Embedder.Fingerprint(), dimension, quantization)
+	reuseState := loadReuseState(ctx, options.ReuseFromPath, options.Embedder.Fingerprint(), dimension, quantization)
 
 	return rebuildInputs{
 		indexPath:    indexPath,
@@ -267,13 +267,13 @@ func prepareBuildInputs(ctx context.Context, records []corpus.Record, options Bu
 }
 
 func finalizeRebuild(ctx context.Context, db *sql.DB, tx *sql.Tx, metadata map[string]string, tmpPath, indexPath string) error {
-	if err := upsertMetadataContext(ctx, tx, metadata); err != nil {
+	if err := upsertMetadata(ctx, tx, metadata); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit rebuild transaction: %w", err)
 	}
-	if err := runIntegrityChecksContext(ctx, db); err != nil {
+	if err := runIntegrityChecks(ctx, db); err != nil {
 		return err
 	}
 	if err := db.Close(); err != nil {
@@ -292,7 +292,7 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 	if indexPath == "" {
 		return nil, fmt.Errorf("update path is required")
 	}
-	if err := ensureExistingIndexContext(indexPath); err != nil {
+	if err := ensureExistingIndex(indexPath); err != nil {
 		return nil, err
 	}
 
@@ -312,7 +312,7 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 		return nil, err
 	}
 	if len(normalizedAdded) > 0 {
-		cfg.reuse = loadReuseStateContext(
+		cfg.reuse = loadReuseState(
 			ctx,
 			indexPath,
 			cfg.embedderFingerprint,
@@ -348,7 +348,7 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 		defer session.Close()
 
 		for _, record := range normalizedAdded {
-			if _, err := deleteRecordContext(ctx, tx, record.Ref); err != nil {
+			if _, err := deleteRecord(ctx, tx, record.Ref); err != nil {
 				return nil, err
 			}
 			stats, err := session.processRecord(ctx, record)
@@ -383,7 +383,7 @@ func normalizeUpdateInputs(added []corpus.Record, removed []string) ([]corpus.Re
 
 func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result *UpdateResult) error {
 	for _, ref := range refs {
-		deleted, err := deleteRecordContext(ctx, tx, ref)
+		deleted, err := deleteRecord(ctx, tx, ref)
 		if err != nil {
 			return err
 		}
@@ -395,13 +395,13 @@ func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result
 }
 
 func finalizeUpdate(ctx context.Context, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
-	recordsNow, err := loadCurrentRecordsContext(ctx, tx)
+	recordsNow, err := loadCurrentRecords(ctx, tx)
 	if err != nil {
 		return err
 	}
 	result.RecordCount = len(recordsNow)
 	result.ContentFingerprint = corpus.Fingerprint(recordsNow)
-	chunkCount, err := countChunksContext(ctx, tx)
+	chunkCount, err := countChunks(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -422,10 +422,10 @@ func finalizeUpdate(ctx context.Context, tx *sql.Tx, cfg sessionConfig, result *
 		"created_at":           createdAt,
 		"updated_at":           now,
 	}
-	if err := upsertMetadataContext(ctx, tx, metadata); err != nil {
+	if err := upsertMetadata(ctx, tx, metadata); err != nil {
 		return err
 	}
-	if err := runIntegrityChecksContext(ctx, tx); err != nil {
+	if err := runIntegrityChecks(ctx, tx); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -475,7 +475,7 @@ func normalizeRecords(records []corpus.Record) ([]corpus.Record, error) {
 	return normalized, nil
 }
 
-func createSchemaContext(ctx context.Context, db *sql.DB, dimension int, quantization string) error {
+func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization string) error {
 	vecType := fmt.Sprintf("float[%d]", dimension)
 	if quantization == store.QuantizationInt8 {
 		vecType = fmt.Sprintf("int8[%d]", dimension)
@@ -521,7 +521,7 @@ func createSchemaContext(ctx context.Context, db *sql.DB, dimension int, quantiz
 	return nil
 }
 
-func insertRecordContext(ctx context.Context, stmt *sql.Stmt, record corpus.Record) error {
+func insertRecord(ctx context.Context, stmt *sql.Stmt, record corpus.Record) error {
 	metadataJSON, err := json.Marshal(record.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal record %s metadata: %w", record.Ref, err)
@@ -644,7 +644,7 @@ func (s *indexSession) Close() {
 func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) (recordStats, error) {
 	var stats recordStats
 
-	if err := insertRecordContext(ctx, s.recordStmt, record); err != nil {
+	if err := insertRecord(ctx, s.recordStmt, record); err != nil {
 		return stats, err
 	}
 
@@ -684,7 +684,7 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		}
 	}
 
-	if err := insertChunksContext(
+	if err := insertChunks(
 		ctx,
 		record,
 		plan,
@@ -702,7 +702,7 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 	return stats, nil
 }
 
-func insertChunksContext(
+func insertChunks(
 	ctx context.Context,
 	record corpus.Record,
 	plan recordReusePlan,
@@ -802,7 +802,7 @@ func documentTextForEmbedding(record corpus.Record) string {
 	return strings.Join(parts, "\n\n")
 }
 
-func runIntegrityChecksContext(ctx context.Context, query queryContextRunner) error {
+func runIntegrityChecks(ctx context.Context, query queryContextRunner) error {
 	row := query.QueryRowContext(ctx, `PRAGMA integrity_check`)
 	var result string
 	if err := row.Scan(&result); err != nil {
@@ -932,7 +932,7 @@ LIMIT ?`)
 	return builder.String(), args
 }
 
-func ensureExistingIndexContext(path string) error {
+func ensureExistingIndex(path string) error {
 	info, err := os.Stat(path)
 	switch {
 	case os.IsNotExist(err):
@@ -1056,7 +1056,7 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 	return cfg, nil
 }
 
-func deleteRecordContext(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
+func deleteRecord(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE record_ref = ?)`, ref); err != nil {
 		return false, fmt.Errorf("delete vectors for %s: %w", ref, err)
 	}
@@ -1074,7 +1074,7 @@ func deleteRecordContext(ctx context.Context, tx *sql.Tx, ref string) (bool, err
 	return rowsAffected > 0, nil
 }
 
-func loadCurrentRecordsContext(ctx context.Context, query queryContextRunner) ([]corpus.Record, error) {
+func loadCurrentRecords(ctx context.Context, query queryContextRunner) ([]corpus.Record, error) {
 	rows, err := query.QueryContext(ctx, `
 SELECT ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_json
 FROM records
@@ -1114,7 +1114,7 @@ ORDER BY ref ASC`)
 	return records, nil
 }
 
-func countChunksContext(ctx context.Context, query queryContextRunner) (int, error) {
+func countChunks(ctx context.Context, query queryContextRunner) (int, error) {
 	var chunkCount int
 	if err := query.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&chunkCount); err != nil {
 		return 0, fmt.Errorf("count chunks: %w", err)
@@ -1122,7 +1122,7 @@ func countChunksContext(ctx context.Context, query queryContextRunner) (int, err
 	return chunkCount, nil
 }
 
-func upsertMetadataContext(ctx context.Context, tx *sql.Tx, metadata map[string]string) error {
+func upsertMetadata(ctx context.Context, tx *sql.Tx, metadata map[string]string) error {
 	for key, value := range metadata {
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO metadata (key, value) VALUES (?, ?)
