@@ -50,15 +50,16 @@ type SectionQuery struct {
 
 // Section is one stored section from a Stroma snapshot.
 type Section struct {
-	ChunkID   int64
-	Ref       string
-	Kind      string
-	Title     string
-	SourceRef string
-	Heading   string
-	Content   string
-	Metadata  map[string]string
-	Embedding []float64
+	ChunkID       int64
+	Ref           string
+	Kind          string
+	Title         string
+	SourceRef     string
+	Heading       string
+	Content       string
+	ContextPrefix string
+	Metadata      map[string]string
+	Embedding     []float64
 }
 
 // OpenSnapshot opens a read-only Stroma snapshot.
@@ -281,6 +282,7 @@ SELECT
   r.source_ref,
   c.heading,
   c.content,
+  c.context_prefix,
   r.metadata_json`)
 	if query.IncludeEmbeddings {
 		builder.WriteString(", v.embedding")
@@ -329,6 +331,7 @@ func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string)
 		&section.SourceRef,
 		&section.Heading,
 		&section.Content,
+		&section.ContextPrefix,
 		&metadataRaw,
 	}
 	if includeEmbeddings {

@@ -31,6 +31,9 @@ type storedRecord struct {
 
 type recordReusePlan struct {
 	sections []chunk.Section
+	// prefixes[i] is the context prefix aligned with sections[i]. nil or
+	// empty string means no contextualization for that section.
+	prefixes []string
 	// keys[i] is reuseChunkKey for sections[i]. Computed once in
 	// planRecordReuse so the write path does not re-hash each section.
 	keys               []string
@@ -105,14 +108,22 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	return true
 }
 
-func planRecordReuse(record corpus.Record, stored storedRecord, chunkOpts chunk.Options) recordReusePlan {
-	sections := sectionsForRecord(record, chunkOpts)
+// planRecordReuse builds a per-record plan given the resolved sections and
+// aligned context prefixes. prefixes must be nil or the same length as
+// sections; a nil slice means "no contextualizer configured" and is
+// equivalent to an empty prefix per section.
+func planRecordReuse(record corpus.Record, stored storedRecord, sections []chunk.Section, prefixes []string) recordReusePlan {
 	keys := make([]string, len(sections))
 	for i, section := range sections {
-		keys[i] = reuseChunkKey(record.Title, section.Heading, section.Body)
+		prefix := ""
+		if i < len(prefixes) {
+			prefix = prefixes[i]
+		}
+		keys[i] = reuseChunkKey(record.Title, section.Heading, section.Body, prefix)
 	}
 	plan := recordReusePlan{
 		sections:         sections,
+		prefixes:         prefixes,
 		keys:             keys,
 		reusedEmbeddings: make(map[string][]byte),
 	}
@@ -179,7 +190,7 @@ func (s *reuseState) disable() {
 
 func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title string) (map[string][]byte, error) {
 	rows, err := db.QueryContext(ctx, `
-SELECT c.heading, c.content, v.embedding
+SELECT c.heading, c.content, c.context_prefix, v.embedding
 FROM chunks c
 JOIN chunks_vec v ON v.chunk_id = c.id
 WHERE c.record_ref = ?
@@ -194,12 +205,13 @@ ORDER BY c.chunk_index ASC, c.id ASC`, ref)
 		var (
 			heading   string
 			content   string
+			prefix    string
 			embedding []byte
 		)
-		if err := rows.Scan(&heading, &content, &embedding); err != nil {
+		if err := rows.Scan(&heading, &content, &prefix, &embedding); err != nil {
 			return nil, fmt.Errorf("scan stored chunk for %s: %w", ref, err)
 		}
-		out[reuseChunkKey(title, heading, content)] = append([]byte(nil), embedding...)
+		out[reuseChunkKey(title, heading, content, prefix)] = append([]byte(nil), embedding...)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate stored chunks for %s: %w", ref, err)
@@ -207,12 +219,14 @@ ORDER BY c.chunk_index ASC, c.id ASC`, ref)
 	return out, nil
 }
 
-func reuseChunkKey(title, heading, body string) string {
+func reuseChunkKey(title, heading, body, prefix string) string {
 	hasher := sha256.New()
 	_, _ = hasher.Write([]byte(title))
 	_, _ = hasher.Write([]byte{0})
 	_, _ = hasher.Write([]byte(heading))
 	_, _ = hasher.Write([]byte{0})
 	_, _ = hasher.Write([]byte(body))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(prefix))
 	return hex.EncodeToString(hasher.Sum(nil))
 }
