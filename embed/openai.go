@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -105,6 +106,24 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		ctx = context.Background()
 	}
 
+	req, inputCount, err := e.buildEmbedRequest(ctx, purpose, texts)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("stroma/embed: call openai endpoint %s: %w", req.URL.String(), err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("stroma/embed: openai endpoint %s returned status %s", req.URL.String(), resp.Status)
+	}
+
+	return e.parseEmbedResponse(resp.Body, inputCount)
+}
+
+func (e *OpenAI) buildEmbedRequest(ctx context.Context, purpose string, texts []string) (*http.Request, int, error) {
 	input := make([]string, 0, len(texts))
 	for _, text := range texts {
 		input = append(input, prepareOpenAIEmbeddingInput(e.strategy, purpose, text))
@@ -115,45 +134,39 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		"input": input,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("stroma/embed: encode openai request: %w", err)
+		return nil, 0, fmt.Errorf("stroma/embed: encode openai request: %w", err)
 	}
 
 	endpoint := e.config.BaseURL + "/embeddings"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
-		return nil, fmt.Errorf("stroma/embed: build openai request: %w", err)
+		return nil, 0, fmt.Errorf("stroma/embed: build openai request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if e.config.APIToken != "" {
 		req.Header.Set("Authorization", "Bearer "+e.config.APIToken)
 	}
+	return req, len(input), nil
+}
 
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("stroma/embed: call openai endpoint %s: %w", endpoint, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("stroma/embed: openai endpoint %s returned status %s", endpoint, resp.Status)
-	}
-
+func (e *OpenAI) parseEmbedResponse(body io.Reader, inputCount int) ([][]float64, error) {
 	var payload struct {
 		Data []struct {
 			Embedding []float64 `json:"embedding"`
 			Index     int       `json:"index"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(body).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("stroma/embed: decode openai response: %w", err)
 	}
-	if len(payload.Data) != len(input) {
-		return nil, fmt.Errorf("stroma/embed: openai returned %d embedding(s) for %d input(s)", len(payload.Data), len(input))
+	if len(payload.Data) != inputCount {
+		return nil, fmt.Errorf("stroma/embed: openai returned %d embedding(s) for %d input(s)", len(payload.Data), inputCount)
 	}
 
-	vectors := make([][]float64, len(input))
+	vectors := make([][]float64, inputCount)
 	for i, item := range payload.Data {
 		idx := item.Index
-		if idx < 0 || idx >= len(input) {
+		if idx < 0 || idx >= inputCount {
 			idx = i
 		}
 		if len(item.Embedding) == 0 {
