@@ -435,6 +435,60 @@ func TestOpenAIMaxBatchSizeDefaultsToConservativeValue(t *testing.T) {
 	}
 }
 
+// TestOpenAIMultiBatchBoundsTotalTimeout verifies that a multi-batch
+// EmbedDocuments call respects the configured Timeout as a total
+// budget, not per-request. Before the fix, http.Client.Timeout
+// applied per HTTP request, so a 10-batch call could consume up to
+// 10 × Timeout before tripping — a behaviour regression vs the
+// pre-batching single-request contract where Timeout bounded the
+// whole call. This test sends 4 batches against a slow server; if
+// the total-timeout guard weren't in place, the operation would
+// succeed; with the guard, it must fail before all batches complete.
+func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
+	t.Parallel()
+
+	const perRequestDelay = 200 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		time.Sleep(perRequestDelay)
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer server.Close()
+
+	// 4 batches × 200ms per batch = 800ms of server work if all ran;
+	// the 300ms Timeout bounds the whole call, so ~2 batches can land
+	// before the deadline fires.
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:      server.URL + "/v1",
+		Model:        "mami",
+		Timeout:      300 * time.Millisecond,
+		MaxBatchSize: 2,
+	})
+	start := time.Now()
+	_, err := e.EmbedDocuments(context.Background(), []string{"a", "b", "c", "d", "e", "f", "g", "h"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("EmbedDocuments() succeeded on slow upstream, want deadline-exceeded error")
+	}
+	// Allow some slack for scheduling jitter; what we really care
+	// about is that we did not blow past the configured budget by
+	// a factor of (batch count).
+	if elapsed > 600*time.Millisecond {
+		t.Fatalf("EmbedDocuments() took %s, want bounded by total Timeout budget (~300ms + slack)", elapsed)
+	}
+}
+
 // TestOpenAIMaxBatchSizeExactBoundary covers the edge case where the
 // input count equals MaxBatchSize — a single request, not two (one
 // with the batch and one empty).

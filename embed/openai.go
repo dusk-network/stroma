@@ -210,10 +210,26 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		return e.embedBatch(ctx, purpose, texts)
 	}
 
+	// http.Client.Timeout applies per request, so a multi-batch call
+	// would otherwise be able to consume up to N*Timeout before the
+	// caller's budget trips — a behavior regression vs the pre-batching
+	// single-request call, where Timeout was the total budget. Derive
+	// an overall deadline here; context.WithDeadline respects any
+	// tighter caller-supplied deadline, so we never extend the window
+	// a caller already wanted to close earlier.
+	if e.config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(e.config.Timeout))
+		defer cancel()
+	}
+
 	// Chunk into sub-requests of at most batchSize and concatenate the
-	// results in order. Any sub-request failure fails the whole call;
-	// callers retry at the EmbedDocuments/EmbedQueries boundary so the
-	// full ordered vector set is always computed as a unit.
+	// results in input order. Any sub-request failure fails the whole
+	// call; callers retry at the EmbedDocuments/EmbedQueries boundary.
+	// Note: earlier-batch vectors that already succeeded upstream are
+	// discarded on retry — embedders are idempotent so this is correct
+	// but wasteful. Richer per-batch progress/retry handling is out of
+	// scope for #41 part 1.
 	result := make([][]float64, 0, len(texts))
 	for start := 0; start < len(texts); start += batchSize {
 		end := start + batchSize
