@@ -447,7 +447,7 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 		}
 	}
 
-	if err := finalizeUpdate(ctx, tx, cfg, result); err != nil {
+	if err := finalizeUpdate(ctx, db, tx, cfg, result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -478,7 +478,7 @@ func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result
 	return nil
 }
 
-func finalizeUpdate(ctx context.Context, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
+func finalizeUpdate(ctx context.Context, db *sql.DB, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
 	recordsNow, err := loadCurrentRecords(ctx, tx)
 	if err != nil {
 		return err
@@ -509,11 +509,18 @@ func finalizeUpdate(ctx context.Context, tx *sql.Tx, cfg sessionConfig, result *
 	if err := upsertMetadata(ctx, tx, metadata); err != nil {
 		return err
 	}
-	if err := runIntegrityChecks(ctx, tx); err != nil {
-		return err
-	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit update transaction: %w", err)
+	}
+	// PRAGMA integrity_check inside an uncommitted write transaction sees
+	// staged dirty pages instead of the durable state, so commit-time
+	// failure modes (WAL flush errors, partial writes, etc.) slip through.
+	// Run the check on the db handle after Commit returns — same order as
+	// finalizeRebuild — so the result reflects what actually landed on
+	// disk. This mirrors finalizeRebuild which validates post-commit
+	// before the staging file is renamed into place.
+	if err := runIntegrityChecks(ctx, db); err != nil {
+		return err
 	}
 	return nil
 }
