@@ -491,12 +491,16 @@ func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result
 }
 
 func finalizeUpdate(ctx context.Context, db *sql.DB, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
-	recordsNow, err := loadCurrentRecords(ctx, tx)
+	// Read only the persisted digest inputs (ref, content_hash) that
+	// corpus.FingerprintFromPairs consumes in this path. Loading full rows
+	// here scales as O(N * row_size) per Update and dominates latency on
+	// large corpora (see #37).
+	pairs, err := loadCurrentRefHashes(ctx, tx)
 	if err != nil {
 		return err
 	}
-	result.RecordCount = len(recordsNow)
-	result.ContentFingerprint = corpus.Fingerprint(recordsNow)
+	result.RecordCount = len(pairs)
+	result.ContentFingerprint = corpus.FingerprintFromPairs(pairs)
 	chunkCount, err := countChunks(ctx, tx)
 	if err != nil {
 		return err
@@ -1728,28 +1732,43 @@ func deleteRecord(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
 	return rowsAffected > 0, nil
 }
 
-func loadCurrentRecords(ctx context.Context, query queryContextRunner) ([]corpus.Record, error) {
+// loadCurrentRefHashes reads only the columns corpus.FingerprintFromPairs
+// consumes. It intentionally avoids body_text / metadata_json so finalizeUpdate
+// pays O(N * small) per update rather than O(N * full_row) (see #37).
+func loadCurrentRefHashes(ctx context.Context, query queryContextRunner) ([]corpus.RefHash, error) {
 	rows, err := query.QueryContext(ctx, `
-SELECT ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_json
+SELECT ref, content_hash
 FROM records
 ORDER BY ref ASC`)
 	if err != nil {
-		return nil, fmt.Errorf("query current records: %w", err)
+		return nil, fmt.Errorf("query current ref/content_hash pairs: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	records := make([]corpus.Record, 0)
+	pairs := make([]corpus.RefHash, 0)
 	for rows.Next() {
-		record, err := scanRecord(rows)
-		if err != nil {
-			return nil, err
+		var pair corpus.RefHash
+		if err := rows.Scan(&pair.Ref, &pair.ContentHash); err != nil {
+			return nil, fmt.Errorf("scan ref/content_hash row: %w", err)
 		}
-		records = append(records, record)
+		// Guard the byte-identity contract with corpus.Fingerprint([]Record).
+		// That path runs each record through Normalized(), which regenerates
+		// ContentHash via HashRecord when empty (an O(row_size) step we
+		// deliberately skip here). If a row ever lands with an empty
+		// content_hash — only possible via a writer bypass or external DB
+		// tampering — FingerprintFromPairs would silently drop it while
+		// Fingerprint([]Record) would include it with a regenerated hash,
+		// making the persisted fingerprint diverge from what Snapshot.Records
+		// callers would recompute. Fail loudly instead.
+		if strings.TrimSpace(pair.ContentHash) == "" {
+			return nil, fmt.Errorf("record %q has empty content_hash; refusing to recompute fingerprint over malformed state", pair.Ref)
+		}
+		pairs = append(pairs, pair)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate current records: %w", err)
+		return nil, fmt.Errorf("iterate ref/content_hash rows: %w", err)
 	}
-	return records, nil
+	return pairs, nil
 }
 
 func countChunks(ctx context.Context, query queryContextRunner) (int, error) {

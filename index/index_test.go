@@ -2990,3 +2990,66 @@ func searchRefs(hits []SearchHit) []string {
 	}
 	return result
 }
+
+// TestUpdateRefusesEmptyContentHashPair exercises the guard in
+// loadCurrentRefHashes: the narrow fingerprint path in finalizeUpdate relies
+// on every persisted row having a non-empty content_hash. If that invariant
+// ever breaks (writer bypass, external tampering), the pair-based digest would
+// silently diverge from corpus.Fingerprint([]Record), which re-derives the
+// hash via HashRecord. Rather than diverge, Update must fail loudly.
+func TestUpdateRefusesEmptyContentHashPair(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	// Blank the content_hash directly to simulate a writer bypass or a
+	// tampered row — the only states in which the narrow (ref, content_hash)
+	// path could silently disagree with corpus.Fingerprint([]Record).
+	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	if _, err := rwDB.ExecContext(context.Background(),
+		`UPDATE records SET content_hash = '' WHERE ref = ?`, testAlphaRef); err != nil {
+		t.Fatalf("blank content_hash: %v", err)
+	}
+	if err := rwDB.Close(); err != nil {
+		t.Fatalf("close rw db: %v", err)
+	}
+
+	_, err = Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded with empty content_hash row, want error")
+	}
+	if !strings.Contains(err.Error(), "empty content_hash") {
+		t.Fatalf("Update() err = %v, want error mentioning empty content_hash", err)
+	}
+}
