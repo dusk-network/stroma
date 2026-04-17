@@ -1046,6 +1046,56 @@ func ensureExistingIndex(path string) error {
 	}
 }
 
+// migrateV2ToV3 adds the context_prefix column to chunks (idempotent: a
+// prior run that already added it is a no-op) and bumps the stored
+// schema_version metadata to "3". Safe to call on a snapshot that is
+// already v3.
+func migrateV2ToV3(ctx context.Context, db *sql.DB) error {
+	hasPrefix, err := hasChunkColumn(ctx, db, "context_prefix")
+	if err != nil {
+		return fmt.Errorf("probe chunks.context_prefix: %w", err)
+	}
+	if !hasPrefix {
+		if _, err := db.ExecContext(ctx,
+			`ALTER TABLE chunks ADD COLUMN context_prefix TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migrate v2 to v3: add chunks.context_prefix: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, schemaVersion); err != nil {
+		return fmt.Errorf("migrate v2 to v3: bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// hasChunkColumn probes PRAGMA table_info(chunks) for the named column.
+// Used by read/reuse paths so v2 snapshots (built before context_prefix
+// existed) keep working against v3-aware code.
+func hasChunkColumn(ctx context.Context, q queryContextRunner, column string) (bool, error) {
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(chunks)`)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, rows.Err()
+		}
+	}
+	return false, rows.Err()
+}
+
 func normalizeRemovedRefs(refs []string) []string {
 	seen := make(map[string]struct{}, len(refs))
 	result := make([]string, 0, len(refs))
@@ -1085,8 +1135,18 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 	if err != nil {
 		return sessionConfig{}, err
 	}
-	if strings.TrimSpace(schema) != schemaVersion {
-		return sessionConfig{}, fmt.Errorf("schema version mismatch: index=%q update=%q", strings.TrimSpace(schema), schemaVersion)
+	trimmedSchema := strings.TrimSpace(schema)
+	if trimmedSchema == "2" {
+		// Migrate v2 → v3 in place so existing indexes stay updatable
+		// after this library upgrade. The migration is idempotent at
+		// the column level (skipped if already applied) and commits
+		// the schema_version bump in the same transaction as the data
+		// edits the caller is about to make.
+		if err := migrateV2ToV3(ctx, db); err != nil {
+			return sessionConfig{}, err
+		}
+	} else if trimmedSchema != schemaVersion {
+		return sessionConfig{}, fmt.Errorf("schema version mismatch: index=%q update=%q", trimmedSchema, schemaVersion)
 	}
 
 	embedderFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")

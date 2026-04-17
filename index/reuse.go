@@ -85,7 +85,17 @@ func (s *reuseState) Close() error {
 
 func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int, quantization string) bool {
 	schema, err := readMetadataValue(ctx, db, "schema_version")
-	if err != nil || strings.TrimSpace(schema) != schemaVersion {
+	if err != nil {
+		return false
+	}
+	// v2 snapshots pre-date context_prefix. They are reuse-compatible
+	// because loadStoredChunksForRecord defaults the missing prefix to
+	// "" and reuseChunkKey with prefix="" matches what the new-side key
+	// produces when no Contextualizer is configured. Contextualizer-
+	// enabled rebuilds produce different new-side keys, so v2 chunks
+	// simply miss and get re-embedded.
+	trimmed := strings.TrimSpace(schema)
+	if trimmed != schemaVersion && trimmed != "2" {
 		return false
 	}
 	storedFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
@@ -189,12 +199,23 @@ func (s *reuseState) disable() {
 }
 
 func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title string) (map[string][]byte, error) {
-	rows, err := db.QueryContext(ctx, `
-SELECT c.heading, c.content, c.context_prefix, v.embedding
+	hasPrefix, err := hasChunkColumn(ctx, db, "context_prefix")
+	if err != nil {
+		return nil, fmt.Errorf("probe chunks.context_prefix for %s: %w", ref, err)
+	}
+	// v2 snapshots lack context_prefix; project an empty string so the
+	// scan shape is uniform and reuse keys computed with prefix="" stay
+	// in sync with the new-side keys when no Contextualizer is configured.
+	prefixExpr := "'' AS context_prefix"
+	if hasPrefix {
+		prefixExpr = "c.context_prefix"
+	}
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+SELECT c.heading, c.content, %s, v.embedding
 FROM chunks c
 JOIN chunks_vec v ON v.chunk_id = c.id
 WHERE c.record_ref = ?
-ORDER BY c.chunk_index ASC, c.id ASC`, ref)
+ORDER BY c.chunk_index ASC, c.id ASC`, prefixExpr), ref)
 	if err != nil {
 		return nil, fmt.Errorf("query stored chunks for %s: %w", ref, err)
 	}

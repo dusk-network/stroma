@@ -1657,6 +1657,168 @@ func TestRebuildContextualizerRejectsWrongLengthPrefixes(t *testing.T) {
 	}
 }
 
+func TestOpenSnapshotV2BackwardCompatibleSections(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	snap, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(v2) error = %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+
+	sections, err := snap.Sections(context.Background(), SectionQuery{})
+	if err != nil {
+		t.Fatalf("Sections(v2) error = %v", err)
+	}
+	if len(sections) == 0 {
+		t.Fatal("Sections(v2) returned no sections")
+	}
+	for _, section := range sections {
+		if section.ContextPrefix != "" {
+			t.Fatalf("v2 section %s ContextPrefix = %q, want empty", section.Ref, section.ContextPrefix)
+		}
+	}
+}
+
+func TestUpdateMigratesV2ToV3AndStaysUsable(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	if _, err := Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Update(v2→v3 migration) error = %v", err)
+	}
+
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.SchemaVersion != "3" {
+		t.Fatalf("SchemaVersion = %q after Update migration, want 3", stats.SchemaVersion)
+	}
+}
+
+func TestRebuildReuseFromV2SnapshotStillHits(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	pathA := dir + "/a.db"
+	pathB := dir + "/b.db"
+
+	records := []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     pathA,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(A) error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(pathA); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          pathB,
+		ReuseFromPath: pathA,
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(B reusing v2 A) error = %v", err)
+	}
+	if result.ReusedChunkCount == 0 {
+		t.Fatal("ReusedChunkCount = 0 against v2 reuse source; v2 must stay reuse-compatible when no Contextualizer is configured")
+	}
+	if result.ReusedChunkCount != result.ChunkCount {
+		t.Fatalf("ReusedChunkCount = %d, ChunkCount = %d, want equal", result.ReusedChunkCount, result.ChunkCount)
+	}
+}
+
+// rewriteSnapshotToV2 converts a freshly-built v3 snapshot into a v2 one
+// by dropping the context_prefix column and rewinding schema_version, so
+// the v2-backcompat tests can run against the same build surface that
+// produced the snapshot in the first place.
+func rewriteSnapshotToV2(path string) error {
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	for _, stmt := range []string{
+		`ALTER TABLE chunks DROP COLUMN context_prefix`,
+		`UPDATE metadata SET value = '2' WHERE key = 'schema_version'`,
+	} {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // contextualizerFunc adapts a function literal to ChunkContextualizer for
 // test fixtures that only need a one-off implementation.
 type contextualizerFunc func(ctx context.Context, record corpus.Record, sections []chunk.Section) ([]string, error)
