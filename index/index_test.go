@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	testSyncGuideRef = "sync-guide"
-	testAlphaRef     = "alpha"
+	testSyncGuideRef  = "sync-guide"
+	testAlphaRef      = "alpha"
+	testNoteKind      = "note"
+	testTargetNoteRef = "target-note"
 )
 
 type reverseReranker struct {
@@ -2313,7 +2315,7 @@ func TestSearchMatryoshkaHonorsKindFilterInsidePrefilter(t *testing.T) {
 	// easily fall outside the shortlist and the search would silently
 	// return zero hits even though a matching kind exists.
 	records := []corpus.Record{{
-		Ref:        "target-note",
+		Ref:        testTargetNoteRef,
 		Kind:       "note",
 		Title:      "Target Note",
 		SourceRef:  "file://notes/target.txt",
@@ -2352,11 +2354,212 @@ func TestSearchMatryoshkaHonorsKindFilterInsidePrefilter(t *testing.T) {
 	if len(hits) == 0 {
 		t.Fatal("Matryoshka + kind filter returned no hits; the prefilter must apply the kind restriction before truncation, not after")
 	}
-	if hits[0].Ref != "target-note" || hits[0].Kind != "note" {
-		t.Fatalf("first hit = (%s, %s), want (target-note, note)", hits[0].Ref, hits[0].Kind)
+	if hits[0].Ref != testTargetNoteRef || hits[0].Kind != testNoteKind {
+		t.Fatalf("first hit = (%s, %s), want (%s, %s)", hits[0].Ref, hits[0].Kind, testTargetNoteRef, testNoteKind)
 	}
 	for _, hit := range hits {
 		if hit.Kind != "note" {
+			t.Fatalf("kind filter leaked: hit %s has kind %q", hit.Ref, hit.Kind)
+		}
+	}
+}
+
+// kindFilterStarvationRecords builds a corpus designed to expose the
+// post-prefilter kind-filter starvation bug: the single "note" chunk
+// uses body text that is *unrelated* to the query, while every "noise"
+// chunk repeats the query tokens verbatim. Any prefilter that ignores
+// the kind predicate fills its shortlist with noise, and the outer
+// WHERE r.kind IN (...) strips every row. The corpus is sized so the
+// prefilter shortlist (candidateLimit == 25 for the default path,
+// candidateLimit * binaryRescoreMultiplier == 75 for the binary path)
+// cannot swallow the whole corpus and mask the bug.
+func kindFilterStarvationRecords(noiseCount int) []corpus.Record {
+	records := []corpus.Record{{
+		Ref:        testTargetNoteRef,
+		Kind:       testNoteKind,
+		Title:      "Target Note",
+		SourceRef:  "file://notes/target.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		// Deliberately lexically distant from the query so the target
+		// note is ranked below the noise by the deterministic fixture
+		// embedder. With the bug present the prefilter never surfaces
+		// it; with the fix the in-CTE kind filter restricts the search
+		// space to the note kind and the note is the only candidate.
+		BodyText: "Reminder: review quarterly hiring plans on Monday.",
+	}}
+	for i := 0; i < noiseCount; i++ {
+		records = append(records, corpus.Record{
+			Ref:        "noise-" + strconv.Itoa(i),
+			Kind:       "noise",
+			Title:      "Noise " + strconv.Itoa(i),
+			SourceRef:  "file://noise/" + strconv.Itoa(i) + ".txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "Background workers process items in batches every hour.",
+		})
+	}
+	return records
+}
+
+func TestSearchFloat32HonorsKindFilterInsidePrefilter(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), kindFilterStarvationRecords(120), BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	// SearchVector bypasses the FTS leg of hybrid search so the vec0
+	// MATCH prefilter has to stand on its own. If the kind predicate is
+	// applied after MATCH returned its k noise candidates, the result is
+	// silently empty; the in-CTE kind predicate must widen the search
+	// until the target note is reached.
+	vectors, err := fixture.EmbedQueries(context.Background(), []string{"background workers batches"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	hits, err := snapshot.SearchVector(context.Background(), VectorSearchQuery{
+		Embedding: vectors[0],
+		Limit:     3,
+		Kinds:     []string{testNoteKind},
+	})
+	if err != nil {
+		t.Fatalf("SearchVector(Kinds=note, default float32) error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("default float32 + kind filter returned no hits; the prefilter must apply the kind restriction inside the MATCH CTE, not after")
+	}
+	if hits[0].Ref != testTargetNoteRef || hits[0].Kind != testNoteKind {
+		t.Fatalf("first hit = (%s, %s), want (%s, %s)", hits[0].Ref, hits[0].Kind, testTargetNoteRef, testNoteKind)
+	}
+	for _, hit := range hits {
+		if hit.Kind != testNoteKind {
+			t.Fatalf("kind filter leaked: hit %s has kind %q", hit.Ref, hit.Kind)
+		}
+	}
+}
+
+func TestSearchBinaryHonorsKindFilterInsidePrefilter(t *testing.T) {
+	t.Parallel()
+
+	// dim=32 is the smallest div-by-8 dim that spreads the fixture's
+	// hashed bigrams across enough bits for the 1-bit prefilter to
+	// separate the lexically-distant note from the query-token noise.
+	// With dim=16 the binary signatures collide heavily and the target
+	// note is accidentally captured by the hamming shortlist.
+	fixture, err := embed.NewFixture("fixture-a", 32)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), kindFilterStarvationRecords(120), BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "binary",
+	}); err != nil {
+		t.Fatalf("Rebuild(binary) error = %v", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(binary) error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	// SearchVector isolates the binary two-stage path: hamming MATCH
+	// prefilter over chunks_vec bit[N] feeding into a full-precision
+	// cosine rescore against chunks_vec_full. If the kind predicate is
+	// applied only after the hamming shortlist is built, a corpus where
+	// the requested kind is a minority starves the rescore input.
+	vectors, err := fixture.EmbedQueries(context.Background(), []string{"background workers batches"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	hits, err := snapshot.SearchVector(context.Background(), VectorSearchQuery{
+		Embedding: vectors[0],
+		Limit:     3,
+		Kinds:     []string{testNoteKind},
+	})
+	if err != nil {
+		t.Fatalf("SearchVector(Kinds=note, binary) error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("binary + kind filter returned no hits; the prefilter must apply the kind restriction inside the hamming MATCH CTE, not after")
+	}
+	if hits[0].Ref != testTargetNoteRef || hits[0].Kind != testNoteKind {
+		t.Fatalf("first hit = (%s, %s), want (%s, %s)", hits[0].Ref, hits[0].Kind, testTargetNoteRef, testNoteKind)
+	}
+	for _, hit := range hits {
+		if hit.Kind != testNoteKind {
+			t.Fatalf("kind filter leaked: hit %s has kind %q", hit.Ref, hit.Kind)
+		}
+	}
+}
+
+func TestSearchInt8HonorsKindFilterInsidePrefilter(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), kindFilterStarvationRecords(120), BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "int8",
+	}); err != nil {
+		t.Fatalf("Rebuild(int8) error = %v", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(int8) error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	// The int8 path shares buildSearchSQL with float32, so the same
+	// starvation bug and fix apply — but the kind-filtered branch wraps
+	// the query blob in vec_int8() to match the packed int8 column type.
+	// Cover it explicitly: sqlite-vec rejects vec_slice over packed int8
+	// bytes (hence no Matryoshka for int8), so the combination of
+	// vec_distance_cosine + vec_int8(?) that this branch relies on is
+	// genuinely a new operator pairing for this codebase.
+	vectors, err := fixture.EmbedQueries(context.Background(), []string{"background workers batches"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	hits, err := snapshot.SearchVector(context.Background(), VectorSearchQuery{
+		Embedding: vectors[0],
+		Limit:     3,
+		Kinds:     []string{testNoteKind},
+	})
+	if err != nil {
+		t.Fatalf("SearchVector(Kinds=note, int8) error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("int8 + kind filter returned no hits; the prefilter must apply the kind restriction inside the MATCH CTE, not after")
+	}
+	if hits[0].Ref != testTargetNoteRef || hits[0].Kind != testNoteKind {
+		t.Fatalf("first hit = (%s, %s), want (%s, %s)", hits[0].Ref, hits[0].Kind, testTargetNoteRef, testNoteKind)
+	}
+	for _, hit := range hits {
+		if hit.Kind != testNoteKind {
 			t.Fatalf("kind filter leaked: hit %s has kind %q", hit.Ref, hit.Kind)
 		}
 	}
