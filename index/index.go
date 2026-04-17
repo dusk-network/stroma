@@ -124,6 +124,15 @@ type SearchQuery struct {
 	Kinds    []string
 	Embedder embed.Embedder
 	Reranker Reranker
+
+	// SearchDimension optionally runs a truncated-prefix vector prefilter
+	// at this dimension, then rescores the shortlist with full-dim cosine.
+	// Zero (default) uses the full stored dimension throughout. Positive
+	// values must be <= the stored embedder dimension. Only valid when the
+	// stored quantization is float32; returns an error against int8 indexes.
+	// This is the shape Matryoshka Representation Learning (MRL) embeddings
+	// rely on — callers who use non-MRL embeddings should leave it zero.
+	SearchDimension int
 }
 
 // SearchHit is one retrieved section.
@@ -473,11 +482,12 @@ func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
 	}
 	defer func() { _ = snapshot.Close() }()
 	return snapshot.Search(ctx, SnapshotSearchQuery{
-		Text:     query.Text,
-		Limit:    query.Limit,
-		Kinds:    query.Kinds,
-		Embedder: query.Embedder,
-		Reranker: query.Reranker,
+		Text:            query.Text,
+		Limit:           query.Limit,
+		Kinds:           query.Kinds,
+		Embedder:        query.Embedder,
+		Reranker:        query.Reranker,
+		SearchDimension: query.SearchDimension,
 	})
 }
 
@@ -947,6 +957,69 @@ WHERE 1 = 1`, matchExpr))
 ORDER BY vh.distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
 	args = append(args, query.Limit)
+	return builder.String(), args
+}
+
+// matryoshkaPrefilterMultiplier scales the prefilter shortlist up from the
+// caller-requested candidate limit so that good candidates that only the
+// truncated prefix ranks lower still have a chance to survive into the
+// full-dim rescore. The final LIMIT then trims back to the caller's count.
+const matryoshkaPrefilterMultiplier = 3
+
+// buildMatryoshkaSearchSQL builds the truncated-prefix prefilter + full-dim
+// rescore query. The prefilter scans every chunk_vec row with cosine over
+// the first searchDim floats; the rescore recomputes full-dim cosine on
+// just the prefilter shortlist. Kind filtering is applied after the
+// prefilter, matching buildSearchSQL's placement so Matryoshka and the
+// vec0 MATCH path have the same kind-interaction semantics.
+func buildMatryoshkaSearchSQL(limit int, kinds []string, queryBlob []byte, searchDim int) (querySQL string, args []any) {
+	// Truncate the full-dim float32 query blob to the first searchDim floats.
+	// The stored vectors are sliced in SQL via vec_slice, keeping the
+	// representation on both sides identical.
+	truncatedQuery := queryBlob[:searchDim*4]
+	prefilterLimit := limit * matryoshkaPrefilterMultiplier
+
+	var builder strings.Builder
+	args = make([]any, 0, 5+len(kinds))
+	builder.WriteString(`
+WITH prefilter AS (
+  SELECT chunk_id, embedding
+  FROM chunks_vec
+  ORDER BY vec_distance_cosine(vec_slice(embedding, 0, ?), ?)
+  LIMIT ?
+)
+SELECT
+  pf.chunk_id,
+  r.ref,
+  r.kind,
+  r.title,
+  r.source_ref,
+  c.heading,
+  c.content,
+  r.metadata_json,
+  vec_distance_cosine(pf.embedding, ?) AS distance
+FROM prefilter pf
+JOIN chunks c ON c.id = pf.chunk_id
+JOIN records r ON r.ref = c.record_ref
+WHERE 1 = 1`)
+	args = append(args, searchDim, truncatedQuery, prefilterLimit, queryBlob)
+
+	if len(kinds) > 0 {
+		builder.WriteString(" AND r.kind IN (")
+		for i, kind := range kinds {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString("?")
+			args = append(args, strings.TrimSpace(kind))
+		}
+		builder.WriteString(")")
+	}
+
+	builder.WriteString(`
+ORDER BY distance ASC, r.ref ASC, c.chunk_index ASC
+LIMIT ?`)
+	args = append(args, limit)
 	return builder.String(), args
 }
 
