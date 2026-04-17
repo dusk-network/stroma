@@ -38,6 +38,18 @@ const (
 // wrapped via fmt.Errorf with %w so callers can use errors.Is to detect it.
 var ErrUnsupportedSchemaVersion = errors.New("unsupported snapshot schema version")
 
+// ErrUpdateCommittedIntegrityCheckFailed signals that Update's transaction
+// committed successfully — the record, chunk, and metadata changes are
+// durable on disk — but the post-commit PRAGMA integrity_check /
+// foreign_key_check reported corruption. The enclosing error wraps this
+// sentinel via fmt.Errorf with %w so callers can use errors.Is to detect
+// it. This case is non-retriable: re-running Update will not unroll the
+// already-durable changes, and the underlying file likely needs operator
+// inspection (see index/ARCHITECTURE.md). Contrast with plain errors
+// returned by Update, which come from pre-commit failures and leave the
+// file byte-identical to its pre-call state.
+var ErrUpdateCommittedIntegrityCheckFailed = errors.New("update committed but post-commit integrity check failed")
+
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
 	Path string
@@ -447,7 +459,7 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 		}
 	}
 
-	if err := finalizeUpdate(ctx, tx, cfg, result); err != nil {
+	if err := finalizeUpdate(ctx, db, tx, cfg, result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -478,7 +490,7 @@ func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result
 	return nil
 }
 
-func finalizeUpdate(ctx context.Context, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
+func finalizeUpdate(ctx context.Context, db *sql.DB, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
 	recordsNow, err := loadCurrentRecords(ctx, tx)
 	if err != nil {
 		return err
@@ -509,11 +521,23 @@ func finalizeUpdate(ctx context.Context, tx *sql.Tx, cfg sessionConfig, result *
 	if err := upsertMetadata(ctx, tx, metadata); err != nil {
 		return err
 	}
-	if err := runIntegrityChecks(ctx, tx); err != nil {
-		return err
-	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit update transaction: %w", err)
+	}
+	// PRAGMA integrity_check inside an uncommitted write transaction sees
+	// staged dirty pages instead of the durable state, so commit-time
+	// failure modes (WAL flush errors, partial writes, etc.) slip through.
+	// Run the check on the db handle after Commit returns so the result
+	// reflects what actually landed on disk. Unlike finalizeRebuild (which
+	// validates post-commit before a final replaceFile, so a failure
+	// leaves the original file untouched), finalizeUpdate has no staging
+	// layer — the durable file is already mutated by the time we reach
+	// this check. Wrap any failure in ErrUpdateCommittedIntegrityCheckFailed
+	// so callers can distinguish "update rolled back cleanly" from
+	// "update committed but the resulting file looks corrupt" and route
+	// the latter to operator inspection instead of a naive retry.
+	if err := runIntegrityChecks(ctx, db); err != nil {
+		return fmt.Errorf("%w: %w", ErrUpdateCommittedIntegrityCheckFailed, err)
 	}
 	return nil
 }
@@ -1051,7 +1075,19 @@ func documentTextForEmbedding(record corpus.Record) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// runIntegrityChecksInjectFault is a test-only seam that runs before the
+// real integrity checks. Production leaves it nil. Tests set it to
+// simulate post-commit corruption and drive the
+// ErrUpdateCommittedIntegrityCheckFailed error path without needing
+// filesystem-level fault injection.
+var runIntegrityChecksInjectFault func() error
+
 func runIntegrityChecks(ctx context.Context, query queryContextRunner) error {
+	if runIntegrityChecksInjectFault != nil {
+		if err := runIntegrityChecksInjectFault(); err != nil {
+			return err
+		}
+	}
 	row := query.QueryRowContext(ctx, `PRAGMA integrity_check`)
 	var result string
 	if err := row.Scan(&result); err != nil {

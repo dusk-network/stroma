@@ -1972,6 +1972,73 @@ func TestMigrateV2ToV3IsCrashSafe(t *testing.T) {
 	}
 }
 
+func TestUpdatePostCommitIntegrityFailureIsTyped(t *testing.T) {
+	// Not parallel: mutates the package-level runIntegrityChecksInjectFault hook.
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	// Force the post-commit integrity check to fail. Because the fault
+	// fires after tx.Commit has already returned, the "beta" record
+	// write is durable; Update must surface the failure with
+	// ErrUpdateCommittedIntegrityCheckFailed so callers can distinguish
+	// it from a pre-commit rollback and route it to operator inspection
+	// instead of a naive retry.
+	integrityErr := errors.New("simulated post-commit integrity corruption")
+	runIntegrityChecksInjectFault = func() error { return integrityErr }
+	t.Cleanup(func() { runIntegrityChecksInjectFault = nil })
+
+	_, err = Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded with integrity fault, want ErrUpdateCommittedIntegrityCheckFailed")
+	}
+	if !errors.Is(err, ErrUpdateCommittedIntegrityCheckFailed) {
+		t.Fatalf("Update() err = %v, want wraps ErrUpdateCommittedIntegrityCheckFailed", err)
+	}
+	if !errors.Is(err, integrityErr) {
+		t.Fatalf("Update() err = %v, want also wraps underlying injected integrity error", err)
+	}
+
+	// Clear the fault so ReadStats's own integrity machinery (if any)
+	// does not trip; then confirm the Update really did commit durably
+	// before the typed error was returned.
+	runIntegrityChecksInjectFault = nil
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.RecordCount != 2 {
+		t.Fatalf("RecordCount = %d after typed integrity failure, want 2; update was not durable", stats.RecordCount)
+	}
+}
+
 // failingEmbedder mirrors the fingerprint and dimension of the wrapped
 // fixture so it passes resolveUpdateSessionConfig's compatibility checks,
 // but returns err from EmbedDocuments. Used to drive a post-migration
