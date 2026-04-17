@@ -269,9 +269,9 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	return result, nil
 }
 
-func buildSectionsQuery(query SectionQuery) (string, []any) {
+func buildSectionsQuery(query SectionQuery) (sqlText string, args []any) {
 	var builder strings.Builder
-	args := make([]any, 0, len(query.Refs)+len(query.Kinds))
+	args = make([]any, 0, len(query.Refs)+len(query.Kinds))
 	builder.WriteString(`
 SELECT
   c.id,
@@ -298,7 +298,8 @@ WHERE 1 = 1`)
 	appendRecordQueryFilter(&builder, &args, "r.kind", query.Kinds)
 	builder.WriteString(`
 ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
-	return builder.String(), args
+	sqlText = builder.String()
+	return sqlText, args
 }
 
 func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string) (Section, error) {
