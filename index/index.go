@@ -1331,30 +1331,30 @@ func buildBinarySearchSQL(limit int, kinds []string, bitQueryBlob, floatQueryBlo
 	var builder strings.Builder
 	args = make([]any, 0, 4+len(kinds))
 
+	prefilterLimit := limit * binaryRescoreMultiplier
+
 	if len(kinds) > 0 {
-		// sqlite-vec's vec0 MATCH + k = N caps the hamming shortlist at N
-		// before any externally-joined predicate runs, so filtering by
-		// r.kind on the outer query silently starves the rescore stage
-		// whenever the requested kinds are a minority of the corpus.
-		// Mirror the Matryoshka and default-path fix: when a kind filter
-		// is supplied, skip the hamming prefilter entirely and score
-		// directly against chunks_vec_full with full-precision cosine,
-		// constrained by the kind predicate inside the CTE. The binary
-		// prefilter's value is amortized bulk kNN over an unfiltered
-		// corpus; a kind-narrowed search is already a bounded scan so
-		// dropping the bit stage keeps the end-to-end cost roughly the
-		// same while guaranteeing correctness.
+		// sqlite-vec's vec0 `MATCH vec_bit(?) AND k = N` caps the hamming
+		// shortlist at N *before* any externally-joined predicate runs, so
+		// filtering by r.kind on the outer query silently starves the
+		// rescore stage whenever the requested kinds are a minority of
+		// the corpus. Keep the two-stage structure — cheap 1-bit hamming
+		// prefilter, full-precision cosine rescore — but swap the vec0
+		// MATCH kNN for a brute-force hamming-distance scan whose CTE
+		// can join `chunks` + `records` and enforce the kind predicate
+		// up front. This preserves the binary path's cost benefit for
+		// broad kind filters (still only prefilterLimit rows hit the
+		// float rescore) while guaranteeing correctness.
 		builder.WriteString(`
-WITH vector_hits AS (
-  SELECT vf.chunk_id,
-         vec_distance_cosine(vf.embedding, ?) AS distance
-  FROM chunks_vec_full vf
-  JOIN chunks c ON c.id = vf.chunk_id
+WITH prefilter AS (
+  SELECT v.chunk_id
+  FROM chunks_vec v
+  JOIN chunks c ON c.id = v.chunk_id
   JOIN records r ON r.ref = c.record_ref
   WHERE r.kind IN (`)
-		// Arg order follows placeholder order: floatQueryBlob for
-		// vec_distance_cosine, then each kind, then the inner LIMIT.
-		args = append(args, floatQueryBlob)
+		// Placeholder order: kinds in WHERE, then bitQueryBlob in the
+		// ORDER BY hamming, then prefilterLimit, then floatQueryBlob for
+		// the rescore stage, then the outer LIMIT.
 		for i, kind := range kinds {
 			if i > 0 {
 				builder.WriteString(", ")
@@ -1363,11 +1363,17 @@ WITH vector_hits AS (
 			args = append(args, strings.TrimSpace(kind))
 		}
 		builder.WriteString(`)
-  ORDER BY distance
+  ORDER BY vec_distance_hamming(v.embedding, vec_bit(?))
   LIMIT ?
+),
+rescored AS (
+  SELECT pf.chunk_id,
+         vec_distance_cosine(vf.embedding, ?) AS distance
+  FROM prefilter pf
+  JOIN chunks_vec_full vf ON vf.chunk_id = pf.chunk_id
 )
 SELECT
-  vh.chunk_id,
+  rs.chunk_id,
   r.ref,
   r.kind,
   r.title,
@@ -1375,17 +1381,16 @@ SELECT
   c.heading,
   c.content,
   r.metadata_json,
-  vh.distance
-FROM vector_hits vh
-JOIN chunks c ON c.id = vh.chunk_id
+  rs.distance
+FROM rescored rs
+JOIN chunks c ON c.id = rs.chunk_id
 JOIN records r ON r.ref = c.record_ref
-ORDER BY vh.distance ASC, r.ref ASC, c.chunk_index ASC
+ORDER BY rs.distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
-		args = append(args, limit, limit)
+		args = append(args, bitQueryBlob, prefilterLimit, floatQueryBlob, limit)
 		return builder.String(), args
 	}
 
-	prefilterLimit := limit * binaryRescoreMultiplier
 	builder.WriteString(`
 WITH prefilter AS (
   SELECT chunk_id

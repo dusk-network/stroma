@@ -2510,6 +2510,61 @@ func TestSearchBinaryHonorsKindFilterInsidePrefilter(t *testing.T) {
 	}
 }
 
+func TestSearchInt8HonorsKindFilterInsidePrefilter(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), kindFilterStarvationRecords(120), BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: "int8",
+	}); err != nil {
+		t.Fatalf("Rebuild(int8) error = %v", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(int8) error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	// The int8 path shares buildSearchSQL with float32, so the same
+	// starvation bug and fix apply — but the kind-filtered branch wraps
+	// the query blob in vec_int8() to match the packed int8 column type.
+	// Cover it explicitly: sqlite-vec rejects vec_slice over packed int8
+	// bytes (hence no Matryoshka for int8), so the combination of
+	// vec_distance_cosine + vec_int8(?) that this branch relies on is
+	// genuinely a new operator pairing for this codebase.
+	vectors, err := fixture.EmbedQueries(context.Background(), []string{"background workers batches"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	hits, err := snapshot.SearchVector(context.Background(), VectorSearchQuery{
+		Embedding: vectors[0],
+		Limit:     3,
+		Kinds:     []string{testNoteKind},
+	})
+	if err != nil {
+		t.Fatalf("SearchVector(Kinds=note, int8) error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("int8 + kind filter returned no hits; the prefilter must apply the kind restriction inside the MATCH CTE, not after")
+	}
+	if hits[0].Ref != testTargetNoteRef || hits[0].Kind != testNoteKind {
+		t.Fatalf("first hit = (%s, %s), want (%s, %s)", hits[0].Ref, hits[0].Kind, testTargetNoteRef, testNoteKind)
+	}
+	for _, hit := range hits {
+		if hit.Kind != testNoteKind {
+			t.Fatalf("kind filter leaked: hit %s has kind %q", hit.Ref, hit.Kind)
+		}
+	}
+}
+
 func TestRebuildSelfReuseReplacesSnapshotInPlace(t *testing.T) {
 	t.Parallel()
 
