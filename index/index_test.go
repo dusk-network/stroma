@@ -1668,7 +1668,7 @@ func TestRebuildContextualizerRejectsWrongLengthPrefixes(t *testing.T) {
 // (Stats, Records, Sections, Search) under v1.0+ code. Read paths never
 // recompute HashRecord, so the content_hash encoding bump does not affect
 // them; only Update forces the migration chain. Sections() on a v2
-// snapshot projects '' for the missing context_prefix column.
+// snapshot projects an empty string for the missing context_prefix column.
 func TestOpenSnapshotV2BackwardCompatibleSections(t *testing.T) {
 	t.Parallel()
 
