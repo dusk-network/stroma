@@ -20,7 +20,7 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
-const schemaVersion = "2"
+const schemaVersion = "3"
 
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
@@ -38,6 +38,14 @@ type BuildOptions struct {
 	ReuseFromPath string
 
 	Embedder embed.Embedder
+
+	// Contextualizer optionally produces a per-chunk prefix string that
+	// gets prepended before the embedding text and the FTS5 content. When
+	// set, the prefix persists on the chunk and participates in reuse
+	// keying so a changed contextualizer invalidates stale reuse without
+	// corrupting the stored representation. Nil disables contextualization
+	// and leaves the build identical to the non-contextual path.
+	Contextualizer ChunkContextualizer
 
 	// MaxChunkTokens sets the approximate maximum number of tokens (words)
 	// per chunk. Sections that exceed this limit are split into smaller
@@ -72,6 +80,12 @@ type BuildResult struct {
 type UpdateOptions struct {
 	Path     string
 	Embedder embed.Embedder
+
+	// Contextualizer optionally produces a per-chunk prefix string. See
+	// BuildOptions.Contextualizer for the contract. Leaving it nil
+	// preserves the non-contextual path and produces chunks with an
+	// empty persisted prefix.
+	Contextualizer ChunkContextualizer
 
 	// MaxChunkTokens sets the approximate maximum number of tokens (words)
 	// per chunk. It should match the chunking policy used to build the current
@@ -145,6 +159,17 @@ type Reranker interface {
 	Rerank(ctx context.Context, query string, candidates []SearchHit) ([]SearchHit, error)
 }
 
+// ChunkContextualizer produces a short explanatory prefix for each section
+// of a record. The returned slice must be the same length as sections and
+// aligned with it index-for-index. An empty prefix is allowed and disables
+// contextual retrieval for that section. The returned prefix is prepended
+// to the embedding text and to the FTS5 content column; it is persisted so
+// reuse keying can detect when a changed contextualizer needs to invalidate
+// the stored embedding.
+type ChunkContextualizer interface {
+	ContextualizeChunks(ctx context.Context, record corpus.Record, sections []chunk.Section) ([]string, error)
+}
+
 // Rebuild atomically recreates the index at the requested path.
 func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions) (*BuildResult, error) {
 	if ctx == nil {
@@ -187,6 +212,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 	session, err := newIndexSession(ctx, tx, sessionConfig{
 		embedder:            options.Embedder,
 		embedderFingerprint: options.Embedder.Fingerprint(),
+		contextualizer:      options.Contextualizer,
 		reuse:               inputs.reuseState,
 		chunkOpts: chunk.Options{
 			MaxTokens:     options.MaxChunkTokens,
@@ -514,11 +540,12 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 			metadata_json TEXT NOT NULL
 		)`,
 		`CREATE TABLE chunks (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			record_ref  TEXT NOT NULL,
-			chunk_index INTEGER NOT NULL,
-			heading     TEXT NOT NULL,
-			content     TEXT NOT NULL,
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			record_ref     TEXT NOT NULL,
+			chunk_index    INTEGER NOT NULL,
+			heading        TEXT NOT NULL,
+			content        TEXT NOT NULL,
+			context_prefix TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY (record_ref) REFERENCES records(ref) ON DELETE CASCADE
 		)`,
 		fmt.Sprintf(`CREATE VIRTUAL TABLE chunks_vec USING vec0(
@@ -569,6 +596,7 @@ type sessionConfig struct {
 	// embedderFingerprint, dimension, and quantization from stored metadata.
 	embedder            embed.Embedder
 	embedderFingerprint string
+	contextualizer      ChunkContextualizer
 	reuse               *reuseState
 	chunkOpts           chunk.Options
 	dimension           int
@@ -586,13 +614,14 @@ type recordStats struct {
 // for the per-record write path. Rebuild delegates to it today; Update will
 // migrate in a follow-up so both write paths share the same invariants.
 type indexSession struct {
-	tx           *sql.Tx
-	embedder     embed.Embedder
-	contextual   embed.ContextualEmbedder
-	reuse        *reuseState
-	chunkOpts    chunk.Options
-	dimension    int
-	quantization string
+	tx             *sql.Tx
+	embedder       embed.Embedder
+	contextual     embed.ContextualEmbedder
+	contextualizer ChunkContextualizer
+	reuse          *reuseState
+	chunkOpts      chunk.Options
+	dimension      int
+	quantization   string
 
 	recordStmt *sql.Stmt
 	chunkStmt  *sql.Stmt
@@ -602,12 +631,13 @@ type indexSession struct {
 
 func newIndexSession(ctx context.Context, tx *sql.Tx, cfg sessionConfig) (*indexSession, error) {
 	s := &indexSession{
-		tx:           tx,
-		embedder:     cfg.embedder,
-		reuse:        cfg.reuse,
-		chunkOpts:    cfg.chunkOpts,
-		dimension:    cfg.dimension,
-		quantization: cfg.quantization,
+		tx:             tx,
+		embedder:       cfg.embedder,
+		contextualizer: cfg.contextualizer,
+		reuse:          cfg.reuse,
+		chunkOpts:      cfg.chunkOpts,
+		dimension:      cfg.dimension,
+		quantization:   cfg.quantization,
 	}
 	if contextual, ok := cfg.embedder.(embed.ContextualEmbedder); ok {
 		s.contextual = contextual
@@ -623,8 +653,8 @@ ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_jso
 	}
 
 	s.chunkStmt, err = tx.PrepareContext(ctx, `INSERT INTO chunks (
-record_ref, chunk_index, heading, content
-) VALUES (?, ?, ?, ?)`)
+record_ref, chunk_index, heading, content, context_prefix
+) VALUES (?, ?, ?, ?, ?)`)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("prepare chunk insert: %w", err)
@@ -669,8 +699,13 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		return stats, err
 	}
 
-	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), s.chunkOpts)
-	sections := plan.sections
+	sections := sectionsForRecord(record, s.chunkOpts)
+	prefixes, err := runContextualizer(ctx, s.contextualizer, record, sections)
+	if err != nil {
+		return stats, fmt.Errorf("contextualize record %s: %w", record.Ref, err)
+	}
+
+	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), sections, prefixes)
 	stats.sections = len(sections)
 	stats.reusedChunks = plan.reusedChunkCount
 	stats.embeddedChunks = plan.embeddedChunkCount
@@ -685,7 +720,7 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		if _, ok := plan.reusedEmbeddings[plan.keys[i]]; ok {
 			continue
 		}
-		texts = append(texts, textForEmbedding(record.Title, section))
+		texts = append(texts, contextualEmbeddingText(sectionPrefix(plan.prefixes, i), record.Title, section))
 	}
 
 	vectors := make([][]float64, 0, len(texts))
@@ -734,7 +769,8 @@ func insertChunks(
 ) error {
 	newVectorIndex := 0
 	for index, section := range sections {
-		chunkResult, err := chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body)
+		prefix := sectionPrefix(plan.prefixes, index)
+		chunkResult, err := chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body, prefix)
 		if err != nil {
 			return fmt.Errorf("insert record %s chunk %d: %w", record.Ref, index, err)
 		}
@@ -742,7 +778,11 @@ func insertChunks(
 		if err != nil {
 			return fmt.Errorf("read chunk id for %s chunk %d: %w", record.Ref, index, err)
 		}
-		if _, err := ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, section.Body); err != nil {
+		ftsContent := section.Body
+		if prefix != "" {
+			ftsContent = prefix + "\n\n" + section.Body
+		}
+		if _, err := ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, ftsContent); err != nil {
 			return fmt.Errorf("insert fts for %s chunk %d: %w", record.Ref, index, err)
 		}
 		if blob, ok := plan.reusedEmbeddings[plan.keys[index]]; ok {
@@ -794,6 +834,59 @@ func sectionsForRecord(record corpus.Record, opts chunk.Options) []chunk.Section
 		}
 		return chunk.Markdown(record.Title, record.BodyText)
 	}
+}
+
+// runContextualizer calls the configured contextualizer and returns a slice
+// of per-section prefixes. A nil contextualizer or zero-length sections
+// returns nil so downstream code can treat "no prefix" uniformly. The
+// contextualizer must return exactly len(sections) prefixes; anything else
+// is a bug in the implementation and is flagged so the build fails fast.
+func runContextualizer(ctx context.Context, contextualizer ChunkContextualizer, record corpus.Record, sections []chunk.Section) ([]string, error) {
+	if contextualizer == nil || len(sections) == 0 {
+		return nil, nil
+	}
+	prefixes, err := contextualizer.ContextualizeChunks(ctx, record, sections)
+	if err != nil {
+		return nil, err
+	}
+	if len(prefixes) != len(sections) {
+		return nil, fmt.Errorf("contextualizer returned %d prefixes for %d sections on %s",
+			len(prefixes), len(sections), record.Ref)
+	}
+	// Normalize whitespace-only prefixes to "" at the source so the reuse
+	// key, persisted column, FTS content, and embedding text all agree on
+	// the empty case. Without this, a prefix of " " would skip embedding
+	// augmentation (contextualEmbeddingText trims) but still persist a
+	// non-empty context_prefix and flow into FTS, diverging silently.
+	for i, p := range prefixes {
+		if strings.TrimSpace(p) == "" {
+			prefixes[i] = ""
+		}
+	}
+	return prefixes, nil
+}
+
+// sectionPrefix returns prefixes[i] when prefixes is populated, or the empty
+// string otherwise. Keeps the single "prefix || empty" branch out of every
+// call site.
+func sectionPrefix(prefixes []string, i int) string {
+	if i < len(prefixes) {
+		return prefixes[i]
+	}
+	return ""
+}
+
+// contextualEmbeddingText prepends the contextualizer's prefix to the
+// standard embedding text so callers can feed the same string to both the
+// vector and FTS arms. When prefix is empty the result matches the
+// non-contextual path exactly. Whitespace normalization happens upstream
+// in runContextualizer, so any non-empty prefix here is a real prefix.
+func contextualEmbeddingText(prefix, title string, section chunk.Section) string {
+	base := textForEmbedding(title, section)
+	if prefix == "" {
+		return base
+	}
+	return prefix + "\n\n" + base
 }
 
 func textForEmbedding(title string, section chunk.Section) string {
@@ -964,6 +1057,56 @@ func ensureExistingIndex(path string) error {
 	}
 }
 
+// migrateV2ToV3 adds the context_prefix column to chunks (idempotent: a
+// prior run that already added it is a no-op) and bumps the stored
+// schema_version metadata to "3". Safe to call on a snapshot that is
+// already v3.
+func migrateV2ToV3(ctx context.Context, db *sql.DB) error {
+	hasPrefix, err := hasChunkColumn(ctx, db, "context_prefix")
+	if err != nil {
+		return fmt.Errorf("probe chunks.context_prefix: %w", err)
+	}
+	if !hasPrefix {
+		if _, err := db.ExecContext(ctx,
+			`ALTER TABLE chunks ADD COLUMN context_prefix TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migrate v2 to v3: add chunks.context_prefix: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, schemaVersion); err != nil {
+		return fmt.Errorf("migrate v2 to v3: bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// hasChunkColumn probes PRAGMA table_info(chunks) for the named column.
+// Used by read/reuse paths so v2 snapshots (built before context_prefix
+// existed) keep working against v3-aware code.
+func hasChunkColumn(ctx context.Context, q queryContextRunner, column string) (bool, error) {
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(chunks)`)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, rows.Err()
+		}
+	}
+	return false, rows.Err()
+}
+
 func normalizeRemovedRefs(refs []string) []string {
 	seen := make(map[string]struct{}, len(refs))
 	result := make([]string, 0, len(refs))
@@ -1003,8 +1146,18 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 	if err != nil {
 		return sessionConfig{}, err
 	}
-	if strings.TrimSpace(schema) != schemaVersion {
-		return sessionConfig{}, fmt.Errorf("schema version mismatch: index=%q update=%q", strings.TrimSpace(schema), schemaVersion)
+	trimmedSchema := strings.TrimSpace(schema)
+	if trimmedSchema == "2" {
+		// Migrate v2 → v3 in place so existing indexes stay updatable
+		// after this library upgrade. The migration is idempotent at
+		// the column level (skipped if already applied) and commits
+		// the schema_version bump in the same transaction as the data
+		// edits the caller is about to make.
+		if err := migrateV2ToV3(ctx, db); err != nil {
+			return sessionConfig{}, err
+		}
+	} else if trimmedSchema != schemaVersion {
+		return sessionConfig{}, fmt.Errorf("schema version mismatch: index=%q update=%q", trimmedSchema, schemaVersion)
 	}
 
 	embedderFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
@@ -1040,6 +1193,7 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 
 	cfg := sessionConfig{
 		embedderFingerprint: embedderFingerprint,
+		contextualizer:      options.Contextualizer,
 		dimension:           dimension,
 		quantization:        quantization,
 		chunkOpts: chunk.Options{
