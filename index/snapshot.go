@@ -242,14 +242,36 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	quantization := store.QuantizationFloat32
 	if query.IncludeEmbeddings {
 		var err error
-		quantization, err = readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+		quantization, err = s.resolveQuantization(ctx)
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	sqlText, args := buildSectionsQuery(query)
+	rows, err := s.db.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query sections: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	result := make([]Section, 0)
+	for rows.Next() {
+		section, err := scanSectionRow(rows, query.IncludeEmbeddings, quantization)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, section)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sections: %w", err)
+	}
+	return result, nil
+}
+
+func buildSectionsQuery(query SectionQuery) (sqlText string, args []any) {
 	var builder strings.Builder
-	args := make([]any, 0, len(query.Refs)+len(query.Kinds))
+	args = make([]any, 0, len(query.Refs)+len(query.Kinds))
 	builder.WriteString(`
 SELECT
   c.id,
@@ -276,52 +298,57 @@ WHERE 1 = 1`)
 	appendRecordQueryFilter(&builder, &args, "r.kind", query.Kinds)
 	builder.WriteString(`
 ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
+	sqlText = builder.String()
+	return sqlText, args
+}
 
-	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+// resolveQuantization reads the snapshot's quantization metadata and
+// validates it against the supported set. It fails fast on unsupported
+// values so callers cannot silently misdecode vectors against stale or
+// malformed metadata. An empty / missing key defaults to float32 via
+// readMetadataValueOptional, which then passes normalizeQuantization.
+func (s *Snapshot) resolveQuantization(ctx context.Context) (string, error) {
+	raw, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
 	if err != nil {
-		return nil, fmt.Errorf("query sections: %w", err)
+		return "", err
 	}
-	defer func() { _ = rows.Close() }()
+	return normalizeQuantization(raw)
+}
 
-	result := make([]Section, 0)
-	for rows.Next() {
-		var (
-			section     Section
-			metadataRaw string
-			blob        []byte
-		)
-		scanArgs := []any{
-			&section.ChunkID,
-			&section.Ref,
-			&section.Kind,
-			&section.Title,
-			&section.SourceRef,
-			&section.Heading,
-			&section.Content,
-			&metadataRaw,
-		}
-		if query.IncludeEmbeddings {
-			scanArgs = append(scanArgs, &blob)
-		}
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("scan section: %w", err)
-		}
-		section.Metadata, err = unmarshalMetadata(section.Ref, metadataRaw)
+func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string) (Section, error) {
+	var (
+		section     Section
+		metadataRaw string
+		blob        []byte
+	)
+	scanArgs := []any{
+		&section.ChunkID,
+		&section.Ref,
+		&section.Kind,
+		&section.Title,
+		&section.SourceRef,
+		&section.Heading,
+		&section.Content,
+		&metadataRaw,
+	}
+	if includeEmbeddings {
+		scanArgs = append(scanArgs, &blob)
+	}
+	if err := rows.Scan(scanArgs...); err != nil {
+		return Section{}, fmt.Errorf("scan section: %w", err)
+	}
+	metadata, err := unmarshalMetadata(section.Ref, metadataRaw)
+	if err != nil {
+		return Section{}, err
+	}
+	section.Metadata = metadata
+	if includeEmbeddings {
+		section.Embedding, err = decodeVector(blob, quantization)
 		if err != nil {
-			return nil, err
+			return Section{}, fmt.Errorf("decode section embedding for %s: %w", section.Ref, err)
 		}
-		if query.IncludeEmbeddings {
-			section.Embedding, err = decodeVector(blob, quantization)
-			if err != nil {
-				return nil, fmt.Errorf("decode section embedding for %s: %w", section.Ref, err)
-			}
-		}
-		result = append(result, section)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate sections: %w", err)
-	}
-	return result, nil
+	return section, nil
 }
 
 // Search runs a hybrid text search (vector + FTS5) against the opened snapshot.
@@ -347,7 +374,7 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 		return nil, err
 	}
 
-	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	quantization, err := s.resolveQuantization(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +420,7 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 		query.Limit = 10
 	}
 
-	quantization, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
+	quantization, err := s.resolveQuantization(ctx)
 	if err != nil {
 		return nil, err
 	}
