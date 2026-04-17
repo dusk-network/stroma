@@ -384,7 +384,21 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 	}
 	defer func() { _ = db.Close() }()
 
-	cfg, err := resolveUpdateSessionConfig(ctx, db, normalizedAdded, options)
+	// Open the main update transaction before resolving session config so
+	// the v2→v3 migration — run from inside resolveUpdateSessionConfig —
+	// commits or rolls back atomically with the rest of the update. A
+	// failure at any later step (embedder error, ctx cancellation, insert
+	// failure) thus cannot leave the file permanently bumped to v3 with
+	// no corresponding update applied.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin update transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	cfg, err := resolveUpdateSessionConfig(ctx, tx, normalizedAdded, options)
 	if err != nil {
 		return nil, err
 	}
@@ -398,14 +412,6 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 		)
 		defer func() { _ = cfg.reuse.Close() }()
 	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin update transaction: %w", err)
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
 
 	result := &UpdateResult{
 		Path:                indexPath,
@@ -1469,43 +1475,25 @@ func hasTable(ctx context.Context, q queryContextRunner, name string) (bool, err
 // migrateV2ToV3InjectFault is a test-only seam that runs between the ALTER
 // and the metadata bump inside migrateV2ToV3. Production leaves it nil.
 // Tests set it to simulate a crash mid-migration and assert that the
-// BEGIN IMMEDIATE transaction rolls back cleanly.
+// enclosing transaction rolls back cleanly.
 var migrateV2ToV3InjectFault func() error
 
 // migrateV2ToV3 adds the context_prefix column to chunks and bumps the
-// stored schema_version metadata to "3" atomically. The ALTER and the
-// UPDATE run inside a BEGIN IMMEDIATE transaction on a single pinned
-// connection so a crash between them rolls back cleanly instead of leaving
-// the file with the new column but schema_version="2"; the column-add is
-// still idempotent (skipped if a prior run already applied it). Safe to
-// call on a snapshot that is already v3.
-func migrateV2ToV3(ctx context.Context, db *sql.DB) (err error) {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("migrate v2 to v3: acquire connection: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return fmt.Errorf("migrate v2 to v3: begin: %w", err)
-	}
-	committed := false
-	defer func() {
-		if committed {
-			return
-		}
-		// Use a fresh context so rollback still runs if ctx is already
-		// cancelled; ignore the rollback error because the outer err
-		// already describes the primary failure.
-		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
-	}()
-
-	hasPrefix, err := hasChunkColumn(ctx, conn, "context_prefix")
+// stored schema_version metadata to "3" on the provided transaction, so
+// the migration commits atomically with whatever surrounding work the
+// caller is running (today: Update's main tx). A crash between the ALTER
+// and the UPDATE — or a failure anywhere in the caller's transaction
+// afterwards — rolls back both statements instead of leaving the file
+// with the new column but schema_version="2". The column-add is
+// idempotent (skipped if a prior run already applied it) and the helper
+// is safe to call against a snapshot that is already v3.
+func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
+	hasPrefix, err := hasChunkColumn(ctx, tx, "context_prefix")
 	if err != nil {
 		return fmt.Errorf("probe chunks.context_prefix: %w", err)
 	}
 	if !hasPrefix {
-		if _, err := conn.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`ALTER TABLE chunks ADD COLUMN context_prefix TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("migrate v2 to v3: add chunks.context_prefix: %w", err)
 		}
@@ -1515,15 +1503,10 @@ func migrateV2ToV3(ctx context.Context, db *sql.DB) (err error) {
 			return fmt.Errorf("migrate v2 to v3: injected fault: %w", err)
 		}
 	}
-	if _, err := conn.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, schemaVersion); err != nil {
 		return fmt.Errorf("migrate v2 to v3: bump schema_version: %w", err)
 	}
-
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-		return fmt.Errorf("migrate v2 to v3: commit: %w", err)
-	}
-	committed = true
 	return nil
 }
 
@@ -1593,8 +1576,8 @@ func validateUpdateInputs(added []corpus.Record, removed []string) error {
 	return nil
 }
 
-func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.Record, options UpdateOptions) (sessionConfig, error) {
-	schema, err := readMetadataValue(ctx, db, "schema_version")
+func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.Record, options UpdateOptions) (sessionConfig, error) {
+	schema, err := readMetadataValue(ctx, tx, "schema_version")
 	if err != nil {
 		return sessionConfig{}, err
 	}
@@ -1602,10 +1585,12 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 	switch trimmedSchema {
 	case prevSchemaVersion:
 		// Migrate v2 → v3 in place so existing indexes stay updatable
-		// after this library upgrade. migrateV2ToV3 wraps the column
-		// add and the schema_version bump in a single BEGIN IMMEDIATE
-		// transaction, so a crash between them rolls back cleanly.
-		if err := migrateV2ToV3(ctx, db); err != nil {
+		// after this library upgrade. migrateV2ToV3 runs against the
+		// caller's transaction, so the column add and the
+		// schema_version bump commit atomically with the rest of
+		// Update; any later failure rolls everything back, preventing
+		// a failed update from stranding the file at v3 on disk.
+		if err := migrateV2ToV3(ctx, tx); err != nil {
 			return sessionConfig{}, err
 		}
 	case schemaVersion:
@@ -1614,11 +1599,11 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 		return sessionConfig{}, fmt.Errorf("%w: index=%q update=%q", ErrUnsupportedSchemaVersion, trimmedSchema, schemaVersion)
 	}
 
-	embedderFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
+	embedderFingerprint, err := readMetadataValue(ctx, tx, "embedder_fingerprint")
 	if err != nil {
 		return sessionConfig{}, err
 	}
-	dimensionValue, err := readMetadataValue(ctx, db, "embedder_dimension")
+	dimensionValue, err := readMetadataValue(ctx, tx, "embedder_dimension")
 	if err != nil {
 		return sessionConfig{}, err
 	}
@@ -1627,7 +1612,7 @@ func resolveUpdateSessionConfig(ctx context.Context, db *sql.DB, added []corpus.
 		return sessionConfig{}, fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
 	}
 
-	quantization, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
+	quantization, err := readMetadataValueOptional(ctx, tx, "quantization", store.QuantizationFloat32)
 	if err != nil {
 		return sessionConfig{}, err
 	}

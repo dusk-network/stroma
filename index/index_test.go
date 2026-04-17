@@ -1917,9 +1917,9 @@ func TestMigrateV2ToV3IsCrashSafe(t *testing.T) {
 		t.Fatalf("Update() err = %v, want wraps injected fault", err)
 	}
 
-	// The BEGIN IMMEDIATE transaction must roll back both the ALTER and the
-	// UPDATE, so the snapshot is back to a pristine v2 (no context_prefix
-	// column yet and schema_version still "2").
+	// Update's main transaction must roll back both the ALTER and the
+	// schema_version bump, so the snapshot is back to a pristine v2 (no
+	// context_prefix column yet and schema_version still "2").
 	checkDB, err := store.OpenReadOnlyContext(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadOnlyContext() error = %v", err)
@@ -1969,6 +1969,99 @@ func TestMigrateV2ToV3IsCrashSafe(t *testing.T) {
 	}
 	if stats.SchemaVersion != schemaVersion {
 		t.Fatalf("SchemaVersion = %q after retry, want %q", stats.SchemaVersion, schemaVersion)
+	}
+}
+
+// failingEmbedder mirrors the fingerprint and dimension of the wrapped
+// fixture so it passes resolveUpdateSessionConfig's compatibility checks,
+// but returns err from EmbedDocuments. Used to drive a post-migration
+// failure in TestUpdateFailureAfterMigrationRollsBackSchema.
+type failingEmbedder struct {
+	inner embed.Embedder
+	err   error
+}
+
+func (f failingEmbedder) Fingerprint() string { return f.inner.Fingerprint() }
+func (f failingEmbedder) Dimension(ctx context.Context) (int, error) {
+	return f.inner.Dimension(ctx)
+}
+func (f failingEmbedder) EmbedDocuments(context.Context, []string) ([][]float64, error) {
+	return nil, f.err
+}
+func (f failingEmbedder) EmbedQueries(context.Context, []string) ([][]float64, error) {
+	return nil, f.err
+}
+
+func TestUpdateFailureAfterMigrationRollsBackSchema(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV2(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
+	}
+
+	// Drive a failure AFTER resolveUpdateSessionConfig has already run
+	// migrateV2ToV3 on the outer tx, by failing the embedder when Update
+	// tries to embed the new record. The tx must roll back both the
+	// schema bump and the half-written update, leaving the file at v2.
+	embedErr := errors.New("simulated embedder failure")
+	broken := failingEmbedder{inner: fixture, err: embedErr}
+
+	_, err = Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: broken,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded despite failing embedder, want failure")
+	}
+	if !errors.Is(err, embedErr) {
+		t.Fatalf("Update() err = %v, want wraps embedder failure", err)
+	}
+
+	checkDB, err := store.OpenReadOnlyContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnlyContext() error = %v", err)
+	}
+	defer func() { _ = checkDB.Close() }()
+	schema, err := readMetadataValue(context.Background(), checkDB, "schema_version")
+	if err != nil {
+		t.Fatalf("readMetadataValue() error = %v", err)
+	}
+	if strings.TrimSpace(schema) != prevSchemaVersion {
+		t.Fatalf("schema_version = %q after failed Update, want %q; migration leaked past Update's rollback",
+			schema, prevSchemaVersion)
+	}
+	hasPrefix, err := hasChunkColumn(context.Background(), checkDB, "context_prefix")
+	if err != nil {
+		t.Fatalf("hasChunkColumn() error = %v", err)
+	}
+	if hasPrefix {
+		t.Fatal("context_prefix column present after failed Update; ALTER leaked past rollback")
 	}
 }
 
