@@ -57,3 +57,53 @@ func TestFingerprintIsOrderIndependent(t *testing.T) {
 		t.Fatalf("Fingerprint() changed with record order")
 	}
 }
+
+// TestFingerprintFromPairsMatchesRecords locks byte-identity between the
+// record-based and pair-based digests for already-normalized records — the
+// contract finalizeUpdate relies on when it reads only (ref, content_hash) to
+// recompute ContentFingerprint. If this regresses, every persisted
+// ContentFingerprint disagrees with what callers recompute from their records.
+func TestFingerprintFromPairsMatchesRecords(t *testing.T) {
+	t.Parallel()
+
+	raw := []Record{
+		{Ref: "alpha", Kind: "doc", SourceRef: "file://alpha.md", BodyFormat: FormatMarkdown, BodyText: "alpha body", Metadata: map[string]string{"k": "v"}},
+		{Ref: "bravo", Kind: DefaultKind, SourceRef: "bravo", BodyFormat: FormatPlaintext, BodyText: "bravo body"},
+		{Ref: "charlie", Kind: "note", SourceRef: "charlie", BodyFormat: FormatMarkdown, BodyText: ""},
+	}
+
+	normalized := make([]Record, 0, len(raw))
+	pairs := make([]RefHash, 0, len(raw))
+	for _, r := range raw {
+		n, err := r.Normalized()
+		if err != nil {
+			t.Fatalf("Normalized(%q) error = %v", r.Ref, err)
+		}
+		normalized = append(normalized, n)
+		pairs = append(pairs, RefHash{Ref: n.Ref, ContentHash: n.ContentHash})
+	}
+
+	want := Fingerprint(normalized)
+	got := FingerprintFromPairs(pairs)
+	if got != want {
+		t.Fatalf("FingerprintFromPairs = %q, want %q (must be byte-identical to Fingerprint for normalized records)", got, want)
+	}
+}
+
+func TestFingerprintFromPairsSkipsEmpty(t *testing.T) {
+	t.Parallel()
+
+	pairs := []RefHash{
+		{Ref: "alpha", ContentHash: "a"},
+		{Ref: "   ", ContentHash: "b"},
+		{Ref: "gamma", ContentHash: "  "},
+		{Ref: "bravo", ContentHash: "c"},
+	}
+	kept := []RefHash{
+		{Ref: "alpha", ContentHash: "a"},
+		{Ref: "bravo", ContentHash: "c"},
+	}
+	if FingerprintFromPairs(pairs) != FingerprintFromPairs(kept) {
+		t.Fatal("FingerprintFromPairs did not skip pairs with empty Ref or ContentHash")
+	}
+}

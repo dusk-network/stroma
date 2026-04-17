@@ -121,6 +121,31 @@ func Fingerprint(records []Record) string {
 	return fingerprint(parts)
 }
 
+// RefHash is the minimal (Ref, ContentHash) pair needed to compute a corpus
+// fingerprint without materializing full record bodies.
+type RefHash struct {
+	Ref         string
+	ContentHash string
+}
+
+// FingerprintFromPairs returns the same digest as Fingerprint([]Record) for
+// already-normalized (Ref, ContentHash) inputs. Pairs with an empty Ref or
+// ContentHash (after trimming) are skipped, mirroring Fingerprint's silent-skip
+// on records that fail Normalized(). Callers holding raw Record values must
+// use Fingerprint to preserve Normalized() defaults and validation.
+func FingerprintFromPairs(pairs []RefHash) string {
+	parts := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		ref := strings.TrimSpace(p.Ref)
+		hash := strings.TrimSpace(p.ContentHash)
+		if ref == "" || hash == "" {
+			continue
+		}
+		parts = append(parts, ref+":"+hash)
+	}
+	return fingerprint(parts)
+}
+
 func normalizeMetadata(metadata map[string]string) map[string]string {
 	if len(metadata) == 0 {
 		return nil
