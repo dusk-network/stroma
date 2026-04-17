@@ -415,6 +415,9 @@ func TestOpenAIChunksOverMaxBatchSize(t *testing.T) {
 	for _, req := range received.requests {
 		flat = append(flat, req.inputs...)
 	}
+	if len(flat) != len(inputs) {
+		t.Fatalf("flattened captured inputs has %d entries, want %d (batching dropped or duplicated an input)", len(flat), len(inputs))
+	}
 	for i, want := range inputs {
 		if flat[i] != want {
 			t.Fatalf("flattened[%d] = %q, want %q (order preservation across batches)", i, flat[i], want)
