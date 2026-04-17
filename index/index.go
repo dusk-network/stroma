@@ -27,10 +27,14 @@ type BuildOptions struct {
 	Path string
 
 	// ReuseFromPath points at an existing Stroma snapshot whose embeddings
-	// should be reused when record content is unchanged. The reuse snapshot
-	// is loaded fully into memory (roughly embedding-size bytes per stored
-	// chunk); at very large corpora this can be a meaningful RAM cost.
-	// Leave empty to disable reuse.
+	// should be reused at the section level: a new section reuses its
+	// stored embedding whenever its title, heading, and body match a
+	// section already present in the prior snapshot. Records that are
+	// fully unchanged are the maximal case, but sections carried over
+	// from an edited record still reuse their embeddings. The reuse
+	// snapshot is loaded fully into memory (roughly embedding-size bytes
+	// per stored chunk); at very large corpora this can be a meaningful
+	// RAM cost. Leave empty to disable reuse.
 	ReuseFromPath string
 
 	Embedder embed.Embedder
