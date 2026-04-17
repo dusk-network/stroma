@@ -116,10 +116,29 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
 	}
+	// Verify the chunks table shape agrees with the accept-listed
+	// schema_version before we cache hasContextPrefix. Any divergence —
+	// metadata says v3 but the column is missing, or metadata says v2 but
+	// the column is present — means read paths would silently misread
+	// (empty prefixes on a v3 file, or random column data on a v2 file).
+	// Fail at open time instead of deferring to a cryptic Sections() error
+	// or, worse, silent empty reads. This is a one-time PRAGMA per handle,
+	// not per Sections() call.
+	expectContextPrefix := schemaHasContextPrefix(trimmedSchema)
+	hasColumn, err := hasChunkColumn(ctx, db, "context_prefix")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: probe chunks.context_prefix: %w", path, err)
+	}
+	if hasColumn != expectContextPrefix {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: schema_version=%q but chunks.context_prefix presence=%t (want %t); snapshot metadata and table shape disagree",
+			path, trimmedSchema, hasColumn, expectContextPrefix)
+	}
 	return &Snapshot{
 		path:             path,
 		db:               db,
-		hasContextPrefix: schemaHasContextPrefix(trimmedSchema),
+		hasContextPrefix: expectContextPrefix,
 	}, nil
 }
 
