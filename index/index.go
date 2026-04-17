@@ -1638,11 +1638,6 @@ var migrateV3ToV4BatchSize = 1000
 // snapshot already at v4 (a no-op second pass re-hashes to the same
 // values, then the metadata update is a same-value re-apply).
 func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error {
-	type rehashed struct {
-		ref  string
-		hash string
-	}
-
 	var lastRef string
 	for {
 		batch, err := migrateV3ToV4ReadBatch(ctx, tx, lastRef, migrateV3ToV4BatchSize)
