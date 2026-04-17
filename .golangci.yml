@@ -19,11 +19,7 @@ linters:
     - revive
   settings:
     gocyclo:
-      # The Rebuild orchestrator in index/index.go currently scores 38 against
-      # a guideline baseline of 20. Refactoring it into named phases per
-      # guideline §3.2 is tracked as follow-up; keeping the limit at 40 here
-      # preserves the gate for new code without blocking the lint rollout.
-      min-complexity: 40
+      min-complexity: 20
     gocritic:
       enabled-tags:
         - diagnostic
