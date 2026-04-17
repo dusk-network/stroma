@@ -1080,11 +1080,18 @@ const matryoshkaPrefilterMultiplier = 3
 // the truncated dim is meaningfully smaller than the stored dim AND the
 // embedder was trained with MRL so the truncated prefix preserves
 // ranking. For non-MRL embedders this is actively harmful.
-func buildMatryoshkaSearchSQL(limit int, kinds []string, queryBlob []byte, searchDim int) (querySQL string, args []any) {
+func buildMatryoshkaSearchSQL(limit int, kinds []string, queryBlob []byte, searchDim int) (querySQL string, args []any, err error) {
 	// Truncate the full-dim float32 query blob to the first searchDim floats.
 	// The stored vectors are sliced in SQL via vec_slice, keeping the
-	// representation on both sides identical.
-	truncatedQuery := queryBlob[:searchDim*4]
+	// representation on both sides identical. Guard the slice explicitly
+	// so a misbehaving embedder that returns fewer dims than the snapshot
+	// was built with surfaces a clear error instead of panicking on the
+	// out-of-bounds reslice.
+	needed := searchDim * 4
+	if len(queryBlob) < needed {
+		return "", nil, fmt.Errorf("query vector blob has %d bytes, need at least %d for SearchDimension=%d", len(queryBlob), needed, searchDim)
+	}
+	truncatedQuery := queryBlob[:needed]
 	prefilterLimit := limit * matryoshkaPrefilterMultiplier
 
 	var builder strings.Builder
@@ -1135,7 +1142,7 @@ JOIN records r ON r.ref = c.record_ref
 ORDER BY distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
 	args = append(args, searchDim, truncatedQuery, prefilterLimit, queryBlob, limit)
-	return builder.String(), args
+	return builder.String(), args, nil
 }
 
 func ensureExistingIndex(path string) error {

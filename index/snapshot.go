@@ -510,7 +510,10 @@ func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float
 	var sqlText string
 	var args []any
 	if searchDimension > 0 {
-		sqlText, args = buildMatryoshkaSearchSQL(limit, kinds, queryBlob, searchDimension)
+		sqlText, args, err = buildMatryoshkaSearchSQL(limit, kinds, queryBlob, searchDimension)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		sqlText, args = buildSearchSQL(SearchQuery{
 			Limit: limit,

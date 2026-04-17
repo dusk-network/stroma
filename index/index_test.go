@@ -1905,14 +1905,21 @@ func TestSearchMatryoshkaTruncatedPrefilterRescoresAtFullDim(t *testing.T) {
 	for _, hit := range baseline {
 		baselineScores[hit.ChunkID] = hit.Score
 	}
+	// The baseline uses the vec0 MATCH path and the Matryoshka path uses
+	// vec_distance_cosine: both compute cosine over the same stored
+	// float32 vector, but the two sqlite-vec entry points do not
+	// guarantee bit-identical floating-point results. Compare within a
+	// small tolerance so the test pins semantic equivalence without
+	// depending on internal arithmetic order.
+	const cosineTolerance = 1e-6
 	for _, hit := range truncated {
 		want, ok := baselineScores[hit.ChunkID]
 		if !ok {
 			continue
 		}
-		if hit.Score != want {
-			t.Fatalf("chunk %d Matryoshka score = %v, baseline = %v (full-dim rescore must match)",
-				hit.ChunkID, hit.Score, want)
+		if diff := hit.Score - want; diff > cosineTolerance || diff < -cosineTolerance {
+			t.Fatalf("chunk %d Matryoshka score = %v, baseline = %v (full-dim rescore must match within %g)",
+				hit.ChunkID, hit.Score, want, cosineTolerance)
 		}
 	}
 
