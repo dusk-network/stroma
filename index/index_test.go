@@ -2009,6 +2009,77 @@ func TestOpenSnapshotRejectsUnknownSchemaVersion(t *testing.T) {
 	}
 }
 
+// TestSearchSucceedsOnSnapshotWithoutFTSChunks proves the OpenSnapshot
+// fts_chunks probe and the cached Snapshot.hasFTS short-circuit in
+// searchFTS handle a snapshot that genuinely lacks the FTS virtual table.
+// The previous fragile detection lived behind a strings.Contains check on
+// the SQLite error message; this test exercises the new cached-flag path
+// against a snapshot built without fts_chunks (drop it post-Rebuild to
+// simulate the pre-hybrid-search shape) and asserts that:
+//   - OpenSnapshot still accepts the file,
+//   - Snapshot.hasFTS is false on the resulting handle,
+//   - Search returns vector-only results without bubbling up "no such
+//     table: fts_chunks".
+func TestSearchSucceedsOnSnapshotWithoutFTSChunks(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       testNoteKind,
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `DROP TABLE fts_chunks`); err != nil {
+		_ = db.Close()
+		t.Fatalf("drop fts_chunks: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	snap, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() on snapshot without fts_chunks: %v", err)
+	}
+	t.Cleanup(func() { _ = snap.Close() })
+	if snap.hasFTS {
+		t.Fatal("Snapshot.hasFTS = true after dropping fts_chunks, want false")
+	}
+
+	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
+		Text:     "alpha content",
+		Limit:    5,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search() on snapshot without fts_chunks: %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("Search() returned 0 hits, want at least one vector-only hit")
+	}
+	if hits[0].Ref != testAlphaRef {
+		t.Fatalf("Search() top hit Ref = %q, want %q", hits[0].Ref, testAlphaRef)
+	}
+}
+
 func TestMigrateV2ToV3IsCrashSafe(t *testing.T) {
 	// Not parallel: mutates the package-level migrateV2ToV3InjectFault hook.
 
