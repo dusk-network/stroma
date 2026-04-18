@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -439,18 +441,25 @@ func TestOpenAIMaxBatchSizeDefaultsToConservativeValue(t *testing.T) {
 }
 
 // TestOpenAIMultiBatchBoundsTotalTimeout verifies that a multi-batch
-// EmbedDocuments call respects the configured Timeout as a total
-// budget, not per-request. Before the fix, http.Client.Timeout
-// applied per HTTP request, so a 10-batch call could consume up to
-// 10 × Timeout before tripping — a behaviour regression vs the
-// pre-batching single-request contract where Timeout bounded the
-// whole call. This test sends 4 batches against a slow server; if
-// the total-timeout guard weren't in place, the operation would
-// succeed; with the guard, it must fail before all batches complete.
+// EmbedDocuments call is still bounded by a total wall-clock budget
+// derived from the configured Timeout. Since #63, that budget is
+// `batches × Timeout` (so each sub-request gets a full Timeout window
+// without later batches starving), not a single flat Timeout — but the
+// call still fails within a bounded total, not unboundedly. This test
+// sends 4 batches against a server that delays each request well
+// beyond the per-request Timeout; pre-#63 the flat deadline tripped
+// after ~1 batch, post-#63 it trips after ~batches×Timeout of work.
+// Either way, EmbedDocuments must fail with a deadline error without
+// running indefinitely.
 func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 	t.Parallel()
 
-	const perRequestDelay = 200 * time.Millisecond
+	const (
+		timeout         = 200 * time.Millisecond
+		perRequestDelay = 500 * time.Millisecond
+		batchSize       = 2
+		inputCount      = 8
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Input []string `json:"input"`
@@ -459,7 +468,11 @@ func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		time.Sleep(perRequestDelay)
+		select {
+		case <-time.After(perRequestDelay):
+		case <-r.Context().Done():
+			return
+		}
 		out := make([]map[string]any, len(body.Input))
 		for i := range body.Input {
 			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
@@ -469,26 +482,31 @@ func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 4 batches × 200ms per batch = 800ms of server work if all ran;
-	// the 300ms Timeout bounds the whole call, so ~2 batches can land
-	// before the deadline fires.
 	e := NewOpenAI(OpenAIConfig{
 		BaseURL:      server.URL + "/v1",
 		Model:        "mami",
-		Timeout:      300 * time.Millisecond,
-		MaxBatchSize: 2,
+		Timeout:      timeout,
+		MaxBatchSize: batchSize,
 	})
 	start := time.Now()
-	_, err := e.EmbedDocuments(context.Background(), []string{"a", "b", "c", "d", "e", "f", "g", "h"})
+	inputs := make([]string, inputCount)
+	for i := range inputs {
+		inputs[i] = "t" + strconv.Itoa(i)
+	}
+	_, err := e.EmbedDocuments(context.Background(), inputs)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("EmbedDocuments() succeeded on slow upstream, want deadline-exceeded error")
 	}
-	// Allow some slack for scheduling jitter; what we really care
-	// about is that we did not blow past the configured budget by
-	// a factor of (batch count).
-	if elapsed > 600*time.Millisecond {
-		t.Fatalf("EmbedDocuments() took %s, want bounded by total Timeout budget (~300ms + slack)", elapsed)
+
+	// Upper bound: the total budget is batches × Timeout plus
+	// scheduling jitter. If we blew past 2× the expected maximum,
+	// something (for example, a missing parent deadline) let the
+	// loop run unboundedly.
+	batches := (inputCount + batchSize - 1) / batchSize
+	maxBudget := time.Duration(batches) * timeout
+	if elapsed > 2*maxBudget {
+		t.Fatalf("EmbedDocuments() took %s, want bounded by batches*Timeout (~%s + slack)", elapsed, maxBudget)
 	}
 }
 
@@ -521,4 +539,108 @@ func fillVector(dim int) []float64 {
 		out[i] = float64(i) + 0.1
 	}
 	return out
+}
+
+// TestOpenAIMultiBatchDeadlineScalesWithBatchCount locks the #63 fix:
+// the overall deadline imposed on a multi-batch EmbedDocuments call
+// must scale with the batch count, so later batches are not starved by
+// the cumulative time spent on earlier ones. Pre-#63, EmbedDocuments
+// set one flat `time.Now().Add(Timeout)` deadline around the whole
+// batch loop. Each individual sub-request still fit inside the
+// per-request Timeout, but their *sum* exceeded it — so the shared
+// context deadline tripped mid-loop and later sub-requests failed
+// with `context deadline exceeded` even though every request was
+// individually well-behaved.
+//
+// The test configuration is tuned to discriminate the two shapes:
+// every batch takes ~65ms (well under the 150ms per-request Timeout
+// enforced by http.Client.Timeout), and the three batches sum to
+// ~195ms — strictly greater than Timeout, strictly less than the
+// post-fix budget of 3*Timeout = 450ms.
+func TestOpenAIMultiBatchDeadlineScalesWithBatchCount(t *testing.T) {
+	t.Parallel()
+
+	const (
+		timeout      = 150 * time.Millisecond
+		perBatchWork = 65 * time.Millisecond
+		dimension    = 4
+	)
+
+	var (
+		mu        sync.Mutex
+		seen      int
+		allInputs [][]string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/embeddings" {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		seen++
+		allInputs = append(allInputs, append([]string(nil), body.Input...))
+		mu.Unlock()
+
+		// Every batch takes the same modest amount of server-side
+		// work — individually well within http.Client.Timeout, but
+		// three of them sum to more than one Timeout window. Pre-#63
+		// the shared ctx deadline trips on the second or third
+		// request; post-#63 the scaled deadline covers all three.
+		select {
+		case <-time.After(perBatchWork):
+		case <-r.Context().Done():
+			return
+		}
+
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{
+				"embedding": fillVector(dimension),
+				"index":     i,
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer server.Close()
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:      server.URL + "/v1",
+		Model:        "mami",
+		Timeout:      timeout,
+		MaxBatchSize: 2,
+	})
+
+	inputs := []string{"a", "b", "c", "d", "e", "f"}
+	vectors, err := e.EmbedDocuments(context.Background(), inputs)
+	if err != nil {
+		t.Fatalf("EmbedDocuments() error = %v (multi-batch deadline should scale with batch count)", err)
+	}
+	if len(vectors) != len(inputs) {
+		t.Fatalf("len(vectors) = %d, want %d", len(vectors), len(inputs))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if seen != 3 {
+		t.Fatalf("server saw %d requests, want 3 (batches of 2/2/2)", seen)
+	}
+	flat := make([]string, 0, len(inputs))
+	for _, batch := range allInputs {
+		flat = append(flat, batch...)
+	}
+	for i, want := range inputs {
+		if flat[i] != want {
+			t.Fatalf("flattened[%d] = %q, want %q (ordering broke across scaled deadline)", i, flat[i], want)
+		}
+	}
 }
