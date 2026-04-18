@@ -40,13 +40,13 @@ Stroma does not own:
   - `Record` is the neutral artifact model.
   - `NewRecord(ref, title, body)` covers the common construction path.
   - `Record.Normalize()` fills safe defaults and computes a content hash when absent. `Record.Normalized()` is kept as a deprecated alias; `Validate()` remains exported but callers should run `Normalize` first.
-  - `Fingerprint` / `FingerprintFromPairs` summarize the full indexed corpus deterministically and return an error on pathological inputs (robust against injective-encoding collisions that earlier versions admitted silently).
+  - `Fingerprint` / `FingerprintFromPairs` summarize the full indexed corpus deterministically and return an error on invalid inputs — records that cannot be normalized, or pairs with empty `Ref` / `ContentHash`. The injective encoding guarantee comes from `HashRecord`'s serialization, not from runtime collision detection.
 
 - `chunk`
   - `Policy` is the chunking contract: `Chunk(ctx, Record) ([]SectionWithLineage, error)`. Every returned section is tagged with an optional parent index so hierarchical policies can persist parent/leaf lineage.
   - `MarkdownPolicy` (default) reproduces the pre-1.0 heading-aware flat pipeline byte-for-byte.
   - `KindRouterPolicy` dispatches to a per-`Kind` sub-policy.
-  - `LateChunkPolicy` emits a parent section per record plus leaf sections underneath.
+  - `LateChunkPolicy` emits a parent span per heading-aware section, then leaf sub-sections beneath each parent; it may skip leaf emission when a parent already fits the child token budget.
   - `MarkdownWithOptions` returns `ErrTooManySections` when the body exceeds the caller's `MaxSections` cap (DoS guard).
 
 - `embed`
@@ -58,7 +58,7 @@ Stroma does not own:
 - `store`
   - validates that SQLite and `sqlite-vec` are usable
   - opens read-only and read-write handles consistently
-  - `QuantizationFloat32` (default), `QuantizationInt8` (4× smaller, minor precision loss), and `QuantizationBinary` (32× smaller via 1-bit sign packing; a companion full-precision table feeds the rescore pass)
+  - `QuantizationFloat32` (default), `QuantizationInt8` (4× smaller, minor precision loss), and `QuantizationBinary` (1-bit sign-packed `vec0` prefilter that is 32× smaller than float32 for that representation; the companion `chunks_vec_full` table retains full precision for cosine rescoring, so total snapshot size is not 32× smaller)
   - translates embeddings to and from `sqlite-vec` blob format for each quantization mode
 
 - `index`
@@ -66,7 +66,7 @@ Stroma does not own:
   - `Update` mutates an existing snapshot in place, deleting removed records and re-embedding only changed sections; it chains forward schema migrations v2 → v3 → v4 → v5 in the same transaction.
   - Embedding reuse is keyed on `(title, heading, body, context_prefix)` so both plain and contextual snapshots benefit.
   - `Snapshot` (from `OpenSnapshot`) exposes long-lived `Stats`, `Records`, `Sections`, `Search` (hybrid), `SearchVector` (dense only), and `ExpandContext` (parent + neighbor window).
-  - Search retrieval paths run through `FusionStrategy` — `DefaultFusion()` returns `RRFFusion{K:60, PreserveSingleArmScore:true}`, byte-identical to the pre-#17 hardcoded RRF on every pre-change shape. Custom strategies receive `RetrievalArm{Name, Hits, Available, Err}` for each arm and must attach `HitProvenance` to every returned hit.
+  - Search retrieval paths run through `FusionStrategy` — `DefaultFusion()` returns `RRFFusion{K:60, PreserveSingleArmScore:true}`. Ordering matches the pre-#17 hardcoded RRF on every pre-change shape; `Score` matches on the multi-arm hybrid path, and on single-arm paths (legacy snapshots without `fts_chunks`, or vector-empty + FTS-non-empty) `DefaultFusion` preserves the arm-native score instead of rewriting to RRF. Callers that need both values read them off `HitProvenance`. Custom strategies receive `RetrievalArm{Name, Hits, Available, Err}` for each arm and must attach `HitProvenance` to every returned hit.
   - `Reranker` optionally refines the fused shortlist; it sees the full `HitProvenance` so score-aware rerankers can weight per-arm evidence.
   - `SearchParams.SearchDimension` enables a truncated-prefix vector prefilter (Matryoshka) with full-dim cosine rescore; only valid on float32 snapshots.
   - `DefaultSearchLimit = 10` fills zero-value `Limit` fields.
@@ -99,7 +99,7 @@ Schema version is `"5"`. Snapshots produced by older versions of Stroma open rea
 | v4   | Update → v5              |
 | v5   | already current          |
 
-`OpenSnapshot` accepts v2–v5 read-only. The v4 → v5 step adds the `chunks.parent_chunk_id` column, a partial index on it, and the same-record triggers; the v3 → v4 step adds the `chunks.context_prefix` column.
+`OpenSnapshot` accepts v2–v5 read-only. The v2 → v3 step adds the `chunks.context_prefix` column; the v3 → v4 step re-hashes `records.content_hash` in place using the current `HashRecord` encoding (no DDL); the v4 → v5 step adds the `chunks.parent_chunk_id` column, a partial index on it, and the same-record triggers.
 
 The schema is product-neutral. There are no spec/document distinctions, no governance edges, and no transport-specific tables. Higher-order products should treat the snapshot as a Stroma-owned artifact and go through the library API instead of joining these tables directly.
 

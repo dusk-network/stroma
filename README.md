@@ -12,7 +12,7 @@ Stroma is for products that need a reusable text corpus layer with:
 - pluggable chunking strategies (`chunk.Policy` — `MarkdownPolicy` default, `KindRouterPolicy` for per-record-kind dispatch, `LateChunkPolicy` for parent/leaf hierarchy)
 - pluggable embedders (`Embedder` / `ContextualEmbedder`) with a deterministic fixture and an OpenAI-compatible HTTP embedder
 - hybrid retrieval: dense vector + FTS5, fused via a pluggable `FusionStrategy` (`RRFFusion` by default) with per-arm provenance surfaced to downstream rerankers
-- quantization knobs: `float32` (default), `int8` (4× smaller), `binary` (32× smaller via 1-bit sign packing with a full-precision rescore pass)
+- quantization knobs: `float32` (default), `int8` (4× smaller), `binary` (1-bit sign-packed `vec0` prefilter that is 32× smaller for the prefilter representation; full-precision vectors are retained in a companion table for cosine rescoring, so total snapshot size is not 32× smaller)
 - optional Matryoshka prefilter at a truncated dimension with full-dim cosine rescore (`SearchParams.SearchDimension`)
 - atomic rebuilds and incremental `Update` with embedding reuse at the section level, chaining schema migrations v2 → v3 → v4 → v5 in one transaction
 
