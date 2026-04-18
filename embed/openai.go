@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -58,8 +59,18 @@ const (
 // that need a redacted view should marshal cfg.String() or build a
 // dedicated view type.
 type OpenAIConfig struct {
-	BaseURL  string
-	Model    string
+	BaseURL string
+	Model   string
+
+	// Timeout bounds a single embeddings sub-request. For inputs that
+	// fit in a single batch (len(texts) <= MaxBatchSize) this is also
+	// the total wall-clock budget. For multi-batch calls the total
+	// budget is Timeout * ceil(len(texts)/MaxBatchSize) — each
+	// sub-request gets its own Timeout-sized window, and a slow early
+	// batch cannot starve later batches. A zero or negative value
+	// selects defaultOpenAITimeout (15s) at NewOpenAI time. Callers
+	// that want a tighter global cap should pass a ctx with their own
+	// deadline; the embedder honors whichever deadline trips first.
 	Timeout  time.Duration
 	APIToken string
 
@@ -210,16 +221,21 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		return e.embedBatch(ctx, purpose, texts)
 	}
 
-	// http.Client.Timeout applies per request, so a multi-batch call
-	// would otherwise be able to consume up to N*Timeout before the
-	// caller's budget trips — a behavior regression vs the pre-batching
-	// single-request call, where Timeout was the total budget. Derive
-	// an overall deadline here; context.WithDeadline respects any
-	// tighter caller-supplied deadline, so we never extend the window
-	// a caller already wanted to close earlier.
-	if e.config.Timeout > 0 {
+	// Derive an overall deadline that scales with batch count so every
+	// sub-request gets a full Timeout window. A single flat deadline
+	// (the pre-#63 shape) collapsed the entire loop under one Timeout:
+	// one slow early batch shrank the remaining budget and made later
+	// sub-requests fail with `context deadline exceeded` even though
+	// each individually fit inside Timeout. Scaling by batch count
+	// keeps the per-request budget honest while preserving an upper
+	// bound on total wall time for callers who rely on Timeout to
+	// bound batch runs. context.WithDeadline honors any tighter
+	// caller-supplied deadline, so callers that want a smaller global
+	// cap pass it via ctx.
+	batches := (len(texts) + batchSize - 1) / batchSize
+	if e.config.Timeout > 0 && batches > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(e.config.Timeout))
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(scaledMultiBatchBudget(e.config.Timeout, batches)))
 		defer cancel()
 	}
 
@@ -243,6 +259,25 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		result = append(result, vectors...)
 	}
 	return result, nil
+}
+
+// scaledMultiBatchBudget returns perRequest * batches, saturating at
+// math.MaxInt64 (~292 years) instead of wrapping. Without this guard a
+// caller-reachable combination of a large Timeout and a large batch
+// count (Timeout > MaxInt64 / batches) would overflow the int64 nanos
+// in time.Duration and yield a negative / tiny derived deadline that
+// cancels the call instantly. Saturating is effectively "no upper
+// bound" for practical purposes, which matches the caller's intent:
+// if they configured a huge Timeout they do not want batch scaling
+// to surprise them by collapsing it.
+func scaledMultiBatchBudget(perRequest time.Duration, batches int) time.Duration {
+	if batches <= 0 || perRequest <= 0 {
+		return perRequest
+	}
+	if int64(perRequest) > int64(math.MaxInt64)/int64(batches) {
+		return time.Duration(math.MaxInt64)
+	}
+	return perRequest * time.Duration(batches)
 }
 
 // embedBatch issues a single embeddings request. Callers guarantee
