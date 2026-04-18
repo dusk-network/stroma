@@ -7,10 +7,10 @@ Stroma is the shared substrate under higher-order products that need a neutral c
 Its job is narrow:
 
 1. normalize records into a stable internal shape
-2. chunk record bodies into retrievable sections
-3. delegate vector generation to an embedder
-4. persist records, chunks, vectors, and index metadata in SQLite
-5. open immutable local snapshots for typed reads and semantic search
+2. chunk record bodies into retrievable sections, optionally with parent/leaf lineage
+3. delegate vector generation to an embedder, optionally with a per-chunk context prefix
+4. persist records, chunks, vectors, FTS entries, and index metadata in SQLite
+5. open immutable local snapshots for typed reads, hybrid semantic search with per-arm provenance, and parent/neighbor context expansion
 
 Everything above that line belongs elsewhere.
 
@@ -20,10 +20,11 @@ Stroma owns:
 
 - canonical corpus records
 - content hashing and corpus fingerprints
-- Markdown chunking
-- embedding abstractions
-- SQLite plus `sqlite-vec` storage
-- semantic section retrieval
+- pluggable chunking (Markdown, kind-dispatched, hierarchical)
+- embedding abstractions (`Embedder`, `ContextualEmbedder`)
+- SQLite plus `sqlite-vec` storage across three quantization modes
+- hybrid semantic retrieval: dense vector + FTS5 fused via a pluggable `FusionStrategy` with per-hit `HitProvenance`
+- incremental `Update` with embedding reuse and forward-only schema migrations
 
 Stroma does not own:
 
@@ -37,41 +38,68 @@ Stroma does not own:
 
 - `corpus`
   - `Record` is the neutral artifact model.
-  - `Record.Normalized` fills safe defaults and computes a content hash when absent.
-  - `Fingerprint` summarizes the full indexed corpus deterministically.
+  - `NewRecord(ref, title, body)` covers the common construction path.
+  - `Record.Normalize()` fills safe defaults and computes a content hash when absent. `Record.Normalized()` is kept as a deprecated alias; `Validate()` remains exported but callers should run `Normalize` first.
+  - `Fingerprint` / `FingerprintFromPairs` summarize the full indexed corpus deterministically and return an error on pathological inputs (robust against injective-encoding collisions that earlier versions admitted silently).
 
 - `chunk`
-  - `Markdown` splits Markdown into heading-aware sections.
-  - Nested headings are flattened into a path-like heading string.
+  - `Policy` is the chunking contract: `Chunk(ctx, Record) ([]SectionWithLineage, error)`. Every returned section is tagged with an optional parent index so hierarchical policies can persist parent/leaf lineage.
+  - `MarkdownPolicy` (default) reproduces the pre-1.0 heading-aware flat pipeline byte-for-byte.
+  - `KindRouterPolicy` dispatches to a per-`Kind` sub-policy.
+  - `LateChunkPolicy` emits a parent section per record plus leaf sections underneath.
+  - `MarkdownWithOptions` returns `ErrTooManySections` when the body exceeds the caller's `MaxSections` cap (DoS guard).
 
 - `embed`
-  - `Embedder` is the only embedding contract the index depends on.
+  - `Embedder` is the minimum embedding contract the index depends on (`Fingerprint`, `Dimension`, `EmbedDocuments`, `EmbedQueries`).
+  - `ContextualEmbedder` embeds `Embedder` and adds `EmbedDocumentChunks` for implementations that want document-aware chunk vectors.
   - `Fixture` provides deterministic embeddings for tests and offline use.
-  - `OpenAI` provides a generic OpenAI-compatible HTTP embedder without product-layer env loading or diagnostics.
+  - `OpenAI` provides a generic OpenAI-compatible HTTP embedder without product-layer env loading or diagnostics. `OpenAIConfig.MaxBatchSize` caps per-request batch size; the parent deadline scales with batch count so a slow early batch cannot starve later ones. `APIToken` is redacted in `String`, `GoString`, and `LogValue` so logs cannot leak the secret.
 
 - `store`
   - validates that SQLite and `sqlite-vec` are usable
   - opens read-only and read-write handles consistently
-  - translates embeddings to and from `sqlite-vec` blob format
+  - `QuantizationFloat32` (default), `QuantizationInt8` (4× smaller, minor precision loss), and `QuantizationBinary` (32× smaller via 1-bit sign packing; a companion full-precision table feeds the rescore pass)
+  - translates embeddings to and from `sqlite-vec` blob format for each quantization mode
 
 - `index`
-  - rebuilds an index atomically
-  - reuses unchanged embeddings from a compatible previous snapshot when available
-  - persists index metadata such as schema version and embedder fingerprint
-  - exposes opened snapshots, stats, section/record readers, and semantic search
+  - `Rebuild` writes the index atomically via a staging file + rename.
+  - `Update` mutates an existing snapshot in place, deleting removed records and re-embedding only changed sections; it chains forward schema migrations v2 → v3 → v4 → v5 in the same transaction.
+  - Embedding reuse is keyed on `(title, heading, body, context_prefix)` so both plain and contextual snapshots benefit.
+  - `Snapshot` (from `OpenSnapshot`) exposes long-lived `Stats`, `Records`, `Sections`, `Search` (hybrid), `SearchVector` (dense only), and `ExpandContext` (parent + neighbor window).
+  - Search retrieval paths run through `FusionStrategy` — `DefaultFusion()` returns `RRFFusion{K:60, PreserveSingleArmScore:true}`, byte-identical to the pre-#17 hardcoded RRF on every pre-change shape. Custom strategies receive `RetrievalArm{Name, Hits, Available, Err}` for each arm and must attach `HitProvenance` to every returned hit.
+  - `Reranker` optionally refines the fused shortlist; it sees the full `HitProvenance` so score-aware rerankers can weight per-arm evidence.
+  - `SearchParams.SearchDimension` enables a truncated-prefix vector prefilter (Matryoshka) with full-dim cosine rescore; only valid on float32 snapshots.
+  - `DefaultSearchLimit = 10` fills zero-value `Limit` fields.
 
 ## On-Disk Schema
 
-The current schema is intentionally small:
+Schema version is `"5"`. Snapshots produced by older versions of Stroma open read-only and migrate to v5 atomically on the first `Update`.
 
 - `records`
-  - canonical normalized records
+  - canonical normalized records + metadata
 - `chunks`
-  - retrievable sections keyed to a record
+  - retrievable sections keyed to a record, with a `context_prefix` column for contextual retrieval and a `parent_chunk_id` column for hierarchical lineage. Same-record lineage is enforced at the storage layer via BEFORE INSERT / BEFORE UPDATE triggers that block cross-record parents.
 - `chunks_vec`
-  - `vec0` virtual table storing chunk embeddings
+  - `vec0` virtual table storing chunk embeddings. Column type is `float[N]`, `int8[N]`, or `bit[N]` depending on the snapshot's quantization.
+- `chunks_vec_full` (binary quantization only)
+  - full-precision companion feeding the cosine rescore pass over the hamming shortlist.
+- `fts_chunks`
+  - `fts5` virtual table over `(title, heading, content)` driving the FTS retrieval arm.
 - `metadata`
-  - schema version, embedder fingerprint, embedder dimension, content fingerprint, creation time
+  - schema version, embedder fingerprint, embedder dimension, content fingerprint, quantization mode, creation time.
+
+### Migration chain
+
+`Update` walks v2 → v3 → v4 → v5 inside one transaction, so older snapshots upgrade in place without a separate tool:
+
+| From | Path                     |
+|------|--------------------------|
+| v2   | Update → v3 → v4 → v5    |
+| v3   | Update → v4 → v5         |
+| v4   | Update → v5              |
+| v5   | already current          |
+
+`OpenSnapshot` accepts v2–v5 read-only. The v4 → v5 step adds the `chunks.parent_chunk_id` column, a partial index on it, and the same-record triggers; the v3 → v4 step adds the `chunks.context_prefix` column.
 
 The schema is product-neutral. There are no spec/document distinctions, no governance edges, and no transport-specific tables. Higher-order products should treat the snapshot as a Stroma-owned artifact and go through the library API instead of joining these tables directly.
 
