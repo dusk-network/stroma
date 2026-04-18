@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -234,7 +235,7 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 	batches := (len(texts) + batchSize - 1) / batchSize
 	if e.config.Timeout > 0 && batches > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(e.config.Timeout*time.Duration(batches)))
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(scaledMultiBatchBudget(e.config.Timeout, batches)))
 		defer cancel()
 	}
 
@@ -258,6 +259,25 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		result = append(result, vectors...)
 	}
 	return result, nil
+}
+
+// scaledMultiBatchBudget returns perRequest * batches, saturating at
+// math.MaxInt64 (~292 years) instead of wrapping. Without this guard a
+// caller-reachable combination of a large Timeout and a large batch
+// count (Timeout > MaxInt64 / batches) would overflow the int64 nanos
+// in time.Duration and yield a negative / tiny derived deadline that
+// cancels the call instantly. Saturating is effectively "no upper
+// bound" for practical purposes, which matches the caller's intent:
+// if they configured a huge Timeout they do not want batch scaling
+// to surprise them by collapsing it.
+func scaledMultiBatchBudget(perRequest time.Duration, batches int) time.Duration {
+	if batches <= 0 || perRequest <= 0 {
+		return perRequest
+	}
+	if int64(perRequest) > int64(math.MaxInt64)/int64(batches) {
+		return time.Duration(math.MaxInt64)
+	}
+	return perRequest * time.Duration(batches)
 }
 
 // embedBatch issues a single embeddings request. Callers guarantee

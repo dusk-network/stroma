@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -539,6 +540,64 @@ func fillVector(dim int) []float64 {
 		out[i] = float64(i) + 0.1
 	}
 	return out
+}
+
+// TestScaledMultiBatchBudgetSaturatesOnOverflow guards the overflow
+// case on the #63 deadline math. time.Duration is int64 nanoseconds
+// (max ~292 years); a caller-configured large Timeout combined with
+// a large batch count can make `Timeout * batches` wrap. The raw
+// multiplication would yield a negative or wildly smaller duration
+// that cancels the call immediately; the helper must clamp to
+// math.MaxInt64 so the derived deadline behaves like "effectively no
+// upper bound" instead.
+func TestScaledMultiBatchBudgetSaturatesOnOverflow(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		perRequest time.Duration
+		batches    int
+		wantMax    bool
+	}{
+		{"zero_batches_returns_perRequest", time.Hour, 0, false},
+		{"zero_timeout_returns_perRequest", 0, 10, false},
+		{"small_values_multiply_cleanly", time.Second, 10, false},
+		// int64 nanoseconds: MaxInt64 ≈ 9.22e18. One hour ≈ 3.6e12 ns.
+		// 3.6e12 * 3e6 ≈ 1.08e19 > MaxInt64 → overflow without the guard.
+		{"hour_times_three_million_overflows", time.Hour, 3_000_000, true},
+		// Extreme case: a year-long Timeout with modest batches also
+		// overflows quickly. One year ≈ 3.15e16 ns; 300 batches ≈ 9.45e18
+		// which is already on the edge of MaxInt64.
+		{"year_times_thousand_overflows", 365 * 24 * time.Hour, 1000, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := scaledMultiBatchBudget(tc.perRequest, tc.batches)
+			if got < 0 {
+				t.Fatalf("scaledMultiBatchBudget(%s, %d) = %s, want a non-negative duration (overflow wrapped into negative)",
+					tc.perRequest, tc.batches, got)
+			}
+			if tc.wantMax && got != time.Duration(math.MaxInt64) {
+				t.Fatalf("scaledMultiBatchBudget(%s, %d) = %s, want saturated math.MaxInt64",
+					tc.perRequest, tc.batches, got)
+			}
+			if !tc.wantMax {
+				// Identity paths (zero batches or zero timeout) return
+				// perRequest unchanged; the multiplying path returns
+				// perRequest * batches exactly.
+				want := tc.perRequest
+				if tc.batches > 0 && tc.perRequest > 0 {
+					want = tc.perRequest * time.Duration(tc.batches)
+				}
+				if got != want {
+					t.Fatalf("scaledMultiBatchBudget(%s, %d) = %s, want %s",
+						tc.perRequest, tc.batches, got, want)
+				}
+			}
+		})
+	}
 }
 
 // TestOpenAIMultiBatchDeadlineScalesWithBatchCount locks the #63 fix:
