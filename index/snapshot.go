@@ -27,6 +27,12 @@ type Snapshot struct {
 	// instead of running the query and pattern-matching on the SQLite
 	// "no such table" error string.
 	hasFTS bool
+	// hasParentChunkID records whether the snapshot carries the
+	// chunks.parent_chunk_id column added in schema v5 (#16). Read paths
+	// (notably ExpandContext) cache the presence at open time so legacy
+	// v2/v3/v4 snapshots degrade cleanly to flat-chunk semantics without
+	// an extra PRAGMA per call.
+	hasParentChunkID bool
 }
 
 // SnapshotSearchQuery defines one text search against an opened snapshot.
@@ -105,10 +111,10 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	// stored values as-is — so legacy v2 snapshots keep opening for Stats,
 	// Records, Sections, and Search against v1.0+ code. Only the Update
 	// path forces the content_hash algo bump via migrateSchemaToCurrent.
-	if trimmedSchema != schemaVersion && trimmedSchema != prevSchemaVersion && trimmedSchema != legacySchemaVersionV2 {
+	if trimmedSchema != schemaVersion && trimmedSchema != prevSchemaVersion && trimmedSchema != legacySchemaVersionV3 && trimmedSchema != legacySchemaVersionV2 {
 		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: %w: got %q, supported %q, %q, or %q",
-			path, ErrUnsupportedSchemaVersion, trimmedSchema, legacySchemaVersionV2, prevSchemaVersion, schemaVersion)
+		return nil, fmt.Errorf("open snapshot %s: %w: got %q, supported %q, %q, %q, or %q",
+			path, ErrUnsupportedSchemaVersion, trimmedSchema, legacySchemaVersionV2, legacySchemaVersionV3, prevSchemaVersion, schemaVersion)
 	}
 	// For binary snapshots, verify the full-precision companion table is
 	// complete at open time. Read paths rely on inner joins against
@@ -142,11 +148,27 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open snapshot %s: probe fts_chunks: %w", path, err)
 	}
+	// Same pattern as hasContextPrefix above: schema_version determines
+	// whether parent_chunk_id is present, but verify the table shape
+	// agrees so a malformed snapshot fails at open time instead of at
+	// the first ExpandContext call.
+	expectParentChunkID := schemaHasParentChunkID(trimmedSchema)
+	hasParentColumn, err := hasChunkColumn(ctx, db, "parent_chunk_id")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: probe chunks.parent_chunk_id: %w", path, err)
+	}
+	if hasParentColumn != expectParentChunkID {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: schema_version=%q but chunks.parent_chunk_id presence=%t (want %t); snapshot metadata and table shape disagree",
+			path, trimmedSchema, hasParentColumn, expectParentChunkID)
+	}
 	return &Snapshot{
 		path:             path,
 		db:               db,
 		hasContextPrefix: expectContextPrefix,
 		hasFTS:           hasFTS,
+		hasParentChunkID: expectParentChunkID,
 	}, nil
 }
 

@@ -1834,10 +1834,13 @@ func TestSchemaHasContextPrefixMapping(t *testing.T) {
 	t.Parallel()
 
 	if !schemaHasContextPrefix(schemaVersion) {
-		t.Fatalf("schemaHasContextPrefix(%q) = false, want true (v4 carries context_prefix)", schemaVersion)
+		t.Fatalf("schemaHasContextPrefix(%q) = false, want true (v5 carries context_prefix)", schemaVersion)
 	}
 	if !schemaHasContextPrefix(prevSchemaVersion) {
-		t.Fatalf("schemaHasContextPrefix(%q) = false, want true (v3 carries context_prefix)", prevSchemaVersion)
+		t.Fatalf("schemaHasContextPrefix(%q) = false, want true (v4 carries context_prefix)", prevSchemaVersion)
+	}
+	if !schemaHasContextPrefix(legacySchemaVersionV3) {
+		t.Fatalf("schemaHasContextPrefix(%q) = false, want true (v3 carries context_prefix)", legacySchemaVersionV3)
 	}
 	if schemaHasContextPrefix(legacySchemaVersionV2) {
 		t.Fatalf("schemaHasContextPrefix(%q) = true, want false (v2 predates context_prefix)", legacySchemaVersionV2)
@@ -1941,9 +1944,10 @@ func TestOpenSnapshotRejectsSchemaTableShapeDivergence(t *testing.T) {
 }
 
 // rewriteSnapshotToV2 converts a freshly-built snapshot into a pristine
-// v2 one by dropping the context_prefix column and rewinding
-// schema_version to "2", so the v2-chain-migration tests can run against
-// the same build surface that produced the snapshot in the first place.
+// v2 one by dropping the v3-era context_prefix and v5-era parent_chunk_id
+// columns and rewinding schema_version to "2", so the v2-chain-migration
+// tests can run against the same build surface that produced the snapshot
+// in the first place.
 func rewriteSnapshotToV2(path string) error {
 	db, err := store.OpenReadWriteContext(context.Background(), path)
 	if err != nil {
@@ -1951,8 +1955,55 @@ func rewriteSnapshotToV2(path string) error {
 	}
 	defer func() { _ = db.Close() }()
 	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_chunks_parent`,
+		`ALTER TABLE chunks DROP COLUMN parent_chunk_id`,
 		`ALTER TABLE chunks DROP COLUMN context_prefix`,
 		`UPDATE metadata SET value = '2' WHERE key = 'schema_version'`,
+	} {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rewriteSnapshotToV3 converts a freshly-built snapshot into a pristine
+// v3 one by dropping the v5-era parent_chunk_id column and rewinding
+// schema_version to "3", so the v3-targeted migration tests can run
+// against the same build surface that produced the snapshot in the first
+// place. The context_prefix column is preserved (v3 already had it).
+func rewriteSnapshotToV3(path string) error {
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_chunks_parent`,
+		`ALTER TABLE chunks DROP COLUMN parent_chunk_id`,
+		`UPDATE metadata SET value = '3' WHERE key = 'schema_version'`,
+	} {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rewriteSnapshotToV4 converts a freshly-built snapshot into a pristine
+// v4 one by dropping the v5-era parent_chunk_id column and rewinding
+// schema_version to "4". v4 carries context_prefix and the post-#39
+// content_hash encoding intact; only the lineage column is removed.
+func rewriteSnapshotToV4(path string) error {
+	db, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_chunks_parent`,
+		`ALTER TABLE chunks DROP COLUMN parent_chunk_id`,
+		`UPDATE metadata SET value = '4' WHERE key = 'schema_version'`,
 	} {
 		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
 			return err
@@ -2213,9 +2264,13 @@ func TestUpdateMigratesV3ToV4RehashesRecords(t *testing.T) {
 		t.Fatalf("Rebuild() error = %v", err)
 	}
 
-	// Simulate a legacy v3 snapshot: fake-old content_hash on every row
-	// (matches the "stored hashes were produced by the old encoding"
-	// state that a pre-1.0 v3 file would exhibit) and rewind schema_version.
+	// Simulate a legacy v3 snapshot: drop the v5-era parent_chunk_id
+	// column, fake-old content_hash on every row (matches the "stored
+	// hashes were produced by the old encoding" state that a pre-1.0 v3
+	// file would exhibit), and rewind schema_version.
+	if err := rewriteSnapshotToV3(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV3() error = %v", err)
+	}
 	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadWriteContext() error = %v", err)
@@ -2223,10 +2278,6 @@ func TestUpdateMigratesV3ToV4RehashesRecords(t *testing.T) {
 	if _, err := rwDB.ExecContext(context.Background(),
 		`UPDATE records SET content_hash = ?`, testLegacyV3HashSentinel); err != nil {
 		t.Fatalf("overwrite content_hash: %v", err)
-	}
-	if _, err := rwDB.ExecContext(context.Background(),
-		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, prevSchemaVersion); err != nil {
-		t.Fatalf("rewind schema_version: %v", err)
 	}
 	if err := rwDB.Close(); err != nil {
 		t.Fatalf("close rw db: %v", err)
@@ -2323,6 +2374,9 @@ func TestMigrateV3ToV4BatchesAcrossMultiplePasses(t *testing.T) {
 		t.Fatalf("Rebuild() error = %v", err)
 	}
 
+	if err := rewriteSnapshotToV3(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV3() error = %v", err)
+	}
 	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadWriteContext() error = %v", err)
@@ -2330,10 +2384,6 @@ func TestMigrateV3ToV4BatchesAcrossMultiplePasses(t *testing.T) {
 	if _, err := rwDB.ExecContext(context.Background(),
 		`UPDATE records SET content_hash = ?`, testLegacyV3HashSentinel); err != nil {
 		t.Fatalf("overwrite content_hash: %v", err)
-	}
-	if _, err := rwDB.ExecContext(context.Background(),
-		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, prevSchemaVersion); err != nil {
-		t.Fatalf("rewind schema_version: %v", err)
 	}
 	if err := rwDB.Close(); err != nil {
 		t.Fatalf("close rw db: %v", err)
@@ -2408,6 +2458,9 @@ func TestMigrateV3ToV4IsCrashSafe(t *testing.T) {
 
 	// Force v3 state with a known-bogus content_hash we can detect after
 	// rollback — the migration must not leak any UPDATE past the fault.
+	if err := rewriteSnapshotToV3(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV3() error = %v", err)
+	}
 	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadWriteContext() error = %v", err)
@@ -2415,10 +2468,6 @@ func TestMigrateV3ToV4IsCrashSafe(t *testing.T) {
 	if _, err := rwDB.ExecContext(context.Background(),
 		`UPDATE records SET content_hash = ?`, testLegacyV3HashSentinel); err != nil {
 		t.Fatalf("overwrite content_hash: %v", err)
-	}
-	if _, err := rwDB.ExecContext(context.Background(),
-		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, prevSchemaVersion); err != nil {
-		t.Fatalf("rewind schema_version: %v", err)
 	}
 	if err := rwDB.Close(); err != nil {
 		t.Fatalf("close rw db: %v", err)
@@ -2451,9 +2500,9 @@ func TestMigrateV3ToV4IsCrashSafe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readMetadataValue() error = %v", err)
 	}
-	if strings.TrimSpace(schema) != prevSchemaVersion {
+	if strings.TrimSpace(schema) != legacySchemaVersionV3 {
 		t.Fatalf("schema_version = %q after rolled-back v3→v4 migration, want %q",
-			schema, prevSchemaVersion)
+			schema, legacySchemaVersionV3)
 	}
 	var storedHash string
 	if err := checkDB.QueryRowContext(context.Background(),
@@ -2462,6 +2511,152 @@ func TestMigrateV3ToV4IsCrashSafe(t *testing.T) {
 	}
 	if storedHash != testLegacyV3HashSentinel {
 		t.Fatalf("content_hash = %q after rollback, want legacy sentinel preserved (rehash leaked past rollback)", storedHash)
+	}
+}
+
+// TestUpdateMigratesV4ToV5AddsParentChunkID verifies that when Update
+// runs against a freshly-built v4 snapshot (parent_chunk_id absent),
+// migrateV4ToV5 adds the column + index, bumps schema_version to v5, and
+// existing read paths continue to work byte-equivalent (the new column
+// is NULL on every existing row).
+func TestUpdateMigratesV4ToV5AddsParentChunkID(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	seed := []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+	if _, err := Rebuild(context.Background(), seed, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV4(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV4() error = %v", err)
+	}
+
+	// An Update with no changes still triggers the migration chain via
+	// resolveUpdateSessionConfig.
+	if _, err := Update(context.Background(), nil, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Update(v4→v5 migration) error = %v", err)
+	}
+
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.SchemaVersion != schemaVersion {
+		t.Fatalf("SchemaVersion = %q after migration, want %q", stats.SchemaVersion, schemaVersion)
+	}
+
+	checkDB, err := store.OpenReadOnlyContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnlyContext() error = %v", err)
+	}
+	defer func() { _ = checkDB.Close() }()
+
+	hasParent, err := hasChunkColumn(context.Background(), checkDB, "parent_chunk_id")
+	if err != nil {
+		t.Fatalf("hasChunkColumn() error = %v", err)
+	}
+	if !hasParent {
+		t.Fatal("chunks.parent_chunk_id missing after v4→v5 migration")
+	}
+
+	var nullCount, totalCount int
+	if err := checkDB.QueryRowContext(context.Background(),
+		`SELECT COUNT(*), SUM(CASE WHEN parent_chunk_id IS NULL THEN 1 ELSE 0 END) FROM chunks`).
+		Scan(&totalCount, &nullCount); err != nil {
+		t.Fatalf("count chunks: %v", err)
+	}
+	if totalCount == 0 {
+		t.Fatal("no chunks present after migration; sanity check failed")
+	}
+	if nullCount != totalCount {
+		t.Fatalf("parent_chunk_id non-NULL on %d/%d rows after migration, want all NULL (no policy emits parents in PR-A)",
+			totalCount-nullCount, totalCount)
+	}
+}
+
+// TestMigrateV4ToV5IsCrashSafe mirrors the v2→v3 / v3→v4 crash-safety
+// tests: if a fault fires between the ALTER + index-create and the
+// schema_version bump, the enclosing Update transaction must roll back
+// and leave the snapshot fully at v4 with no parent_chunk_id column.
+func TestMigrateV4ToV5IsCrashSafe(t *testing.T) {
+	// Not parallel: mutates the package-level migrateV4ToV5InjectFault hook.
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV4(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV4() error = %v", err)
+	}
+
+	injected := errors.New("simulated crash between ALTER and metadata bump")
+	migrateV4ToV5InjectFault = func() error { return injected }
+	t.Cleanup(func() { migrateV4ToV5InjectFault = nil })
+
+	_, err = Update(context.Background(), nil, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded with injected fault, want failure")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("Update() err = %v, want wraps injected fault", err)
+	}
+
+	checkDB, err := store.OpenReadOnlyContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnlyContext() error = %v", err)
+	}
+	defer func() { _ = checkDB.Close() }()
+
+	schema, err := readMetadataValue(context.Background(), checkDB, "schema_version")
+	if err != nil {
+		t.Fatalf("readMetadataValue() error = %v", err)
+	}
+	if strings.TrimSpace(schema) != prevSchemaVersion {
+		t.Fatalf("schema_version = %q after rolled-back v4→v5 migration, want %q",
+			schema, prevSchemaVersion)
+	}
+	hasParent, err := hasChunkColumn(context.Background(), checkDB, "parent_chunk_id")
+	if err != nil {
+		t.Fatalf("hasChunkColumn() error = %v", err)
+	}
+	if hasParent {
+		t.Fatal("parent_chunk_id column present after rolled-back v4→v5 migration; ALTER leaked past rollback")
 	}
 }
 
