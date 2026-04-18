@@ -35,6 +35,14 @@ func contextPrefixSelectExpr(hasContextPrefix bool) string {
 }
 
 // Snapshot is one opened Stroma index snapshot.
+//
+// Safe for concurrent use by multiple goroutines once returned from
+// OpenSnapshot: *sql.DB is goroutine-safe per the database/sql
+// contract, and all Snapshot read methods (Stats, Records, Sections,
+// Search, SearchVector, ExpandContext) invoke it through that
+// contract. Cached metadata fields (quantization, storedDimension,
+// hasFTS, …) are populated at open time and read-only thereafter, so
+// no additional synchronization is required around Snapshot itself.
 type Snapshot struct {
 	path string
 	db   *sql.DB
@@ -83,9 +91,16 @@ type SnapshotSearchQuery struct {
 
 // VectorSearchQuery defines one vector search against an opened snapshot.
 type VectorSearchQuery struct {
+	// Embedding is the precomputed query vector. Empty rejects with
+	// a "search embedding is required" error — this field has no
+	// default.
 	Embedding []float64
-	Limit     int
-	Kinds     []string
+	// Limit caps the number of SearchHits returned. Zero or negative
+	// selects DefaultSearchLimit (10).
+	Limit int
+	// Kinds filters candidate records to the supplied kind list. Nil
+	// or empty means "no filter, all kinds".
+	Kinds []string
 }
 
 // RecordQuery filters records from an opened snapshot.
@@ -123,14 +138,21 @@ type Section struct {
 	Embedding     []float64
 }
 
-// OpenSnapshot opens a read-only Stroma snapshot. The snapshot's
-// schema_version metadata must be one of the accept-listed versions —
-// schemaVersion (current), prevSchemaVersion, legacySchemaVersionV3,
-// or legacySchemaVersionV2 — all of which read paths can decode
-// directly without forcing an Update. Anything else returns
-// ErrUnsupportedSchemaVersion wrapped with the observed version, so
-// callers can surface a clear upgrade/downgrade message instead of
-// silently misdecoding data against a future schema.
+// OpenSnapshot opens a read-only Stroma snapshot at path. The path is
+// OS-native; on Windows both forward and back slashes are accepted
+// (the store package normalizes drive prefixes on open). The
+// snapshot's schema_version metadata must be one of the accept-listed
+// versions — schemaVersion (current), prevSchemaVersion,
+// legacySchemaVersionV3, or legacySchemaVersionV2 — all of which read
+// paths can decode directly without forcing an Update. Anything else
+// returns ErrUnsupportedSchemaVersion wrapped with the observed
+// version, so callers can surface a clear upgrade/downgrade message
+// instead of silently misdecoding data against a future schema.
+//
+// The returned *Snapshot is safe for concurrent use by multiple
+// goroutines once constructed: *sql.DB is goroutine-safe per the
+// database/sql contract, and Snapshot's cached metadata fields are
+// populated at open time and read-only thereafter.
 func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -588,7 +610,7 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 		return nil, fmt.Errorf("search embedder is required")
 	}
 	if query.Limit <= 0 {
-		query.Limit = 10
+		query.Limit = DefaultSearchLimit
 	}
 
 	if err := ensureCompatibleEmbedder(ctx, s.db, query.Embedder); err != nil {
@@ -675,7 +697,7 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 		return nil, fmt.Errorf("search embedding is required")
 	}
 	if query.Limit <= 0 {
-		query.Limit = 10
+		query.Limit = DefaultSearchLimit
 	}
 	if s.quantizationErr != nil {
 		return nil, s.quantizationErr

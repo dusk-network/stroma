@@ -2395,9 +2395,9 @@ func TestUpdateMigratesV3ToV4RehashesRecords(t *testing.T) {
 	// original normalized records — that's the byte-identity contract.
 	normalized := make([]corpus.Record, 0, len(seed))
 	for _, r := range seed {
-		n, err := r.Normalized()
+		n, err := r.Normalize()
 		if err != nil {
-			t.Fatalf("Normalized(%q) error = %v", r.Ref, err)
+			t.Fatalf("Normalize(%q) error = %v", r.Ref, err)
 		}
 		normalized = append(normalized, n)
 	}

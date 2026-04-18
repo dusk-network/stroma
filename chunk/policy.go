@@ -40,6 +40,14 @@ type SectionWithLineage struct {
 // flat slice of (Section, ParentIndex) pairs. Policies have no
 // awareness of indexing, embeddings, or storage — those concerns
 // remain in the index package.
+//
+// Implementations must be safe for concurrent use: the index session
+// invokes Chunk on one record at a time today, but library callers
+// that drive chunking themselves (tests, offline pipelines) should be
+// able to fan out across goroutines without hidden shared state. The
+// shipped Policy types (MarkdownPolicy, KindRouterPolicy,
+// LateChunkPolicy) are immutable post-construction and derive all
+// mutable state from the per-call record.
 type Policy interface {
 	Chunk(ctx context.Context, record corpus.Record) ([]SectionWithLineage, error)
 }

@@ -32,8 +32,31 @@ type Record struct {
 	Metadata    map[string]string
 }
 
-// Normalized returns a trimmed, validated record with safe defaults applied.
-func (r Record) Normalized() (Record, error) {
+// NewRecord constructs a Record for the common path: a reference, a
+// human title, and a Markdown body. All other fields default through
+// Normalize at the point the record enters a Rebuild / Update call.
+// Callers with non-default kinds, custom metadata, or plaintext bodies
+// should build the struct directly and pass it through Normalize.
+func NewRecord(ref, title, body string) Record {
+	return Record{
+		Ref:        ref,
+		Title:      title,
+		BodyFormat: FormatMarkdown,
+		BodyText:   body,
+	}
+}
+
+// Normalize returns a trimmed, validated record with safe defaults
+// applied: missing Kind defaults to DefaultKind, Title and SourceRef
+// default to Ref, BodyFormat defaults to FormatMarkdown, and
+// ContentHash is regenerated from HashRecord when empty. The returned
+// record satisfies Validate by construction.
+//
+// This is the entry point callers should use before invoking Validate.
+// Calling Validate on a raw Record will reject records that would have
+// been accepted after defaults — for example Record{Ref:"x"} fails
+// Validate (no kind) but Normalize fills in DefaultKind and succeeds.
+func (r Record) Normalize() (Record, error) {
 	normalized := Record{
 		Ref:         strings.TrimSpace(r.Ref),
 		Kind:        strings.TrimSpace(r.Kind),
@@ -68,7 +91,21 @@ func (r Record) Normalized() (Record, error) {
 	return normalized, nil
 }
 
+// Normalized is a deprecated alias for Normalize retained so downstream
+// callers that upgrade without switching name immediately keep
+// compiling. New code should use Normalize. Scheduled for removal one
+// release after adoption settles.
+//
+// Deprecated: use Normalize.
+func (r Record) Normalized() (Record, error) {
+	return r.Normalize()
+}
+
 // Validate reports whether the record is complete enough to persist.
+// Callers constructing a Record by hand should prefer Normalize, which
+// applies safe defaults before validation — calling Validate directly
+// on a raw struct will reject records that Normalize would have
+// accepted (e.g. a missing Kind).
 func (r Record) Validate() error {
 	switch {
 	case strings.TrimSpace(r.Ref) == "":
@@ -116,7 +153,7 @@ func HashRecord(r Record) string {
 }
 
 // Fingerprint summarizes a set of records deterministically and returns an
-// error if any record fails Normalized(). Prior versions silently skipped
+// error if any record fails Normalize. Prior versions silently skipped
 // invalid records, which meant "corpus with an invalid record" produced the
 // same digest as "same corpus without that record" — masking silent reuse of
 // a snapshot that was missing data the caller thought they had. The loud
@@ -124,7 +161,7 @@ func HashRecord(r Record) string {
 func Fingerprint(records []Record) (string, error) {
 	parts := make([]string, 0, len(records))
 	for _, record := range records {
-		normalized, err := record.Normalized()
+		normalized, err := record.Normalize()
 		if err != nil {
 			return "", fmt.Errorf("fingerprint record %q: %w", record.Ref, err)
 		}
@@ -144,7 +181,7 @@ type RefHash struct {
 // already-normalized (Ref, ContentHash) inputs: non-empty after trimming,
 // with ContentHash already computed. Pairs with an empty Ref or ContentHash
 // return an error — unlike Fingerprint([]Record), this helper cannot apply
-// Normalized() defaults or regenerate ContentHash via HashRecord from other
+// Normalize() defaults or regenerate ContentHash via HashRecord from other
 // fields, so its output only matches Fingerprint when the inputs already
 // satisfy that invariant. Callers reading persisted rows must enforce the
 // invariant at read time (as index.loadCurrentRefHashes does) or use
