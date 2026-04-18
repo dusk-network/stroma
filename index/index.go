@@ -22,19 +22,26 @@ import (
 
 const (
 	// schemaVersion is the current on-disk snapshot schema. Bumps require
-	// a forward migration (see migrateV2ToV3, migrateV3ToV4) and an
-	// extension of the OpenSnapshot accept-list.
-	schemaVersion = "4"
+	// a forward migration (see migrateV2ToV3, migrateV3ToV4, migrateV4ToV5)
+	// and an extension of the OpenSnapshot accept-list.
+	schemaVersion = "5"
 
 	// prevSchemaVersion is the most recent prior schema that OpenSnapshot
 	// still accepts read-only and that resolveUpdateSessionConfig can
-	// migrate forward in place. Older snapshots must be rebuilt or
-	// upgraded through a chain migration in the Update path.
-	prevSchemaVersion = "3"
+	// migrate forward in place. Older snapshots are migrated through a
+	// chain migration in the Update path.
+	prevSchemaVersion = "4"
+
+	// legacySchemaVersionV3 is an older schema that OpenSnapshot still
+	// accepts read-only and that the Update path migrates forward via a
+	// chain (v3 → v4 → v5). v3 carries chunks.context_prefix but not
+	// chunks.parent_chunk_id.
+	legacySchemaVersionV3 = "3"
 
 	// legacySchemaVersionV2 is the earliest schema that Update can still
-	// chain forward (v2 → v3 → v4). OpenSnapshot rejects it directly;
-	// callers must Update a v2 file before reading it in 1.0+.
+	// chain forward (v2 → v3 → v4 → v5). OpenSnapshot accepts it
+	// read-only; the v2 → v3 step adds chunks.context_prefix and re-hashes
+	// records under the new content_hash encoding.
 	legacySchemaVersionV2 = "2"
 )
 
@@ -63,13 +70,23 @@ func resolveMaxChunkSections(user int) int {
 // schemaHasContextPrefix reports whether a snapshot at the given schema
 // version carries the chunks.context_prefix column. The v2→v3 bump added
 // that column; v3→v4 kept the same table shape (it re-hashed record
-// content under a new encoding, not a schema shape change). Both v3 and
-// v4 therefore carry the column, so the flag is fully determined by the
-// accept-listed schema_version — read paths can cache it at handle-open
-// time instead of probing PRAGMA table_info(chunks) on every query.
+// content under a new encoding); v4→v5 added chunks.parent_chunk_id but
+// left context_prefix in place. All of v3, v4, v5 carry the column, so
+// the flag is fully determined by the accept-listed schema_version — read
+// paths can cache it at handle-open time instead of probing PRAGMA
+// table_info(chunks) on every query.
 func schemaHasContextPrefix(schema string) bool {
 	trimmed := strings.TrimSpace(schema)
-	return trimmed == schemaVersion || trimmed == prevSchemaVersion
+	return trimmed == schemaVersion || trimmed == prevSchemaVersion || trimmed == legacySchemaVersionV3
+}
+
+// schemaHasParentChunkID reports whether a snapshot at the given schema
+// version carries the chunks.parent_chunk_id column. The v4→v5 bump
+// added that column; older versions lack it entirely. Read paths cache
+// the flag at OpenSnapshot time so degraded behavior on legacy files
+// (no parent walks) is decided once per handle.
+func schemaHasParentChunkID(schema string) bool {
+	return strings.TrimSpace(schema) == schemaVersion
 }
 
 // ErrUnsupportedSchemaVersion is returned when an operation encounters a
@@ -675,12 +692,13 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 			metadata_json TEXT NOT NULL
 		)`,
 		`CREATE TABLE chunks (
-			id             INTEGER PRIMARY KEY AUTOINCREMENT,
-			record_ref     TEXT NOT NULL,
-			chunk_index    INTEGER NOT NULL,
-			heading        TEXT NOT NULL,
-			content        TEXT NOT NULL,
-			context_prefix TEXT NOT NULL DEFAULT '',
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			record_ref      TEXT NOT NULL,
+			chunk_index     INTEGER NOT NULL,
+			heading         TEXT NOT NULL,
+			content         TEXT NOT NULL,
+			context_prefix  TEXT NOT NULL DEFAULT '',
+			parent_chunk_id INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
 			FOREIGN KEY (record_ref) REFERENCES records(ref) ON DELETE CASCADE
 		)`,
 		vecTableStmt,
@@ -691,6 +709,24 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 		`CREATE VIRTUAL TABLE fts_chunks USING fts5(title, heading, content)`,
 		`CREATE INDEX idx_records_kind ON records(kind)`,
 		`CREATE INDEX idx_chunks_record_ref ON chunks(record_ref)`,
+		// Partial index — only leaves (rows with a non-NULL parent
+		// pointer) participate, so the index is empty in PR-A (no
+		// policy emits parents) and grows only when PR-B's
+		// chunk.Policy framework starts producing hierarchies. The
+		// trigger lookups also use this filter implicitly via the
+		// IS NOT NULL guard, so the partial form serves both queries.
+		`CREATE INDEX idx_chunks_parent ON chunks(parent_chunk_id) WHERE parent_chunk_id IS NOT NULL`,
+		// Same-record lineage invariant for parent_chunk_id (#16). SQLite
+		// CHECK constraints cannot reference other rows, so the
+		// invariant is enforced via BEFORE INSERT / BEFORE UPDATE
+		// triggers that RAISE(ABORT) when a chunk's parent points at a
+		// row in a different record. This blocks cross-record lineage
+		// at the storage layer so ExpandContext's parent walks cannot
+		// leak content across records, and so DELETE FROM records
+		// cascades cannot orphan chunks_vec / fts_chunks rows in an
+		// unrelated record.
+		chunksParentSameRecordInsertTriggerSQL,
+		chunksParentSameRecordUpdateTriggerSQL,
 	}
 	if quantization == store.QuantizationBinary {
 		// Companion full-precision column for the rescore pass. The
@@ -1602,16 +1638,26 @@ func migrateSchemaToCurrent(ctx context.Context, tx *sql.Tx) error {
 	}
 	switch strings.TrimSpace(schema) {
 	case legacySchemaVersionV2:
-		// v2 predates context_prefix and the new content_hash encoding;
-		// chain v2→v3→v4 in one transaction.
+		// v2 predates context_prefix, the new content_hash encoding, and
+		// parent_chunk_id; chain v2→v3→v4→v5 in one transaction.
 		if err := migrateV2ToV3(ctx, tx); err != nil {
 			return err
 		}
-		return migrateV3ToV4(ctx, tx)
+		if err := migrateV3ToV4(ctx, tx); err != nil {
+			return err
+		}
+		return migrateV4ToV5(ctx, tx)
+	case legacySchemaVersionV3:
+		// v3 carries context_prefix already; chain v3→v4→v5 (re-hash
+		// records under #39's encoding, then add parent_chunk_id).
+		if err := migrateV3ToV4(ctx, tx); err != nil {
+			return err
+		}
+		return migrateV4ToV5(ctx, tx)
 	case prevSchemaVersion:
-		// v3 carries the column already; only the content_hash encoding
-		// changes (#39) — re-hash every record row and bump metadata.
-		return migrateV3ToV4(ctx, tx)
+		// v4 carries records under the current content_hash encoding;
+		// only chunks.parent_chunk_id needs adding (#16).
+		return migrateV4ToV5(ctx, tx)
 	case schemaVersion:
 		return nil
 	default:
@@ -1626,16 +1672,17 @@ func migrateSchemaToCurrent(ctx context.Context, tx *sql.Tx) error {
 var migrateV2ToV3InjectFault func() error
 
 // migrateV2ToV3 adds the context_prefix column to chunks and bumps the
-// stored schema_version metadata to "3" on the provided transaction, so
-// the migration commits atomically with whatever surrounding work the
-// caller is running (today: Update's main tx, chained with migrateV3ToV4
-// when starting from v2). A crash between the ALTER and the UPDATE — or
-// a failure anywhere in the caller's transaction afterwards — rolls back
-// both statements instead of leaving the file with the new column but
+// stored schema_version metadata to legacySchemaVersionV3 ("3") on the
+// provided transaction, so the migration commits atomically with
+// whatever surrounding work the caller is running (today: Update's main
+// tx, chained with migrateV3ToV4 and migrateV4ToV5 when starting from
+// v2). A crash between the ALTER and the UPDATE — or a failure anywhere
+// in the caller's transaction afterwards — rolls back both statements
+// instead of leaving the file with the new column but
 // schema_version="2". The column-add is idempotent (skipped if a prior
 // run already applied it), so the helper is safe if re-entered on a v3
 // snapshot. It must not be called on v4 or later: the schema_version
-// bump is hard-coded to prevSchemaVersion and would effectively
+// bump is hard-coded to legacySchemaVersionV3 and would effectively
 // downgrade metadata. migrateSchemaToCurrent enforces the v2-only
 // entry point.
 func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
@@ -1655,7 +1702,7 @@ func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, prevSchemaVersion); err != nil {
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, legacySchemaVersionV3); err != nil {
 		return fmt.Errorf("migrate v2 to v3: bump schema_version: %w", err)
 	}
 	return nil
@@ -1719,8 +1766,102 @@ func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, schemaVersion); err != nil {
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, prevSchemaVersion); err != nil {
 		return fmt.Errorf("migrate v3 to v4: bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// chunksParentSameRecordInsertTriggerSQL and
+// chunksParentSameRecordUpdateTriggerSQL guard the v5 lineage column
+// against cross-record parent assignments. SQLite CHECK constraints
+// cannot reference other rows, so the same-record invariant is enforced
+// via BEFORE triggers that RAISE(ABORT) when NEW.parent_chunk_id points
+// at a row in a different record. The trigger is a no-op when
+// parent_chunk_id IS NULL (the only shape PR-A produces), so it adds
+// zero overhead until PR-B's chunk.Policy framework starts emitting
+// parents.
+const (
+	chunksParentSameRecordInsertTriggerSQL = `
+CREATE TRIGGER chunks_parent_same_record_insert
+BEFORE INSERT ON chunks
+WHEN NEW.parent_chunk_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'chunks.parent_chunk_id must reference a chunk in the same record_ref')
+    WHERE NEW.record_ref != (SELECT record_ref FROM chunks WHERE id = NEW.parent_chunk_id);
+END`
+
+	chunksParentSameRecordUpdateTriggerSQL = `
+CREATE TRIGGER chunks_parent_same_record_update
+BEFORE UPDATE OF parent_chunk_id ON chunks
+WHEN NEW.parent_chunk_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'chunks.parent_chunk_id must reference a chunk in the same record_ref')
+    WHERE NEW.record_ref != (SELECT record_ref FROM chunks WHERE id = NEW.parent_chunk_id);
+END`
+)
+
+// migrateV4ToV5InjectFault is a test-only seam that runs between the
+// ALTER + index-create and the metadata bump inside migrateV4ToV5.
+// Production leaves it nil. Tests set it to simulate a crash
+// mid-migration and assert the enclosing transaction rolls back cleanly.
+var migrateV4ToV5InjectFault func() error
+
+// migrateV4ToV5 adds the chunks.parent_chunk_id column + idx_chunks_parent
+// index and bumps the stored schema_version metadata to "5". The column
+// is NULLable with a CASCADE FK back to chunks(id), matching how
+// chunks_vec_full keys to chunks for binary quantization. NULL is the
+// only legal value until a Policy emits parent topology (#16 PR-B), so
+// existing v4 row content is byte-equivalent under v5 read paths.
+//
+// All work runs against the caller's transaction so the schema bump
+// commits atomically with whatever surrounding work the caller is
+// running (today: Update's main tx, chained with migrateV3ToV4 and
+// migrateV2ToV3 when starting from v3 or v2). A crash between the
+// ALTER, the CREATE INDEX, and the UPDATE metadata — or a failure
+// anywhere in the caller's transaction afterwards — rolls back all
+// statements instead of leaving the file partially upgraded. The
+// column-add and index-create are idempotent (skipped if a prior run
+// already applied them), so the helper is safe if re-entered on a v5
+// snapshot.
+func migrateV4ToV5(ctx context.Context, tx *sql.Tx) error {
+	hasParent, err := hasChunkColumn(ctx, tx, "parent_chunk_id")
+	if err != nil {
+		return fmt.Errorf("probe chunks.parent_chunk_id: %w", err)
+	}
+	if !hasParent {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE chunks ADD COLUMN parent_chunk_id INTEGER REFERENCES chunks(id) ON DELETE CASCADE`); err != nil {
+			return fmt.Errorf("migrate v4 to v5: add chunks.parent_chunk_id: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_chunk_id) WHERE parent_chunk_id IS NOT NULL`); err != nil {
+		return fmt.Errorf("migrate v4 to v5: create idx_chunks_parent: %w", err)
+	}
+	// Same-record lineage invariant: install the same triggers a fresh
+	// v5 schema gets so upgraded snapshots cannot accept cross-record
+	// parent_chunk_id values from any later writer. CREATE TRIGGER does
+	// not support IF NOT EXISTS in the SQL standard but SQLite does, so
+	// the migration is idempotent if re-entered on a v5 file.
+	if _, err := tx.ExecContext(ctx,
+		strings.Replace(chunksParentSameRecordInsertTriggerSQL,
+			"CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1)); err != nil {
+		return fmt.Errorf("migrate v4 to v5: create chunks_parent_same_record_insert trigger: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		strings.Replace(chunksParentSameRecordUpdateTriggerSQL,
+			"CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1)); err != nil {
+		return fmt.Errorf("migrate v4 to v5: create chunks_parent_same_record_update trigger: %w", err)
+	}
+	if migrateV4ToV5InjectFault != nil {
+		if err := migrateV4ToV5InjectFault(); err != nil {
+			return fmt.Errorf("migrate v4 to v5: injected fault: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE metadata SET value = ? WHERE key = 'schema_version'`, schemaVersion); err != nil {
+		return fmt.Errorf("migrate v4 to v5: bump schema_version: %w", err)
 	}
 	return nil
 }

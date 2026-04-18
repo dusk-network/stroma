@@ -121,7 +121,7 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	// HashRecord uses the new encoding; chunk-level reuse still picks up
 	// every unchanged chunk.
 	trimmed := strings.TrimSpace(schema)
-	if trimmed != schemaVersion && trimmed != prevSchemaVersion && trimmed != legacySchemaVersionV2 {
+	if trimmed != schemaVersion && trimmed != prevSchemaVersion && trimmed != legacySchemaVersionV3 && trimmed != legacySchemaVersionV2 {
 		return false, false
 	}
 	storedFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
@@ -230,10 +230,7 @@ func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title, quan
 	// in sync with the new-side keys when no Contextualizer is configured.
 	// hasContextPrefix comes from reuseState, which derives it from the
 	// accept-listed schema_version read at open time — no PRAGMA probe.
-	prefixExpr := "'' AS context_prefix"
-	if hasContextPrefix {
-		prefixExpr = "c.context_prefix"
-	}
+	prefixExpr := contextPrefixSelectExpr(hasContextPrefix)
 	// Binary mode stores the primary chunks_vec row as a sign-packed bit
 	// blob and keeps the float32 source of truth in chunks_vec_full. Reuse
 	// loads the full-precision blob so the write path can re-derive the

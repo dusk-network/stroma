@@ -13,6 +13,27 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
+// SQL fragments for projecting the chunks.context_prefix column. v2
+// snapshots (and any future schema bump that drops the column) substitute
+// the missing variant so scan-row shapes stay uniform across versions.
+// Centralized here so reuse.go, snapshot.go, and context.go all read from
+// one source of truth — `c.` prefixed because every callsite joins
+// chunks AS c.
+const (
+	contextPrefixSelectMissing = "'' AS context_prefix"
+	contextPrefixSelectPresent = "c.context_prefix"
+)
+
+// contextPrefixSelectExpr returns the SQL fragment for the
+// context_prefix projection given whether the snapshot's chunks table
+// carries the column.
+func contextPrefixSelectExpr(hasContextPrefix bool) string {
+	if hasContextPrefix {
+		return contextPrefixSelectPresent
+	}
+	return contextPrefixSelectMissing
+}
+
 // Snapshot is one opened Stroma index snapshot.
 type Snapshot struct {
 	path string
@@ -27,6 +48,12 @@ type Snapshot struct {
 	// instead of running the query and pattern-matching on the SQLite
 	// "no such table" error string.
 	hasFTS bool
+	// hasParentChunkID records whether the snapshot carries the
+	// chunks.parent_chunk_id column added in schema v5 (#16). Read paths
+	// (notably ExpandContext) cache the presence at open time so legacy
+	// v2/v3/v4 snapshots degrade cleanly to flat-chunk semantics without
+	// an extra PRAGMA per call.
+	hasParentChunkID bool
 }
 
 // SnapshotSearchQuery defines one text search against an opened snapshot.
@@ -78,11 +105,13 @@ type Section struct {
 }
 
 // OpenSnapshot opens a read-only Stroma snapshot. The snapshot's
-// schema_version metadata must be either the current schemaVersion or
-// prevSchemaVersion (which the Update path knows how to migrate forward);
-// anything else returns ErrUnsupportedSchemaVersion wrapped with the
-// observed version, so callers can surface a clear upgrade/downgrade
-// message instead of silently misdecoding data against a future schema.
+// schema_version metadata must be one of the accept-listed versions —
+// schemaVersion (current), prevSchemaVersion, legacySchemaVersionV3,
+// or legacySchemaVersionV2 — all of which read paths can decode
+// directly without forcing an Update. Anything else returns
+// ErrUnsupportedSchemaVersion wrapped with the observed version, so
+// callers can surface a clear upgrade/downgrade message instead of
+// silently misdecoding data against a future schema.
 func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -105,10 +134,10 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	// stored values as-is — so legacy v2 snapshots keep opening for Stats,
 	// Records, Sections, and Search against v1.0+ code. Only the Update
 	// path forces the content_hash algo bump via migrateSchemaToCurrent.
-	if trimmedSchema != schemaVersion && trimmedSchema != prevSchemaVersion && trimmedSchema != legacySchemaVersionV2 {
+	if trimmedSchema != schemaVersion && trimmedSchema != prevSchemaVersion && trimmedSchema != legacySchemaVersionV3 && trimmedSchema != legacySchemaVersionV2 {
 		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: %w: got %q, supported %q, %q, or %q",
-			path, ErrUnsupportedSchemaVersion, trimmedSchema, legacySchemaVersionV2, prevSchemaVersion, schemaVersion)
+		return nil, fmt.Errorf("open snapshot %s: %w: got %q, supported %q, %q, %q, or %q",
+			path, ErrUnsupportedSchemaVersion, trimmedSchema, legacySchemaVersionV2, legacySchemaVersionV3, prevSchemaVersion, schemaVersion)
 	}
 	// For binary snapshots, verify the full-precision companion table is
 	// complete at open time. Read paths rely on inner joins against
@@ -142,11 +171,27 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open snapshot %s: probe fts_chunks: %w", path, err)
 	}
+	// Same pattern as hasContextPrefix above: schema_version determines
+	// whether parent_chunk_id is present, but verify the table shape
+	// agrees so a malformed snapshot fails at open time instead of at
+	// the first ExpandContext call.
+	expectParentChunkID := schemaHasParentChunkID(trimmedSchema)
+	hasParentColumn, err := hasChunkColumn(ctx, db, "parent_chunk_id")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: probe chunks.parent_chunk_id: %w", path, err)
+	}
+	if hasParentColumn != expectParentChunkID {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: schema_version=%q but chunks.parent_chunk_id presence=%t (want %t); snapshot metadata and table shape disagree",
+			path, trimmedSchema, hasParentColumn, expectParentChunkID)
+	}
 	return &Snapshot{
 		path:             path,
 		db:               db,
 		hasContextPrefix: expectContextPrefix,
 		hasFTS:           hasFTS,
+		hasParentChunkID: expectParentChunkID,
 	}, nil
 }
 
@@ -356,10 +401,7 @@ func buildSectionsQuery(query SectionQuery, hasContextPrefix, embeddingsFromFull
 	args = make([]any, 0, len(query.Refs)+len(query.Kinds))
 	// v2 snapshots lack context_prefix; project an empty string so the
 	// row shape scanSectionRow expects stays stable across versions.
-	prefixExpr := "'' AS context_prefix"
-	if hasContextPrefix {
-		prefixExpr = "c.context_prefix"
-	}
+	prefixExpr := contextPrefixSelectExpr(hasContextPrefix)
 	builder.WriteString(`
 SELECT
   c.id,
