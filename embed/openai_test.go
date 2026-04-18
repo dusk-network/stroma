@@ -442,16 +442,29 @@ func TestOpenAIMaxBatchSizeDefaultsToConservativeValue(t *testing.T) {
 }
 
 // TestOpenAIMultiBatchBoundsTotalTimeout verifies that a multi-batch
-// EmbedDocuments call is still bounded by a total wall-clock budget
-// derived from the configured Timeout. Since #63, that budget is
-// `batches × Timeout` (so each sub-request gets a full Timeout window
-// without later batches starving), not a single flat Timeout — but the
-// call still fails within a bounded total, not unboundedly. This test
-// sends 4 batches against a server that delays each request well
-// beyond the per-request Timeout; pre-#63 the flat deadline tripped
-// after ~1 batch, post-#63 it trips after ~batches×Timeout of work.
-// Either way, EmbedDocuments must fail with a deadline error without
-// running indefinitely.
+// EmbedDocuments call is still bounded by the scaled parent deadline
+// (batches × Timeout) — i.e. a slow upstream does not let the loop
+// run unboundedly even when every individual request would fit inside
+// the per-request Timeout.
+//
+// The per-request http.Client.Timeout is disabled in this test so the
+// scaled parent ctx deadline is the ONLY timeout in play. Otherwise
+// http.Client.Timeout trips on the first request (because server
+// work > Timeout) and we would not actually be exercising the parent
+// deadline at all — which was Copilot's observation on the initial
+// revision of this test.
+//
+// Shape: server work per request = 500ms, Timeout = 200ms, 4 batches.
+// Parent budget = 4*200ms = 800ms. Batch 1 takes 500ms; after it the
+// remaining budget is ~300ms, which is less than the next batch's
+// 500ms of work, so the ctx trips during batch 2. We expect:
+//   - EmbedDocuments returns a non-nil error,
+//   - at least one request was fully delivered (proving http.Client
+//     did not trip first),
+//   - not all batches ran (proving the parent deadline did bound the
+//     loop),
+//   - elapsed stays within 2x the scaled budget as a sanity check
+//     against an unbounded run.
 func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -460,6 +473,11 @@ func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 		perRequestDelay = 500 * time.Millisecond
 		batchSize       = 2
 		inputCount      = 8
+	)
+
+	var (
+		mu   sync.Mutex
+		seen int
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -474,6 +492,9 @@ func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 		case <-r.Context().Done():
 			return
 		}
+		mu.Lock()
+		seen++
+		mu.Unlock()
 		out := make([]map[string]any, len(body.Input))
 		for i := range body.Input {
 			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
@@ -489,6 +510,13 @@ func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 		Timeout:      timeout,
 		MaxBatchSize: batchSize,
 	})
+	// Disable the per-request http.Client.Timeout so the scaled
+	// parent ctx deadline is the ONLY bound in play. Without this,
+	// http.Client.Timeout (=200ms) trips before the server finishes
+	// any single 500ms request and the test would not actually
+	// validate the parent deadline.
+	e.client.Timeout = 0
+
 	start := time.Now()
 	inputs := make([]string, inputCount)
 	for i := range inputs {
@@ -500,12 +528,22 @@ func TestOpenAIMultiBatchBoundsTotalTimeout(t *testing.T) {
 		t.Fatal("EmbedDocuments() succeeded on slow upstream, want deadline-exceeded error")
 	}
 
-	// Upper bound: the total budget is batches × Timeout plus
-	// scheduling jitter. If we blew past 2× the expected maximum,
-	// something (for example, a missing parent deadline) let the
-	// loop run unboundedly.
 	batches := (inputCount + batchSize - 1) / batchSize
 	maxBudget := time.Duration(batches) * timeout
+
+	mu.Lock()
+	observed := seen
+	mu.Unlock()
+
+	if observed == 0 {
+		t.Fatal("server saw 0 completed requests; http.Client.Timeout tripped before any request delivered — parent-deadline bound not actually exercised")
+	}
+	if observed >= batches {
+		t.Fatalf("server saw all %d requests despite a bounded parent deadline; scaled deadline did not actually cap the loop", observed)
+	}
+	// Upper bound: the total budget is batches × Timeout plus
+	// scheduling jitter. If we blew past 2× the expected maximum,
+	// the parent ctx deadline was not bounding the loop.
 	if elapsed > 2*maxBudget {
 		t.Fatalf("EmbedDocuments() took %s, want bounded by batches*Timeout (~%s + slack)", elapsed, maxBudget)
 	}
