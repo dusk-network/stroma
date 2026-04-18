@@ -709,7 +709,13 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 		`CREATE VIRTUAL TABLE fts_chunks USING fts5(title, heading, content)`,
 		`CREATE INDEX idx_records_kind ON records(kind)`,
 		`CREATE INDEX idx_chunks_record_ref ON chunks(record_ref)`,
-		`CREATE INDEX idx_chunks_parent ON chunks(parent_chunk_id)`,
+		// Partial index — only leaves (rows with a non-NULL parent
+		// pointer) participate, so the index is empty in PR-A (no
+		// policy emits parents) and grows only when PR-B's
+		// chunk.Policy framework starts producing hierarchies. The
+		// trigger lookups also use this filter implicitly via the
+		// IS NOT NULL guard, so the partial form serves both queries.
+		`CREATE INDEX idx_chunks_parent ON chunks(parent_chunk_id) WHERE parent_chunk_id IS NOT NULL`,
 		// Same-record lineage invariant for parent_chunk_id (#16). SQLite
 		// CHECK constraints cannot reference other rows, so the
 		// invariant is enforced via BEFORE INSERT / BEFORE UPDATE
@@ -1666,16 +1672,17 @@ func migrateSchemaToCurrent(ctx context.Context, tx *sql.Tx) error {
 var migrateV2ToV3InjectFault func() error
 
 // migrateV2ToV3 adds the context_prefix column to chunks and bumps the
-// stored schema_version metadata to "3" on the provided transaction, so
-// the migration commits atomically with whatever surrounding work the
-// caller is running (today: Update's main tx, chained with migrateV3ToV4
-// when starting from v2). A crash between the ALTER and the UPDATE — or
-// a failure anywhere in the caller's transaction afterwards — rolls back
-// both statements instead of leaving the file with the new column but
+// stored schema_version metadata to legacySchemaVersionV3 ("3") on the
+// provided transaction, so the migration commits atomically with
+// whatever surrounding work the caller is running (today: Update's main
+// tx, chained with migrateV3ToV4 and migrateV4ToV5 when starting from
+// v2). A crash between the ALTER and the UPDATE — or a failure anywhere
+// in the caller's transaction afterwards — rolls back both statements
+// instead of leaving the file with the new column but
 // schema_version="2". The column-add is idempotent (skipped if a prior
 // run already applied it), so the helper is safe if re-entered on a v3
 // snapshot. It must not be called on v4 or later: the schema_version
-// bump is hard-coded to prevSchemaVersion and would effectively
+// bump is hard-coded to legacySchemaVersionV3 and would effectively
 // downgrade metadata. migrateSchemaToCurrent enforces the v2-only
 // entry point.
 func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
@@ -1829,7 +1836,7 @@ func migrateV4ToV5(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_chunk_id)`); err != nil {
+		`CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_chunk_id) WHERE parent_chunk_id IS NOT NULL`); err != nil {
 		return fmt.Errorf("migrate v4 to v5: create idx_chunks_parent: %w", err)
 	}
 	// Same-record lineage invariant: install the same triggers a fresh

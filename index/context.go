@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -57,6 +56,14 @@ type ContextOptions struct {
 // scopes by record_ref alone (no parent grouping). ExpandContext stays
 // useful on legacy files; it just cannot surface lineage that was
 // never recorded.
+//
+// Internally ExpandContext issues a small bounded number of
+// parameterized reads: at most one to locate the requested chunk, one
+// to fetch the parent (when IncludeParent + parent_chunk_id present),
+// and one range scan over the sibling window. There is no per-result
+// parameter expansion (no `WHERE id IN (?, ?, ?, ...)`), so the
+// query never approaches SQLite's parameter cap regardless of
+// NeighborWindow.
 func (s *Snapshot) ExpandContext(ctx context.Context, chunkID int64, opts ContextOptions) ([]Section, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("snapshot is not open")
@@ -76,24 +83,32 @@ func (s *Snapshot) ExpandContext(ctx context.Context, chunkID int64, opts Contex
 		return []Section{}, nil
 	}
 
-	ids := map[int64]struct{}{chunkID: {}}
-
-	includeParent := opts.IncludeParent && s.hasParentChunkID && parentChunkID.Valid
-	if includeParent {
-		ids[parentChunkID.Int64] = struct{}{}
-	}
-
-	if opts.NeighborWindow > 0 {
-		siblings, err := s.loadSiblingIDs(ctx, recordRef, parentChunkID, chunkIndex, opts.NeighborWindow)
+	var parentSection *Section
+	if opts.IncludeParent && s.hasParentChunkID && parentChunkID.Valid {
+		// Defense in depth against a malformed or tampered snapshot. The
+		// v5 same-record triggers (#16) reject cross-record parent links
+		// on INSERT/UPDATE, so a well-formed snapshot cannot reach this
+		// branch with a mismatch. ExpandContext nonetheless requires the
+		// parent row to share record_ref before surfacing it: the
+		// load query bakes that constraint into its WHERE clause, so a
+		// cross-record parent simply returns nil without an error.
+		parentSection, err = s.loadParentSection(ctx, parentChunkID.Int64, recordRef)
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range siblings {
-			ids[id] = struct{}{}
-		}
 	}
 
-	return s.loadContextSections(ctx, ids, parentChunkID, includeParent)
+	windowSections, err := s.loadContextWindow(ctx, recordRef, parentChunkID, chunkIndex, opts.NeighborWindow)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Section, 0, len(windowSections)+1)
+	if parentSection != nil {
+		out = append(out, *parentSection)
+	}
+	out = append(out, windowSections...)
+	return out, nil
 }
 
 // locateChunk reads the (record_ref, parent_chunk_id, chunk_index) of the
@@ -108,8 +123,11 @@ func (s *Snapshot) locateChunk(ctx context.Context, chunkID int64) (recordRef st
 	if s.hasParentChunkID {
 		parentExpr = "parent_chunk_id"
 	}
-	query := fmt.Sprintf(`SELECT record_ref, %s, chunk_index FROM chunks WHERE id = ?`, parentExpr)
-	scanErr := s.db.QueryRowContext(ctx, query, chunkID).Scan(&recordRef, &parentChunkID, &chunkIndex)
+	var qb strings.Builder
+	qb.WriteString(`SELECT record_ref, `)
+	qb.WriteString(parentExpr)
+	qb.WriteString(`, chunk_index FROM chunks WHERE id = ?`)
+	scanErr := s.db.QueryRowContext(ctx, qb.String(), chunkID).Scan(&recordRef, &parentChunkID, &chunkIndex)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		return "", sql.NullInt64{}, 0, false, nil
 	}
@@ -119,85 +137,12 @@ func (s *Snapshot) locateChunk(ctx context.Context, chunkID int64) (recordRef st
 	return recordRef, parentChunkID, chunkIndex, true, nil
 }
 
-// loadSiblingIDs returns the chunk IDs of siblings of the requested
-// chunk within the chunk_index window [center-N, center+N]. "Sibling"
-// is determined by (record_ref, parent_chunk_id) on v5 snapshots and
-// by record_ref alone on legacy snapshots. The IN clause caller
-// deduplicates, so loadSiblingIDs may return the requested chunk's own
-// id without harm.
-func (s *Snapshot) loadSiblingIDs(ctx context.Context, recordRef string, parentChunkID sql.NullInt64, center int64, window int) ([]int64, error) {
-	low := center - int64(window)
-	high := center + int64(window)
-
-	var (
-		query string
-		args  []any
-	)
-	switch {
-	case s.hasParentChunkID && parentChunkID.Valid:
-		query = `SELECT id FROM chunks
-WHERE record_ref = ? AND parent_chunk_id = ?
-  AND chunk_index >= ? AND chunk_index <= ?
-ORDER BY chunk_index ASC, id ASC`
-		args = []any{recordRef, parentChunkID.Int64, low, high}
-	case s.hasParentChunkID:
-		query = `SELECT id FROM chunks
-WHERE record_ref = ? AND parent_chunk_id IS NULL
-  AND chunk_index >= ? AND chunk_index <= ?
-ORDER BY chunk_index ASC, id ASC`
-		args = []any{recordRef, low, high}
-	default:
-		// Legacy snapshot: no parent grouping is available, so the
-		// neighborhood is scoped by record_ref + chunk_index window.
-		query = `SELECT id FROM chunks
-WHERE record_ref = ?
-  AND chunk_index >= ? AND chunk_index <= ?
-ORDER BY chunk_index ASC, id ASC`
-		args = []any{recordRef, low, high}
-	}
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("load sibling chunk ids: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	ids := make([]int64, 0, 2*window+1)
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan sibling id: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate sibling ids: %w", err)
-	}
-	return ids, nil
-}
-
-// loadContextSections fetches the rows for the collected chunk IDs and
-// returns them in document order. The parent (when included) is placed
-// first; the rest sort by (chunk_index ASC, id ASC). Embeddings are
-// never populated.
-func (s *Snapshot) loadContextSections(ctx context.Context, ids map[int64]struct{}, parentChunkID sql.NullInt64, includeParent bool) ([]Section, error) {
-	if len(ids) == 0 {
-		return []Section{}, nil
-	}
-
-	placeholders := make([]string, 0, len(ids))
-	args := make([]any, 0, len(ids))
-	for id := range ids {
-		placeholders = append(placeholders, "?")
-		args = append(args, id)
-	}
-
-	// SQL is assembled via strings.Builder rather than fmt.Sprintf so
-	// gosec G201 stays clean. Every fragment written here is either a
-	// hard-coded literal or a package-local constant
-	// (contextPrefixSelectExpr return value, "?" placeholders); no user
-	// data is concatenated into the SQL text. User data is passed
-	// exclusively via the args slice to QueryContext below.
+// loadParentSection fetches the parent row identified by parentID, but
+// only if that row's record_ref matches expectedRecordRef. Returns
+// (nil, nil) when the parent does not exist or belongs to a different
+// record — both cases are non-errors from the caller's point of view.
+// Embedding is never populated.
+func (s *Snapshot) loadParentSection(ctx context.Context, parentID int64, expectedRecordRef string) (*Section, error) {
 	prefixExpr := contextPrefixSelectExpr(s.hasContextPrefix)
 	var qb strings.Builder
 	qb.WriteString(`
@@ -212,75 +157,135 @@ SELECT
   `)
 	qb.WriteString(prefixExpr)
 	qb.WriteString(`,
-  r.metadata_json,
-  c.chunk_index
+  r.metadata_json
 FROM chunks c
 JOIN records r ON r.ref = c.record_ref
-WHERE c.id IN (`)
-	qb.WriteString(strings.Join(placeholders, ", "))
-	qb.WriteString(`)`)
-	query := qb.String()
+WHERE c.id = ? AND c.record_ref = ?`)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	row := s.db.QueryRowContext(ctx, qb.String(), parentID, expectedRecordRef)
+	var (
+		section      Section
+		metadataJSON string
+	)
+	scanErr := row.Scan(
+		&section.ChunkID,
+		&section.Ref,
+		&section.Kind,
+		&section.Title,
+		&section.SourceRef,
+		&section.Heading,
+		&section.Content,
+		&section.ContextPrefix,
+		&metadataJSON,
+	)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if scanErr != nil {
+		return nil, fmt.Errorf("load parent chunk %d: %w", parentID, scanErr)
+	}
+	metadata, err := unmarshalMetadata(section.Ref, metadataJSON)
 	if err != nil {
-		return nil, fmt.Errorf("load context section rows: %w", err)
+		return nil, err
+	}
+	section.Metadata = metadata
+	return &section, nil
+}
+
+// loadContextWindow scans the chunks of recordRef whose chunk_index
+// falls within [center-window, center+window] AND whose parent_chunk_id
+// matches the same sibling group as the requested chunk. The result
+// always includes the requested chunk itself (window=0 → single-row
+// result). Embeddings are not populated.
+//
+// Sibling grouping is determined by the snapshot's lineage state:
+//
+//   - v5 leaf (parentChunkID.Valid): siblings share the same
+//     parent_chunk_id.
+//   - v5 root (parentChunkID is NULL): siblings are other rows under
+//     the same record_ref with parent_chunk_id IS NULL — the bucket
+//     where flat chunks and parent rows live.
+//   - legacy (no parent column): siblings are any rows under the same
+//     record_ref. Parent grouping is unavailable.
+//
+// All SQL fragments are package-local literals; user data flows only
+// through the args slice, so gosec G201 does not apply.
+func (s *Snapshot) loadContextWindow(ctx context.Context, recordRef string, parentChunkID sql.NullInt64, center int64, window int) ([]Section, error) {
+	low := center - int64(window)
+	high := center + int64(window)
+
+	prefixExpr := contextPrefixSelectExpr(s.hasContextPrefix)
+
+	var qb strings.Builder
+	qb.WriteString(`
+SELECT
+  c.id,
+  r.ref,
+  r.kind,
+  r.title,
+  r.source_ref,
+  c.heading,
+  c.content,
+  `)
+	qb.WriteString(prefixExpr)
+	qb.WriteString(`,
+  r.metadata_json
+FROM chunks c
+JOIN records r ON r.ref = c.record_ref
+WHERE c.record_ref = ?
+  AND c.chunk_index >= ? AND c.chunk_index <= ?`)
+
+	args := []any{recordRef, low, high}
+	switch {
+	case s.hasParentChunkID && parentChunkID.Valid:
+		qb.WriteString(`
+  AND c.parent_chunk_id = ?`)
+		args = append(args, parentChunkID.Int64)
+	case s.hasParentChunkID:
+		qb.WriteString(`
+  AND c.parent_chunk_id IS NULL`)
+		// no extra arg
+	default:
+		// Legacy snapshot: no parent grouping is available, so the
+		// neighborhood is scoped by record_ref + chunk_index window
+		// only. No additional predicate.
+	}
+	qb.WriteString(`
+ORDER BY c.chunk_index ASC, c.id ASC`)
+
+	rows, err := s.db.QueryContext(ctx, qb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("load context window: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	// Pointer-valued map so neither the map iteration nor the rest-slice
-	// build incurs a per-iteration copy of the ~160-byte Section struct
-	// (the gocritic rangeValCopy lint catches this).
-	type row struct {
-		section    Section
-		chunkIndex int64
-	}
-	loaded := make(map[int64]*row, len(ids))
+	out := make([]Section, 0, 2*window+1)
 	for rows.Next() {
-		r := &row{}
-		var metadataJSON string
+		var (
+			section      Section
+			metadataJSON string
+		)
 		if err := rows.Scan(
-			&r.section.ChunkID,
-			&r.section.Ref,
-			&r.section.Kind,
-			&r.section.Title,
-			&r.section.SourceRef,
-			&r.section.Heading,
-			&r.section.Content,
-			&r.section.ContextPrefix,
+			&section.ChunkID,
+			&section.Ref,
+			&section.Kind,
+			&section.Title,
+			&section.SourceRef,
+			&section.Heading,
+			&section.Content,
+			&section.ContextPrefix,
 			&metadataJSON,
-			&r.chunkIndex,
 		); err != nil {
-			return nil, fmt.Errorf("scan context section row: %w", err)
+			return nil, fmt.Errorf("scan context window row: %w", err)
 		}
-		r.section.Metadata, err = unmarshalMetadata(r.section.Ref, metadataJSON)
+		section.Metadata, err = unmarshalMetadata(section.Ref, metadataJSON)
 		if err != nil {
 			return nil, err
 		}
-		loaded[r.section.ChunkID] = r
+		out = append(out, section)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate context section rows: %w", err)
-	}
-
-	out := make([]Section, 0, len(loaded))
-	if includeParent && parentChunkID.Valid {
-		if r, ok := loaded[parentChunkID.Int64]; ok {
-			out = append(out, r.section)
-			delete(loaded, parentChunkID.Int64)
-		}
-	}
-	rest := make([]*row, 0, len(loaded))
-	for _, r := range loaded {
-		rest = append(rest, r)
-	}
-	sort.Slice(rest, func(i, j int) bool {
-		if rest[i].chunkIndex != rest[j].chunkIndex {
-			return rest[i].chunkIndex < rest[j].chunkIndex
-		}
-		return rest[i].section.ChunkID < rest[j].section.ChunkID
-	})
-	for _, r := range rest {
-		out = append(out, r.section)
+		return nil, fmt.Errorf("iterate context window rows: %w", err)
 	}
 	return out, nil
 }

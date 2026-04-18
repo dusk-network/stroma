@@ -99,7 +99,7 @@ UPDATE metadata SET value = '5' WHERE key = 'schema_version';
 
 `parent_chunk_id` is NULL for flat chunks (the only kind today's `MarkdownPolicy` produces) and for parent rows. It points at the parent's `chunks.id` for leaf rows. The index supports the parent-walk path in `ExpandContext`.
 
-`OpenSnapshot` accepts v3, v4, v5 read-only. `Update` chains v2 → v3 → v4 → v5 in one transaction. Existing v4 snapshots Open with `parent_chunk_id` absent; the existing `hasContextPrefix`-style cached probe pattern extends to a `hasParentChunkID` flag set at open time so read paths know whether to issue parent-aware SQL or skip the join.
+`OpenSnapshot` accepts v2, v3, v4, v5 read-only — read paths decode all four versions directly without forcing an Update. `Update` chains v2 → v3 → v4 → v5 in one transaction. Existing v2/v3/v4 snapshots Open with `parent_chunk_id` absent; the existing `hasContextPrefix`-style cached probe pattern extends to a `hasParentChunkID` flag set at open time so read paths know whether to issue parent-aware SQL or skip the join.
 
 #### `BuildOptions` / `UpdateOptions`
 
@@ -161,13 +161,13 @@ type ContextOptions struct {
 func (s *Snapshot) ExpandContext(ctx context.Context, chunkID int64, opts ContextOptions) ([]Section, error)
 ```
 
-Implementation: one parameterized SELECT per call (parent fetch + neighbor window + the chunk itself in a single CTE-flavored query, scoped by `record_ref` and `COALESCE(parent_chunk_id, -1)`). Returns `Section` rows compatible with the existing `Section` type (Heading, Content, ContextPrefix, ChunkID, Ref, Kind, Title, SourceRef, Metadata) with `Embedding = nil`.
+Implementation: a small bounded sequence of parameterized reads per call — at most one to locate the requested chunk, one to fetch the parent (when `IncludeParent` is set and `parent_chunk_id` is non-NULL), and one range scan over the sibling window scoped by `record_ref`, lineage, and `chunk_index BETWEEN low AND high`. There is no per-result parameter expansion (no `WHERE id IN (?, ?, ?, ...)`), so the query never approaches SQLite's parameter cap regardless of `NeighborWindow`. Returns `Section` rows compatible with the existing `Section` type (Heading, Content, ContextPrefix, ChunkID, Ref, Kind, Title, SourceRef, Metadata) with `Embedding = nil`. Cross-record `parent_chunk_id` values are rejected at storage (v5 same-record triggers) and ignored at read time (the parent-load query bakes the same-record predicate into its WHERE clause), so a malformed snapshot cannot leak parent context across records.
 
 When the snapshot was opened against a v4 (pre-lineage) file, `parent_chunk_id` is treated as universally NULL: `IncludeParent` is a no-op, `NeighborWindow` falls back to flat-chunk neighbors via `chunk_index`. ExpandContext stays useful against legacy snapshots — it just can't surface lineage that was never recorded.
 
 ### Default behavior preservation
 
-`BuildOptions{}` and `UpdateOptions{}` with `ChunkPolicy == nil` produce byte-identical output to today: flat chunks, no `parent_chunk_id`, same chunk_index ordering, same embeddings, same reuse keys. The only observable schema delta is the new (always-NULL) `parent_chunk_id` column on `chunks` — invisible to the read API contract and to existing tests.
+`BuildOptions{}` and `UpdateOptions{}` with `ChunkPolicy == nil` produce byte-identical output to today: flat chunks with `parent_chunk_id` NULL on every row, same `chunk_index` ordering, same embeddings, same reuse keys. The only observable schema delta is the new (always-NULL) `parent_chunk_id` column and the same-record lineage triggers on `chunks` — invisible to the read API contract and to existing tests.
 
 `Search`, `SearchHit`, `Sections`, `SectionQuery`, and `Snapshot.Records` are byte-identical. The new surface is strictly additive: `chunk.Policy` (interface), `chunk.SectionWithLineage`, `chunk.MarkdownPolicy`, `chunk.KindRouterPolicy`, `chunk.LateChunkPolicy`, `chunk.NoParent`, `index.BuildOptions.ChunkPolicy`, `index.UpdateOptions.ChunkPolicy`, `index.ContextOptions`, `Snapshot.ExpandContext`.
 

@@ -115,7 +115,7 @@ func TestExpandContextNeighborWindowOnFlatChunks(t *testing.T) {
 		Kind:       "note",
 		Title:      "Doc",
 		SourceRef:  "doc.md",
-		BodyFormat: "markdown",
+		BodyFormat: corpus.FormatMarkdown,
 		BodyText:   body,
 	}}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
 		t.Fatalf("Rebuild() error = %v", err)
@@ -185,7 +185,7 @@ func TestExpandContextWalksParentChunkID(t *testing.T) {
 		Kind:       "note",
 		Title:      "Doc",
 		SourceRef:  "doc.md",
-		BodyFormat: "markdown",
+		BodyFormat: corpus.FormatMarkdown,
 		BodyText:   body,
 	}}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
 		t.Fatalf("Rebuild() error = %v", err)
@@ -289,7 +289,7 @@ func TestExpandContextOnLegacyV4SnapshotDegradesGracefully(t *testing.T) {
 		Kind:       "note",
 		Title:      "Doc",
 		SourceRef:  "doc.md",
-		BodyFormat: "markdown",
+		BodyFormat: corpus.FormatMarkdown,
 		BodyText:   body,
 	}}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
 		t.Fatalf("Rebuild() error = %v", err)
@@ -402,6 +402,85 @@ func TestParentChunkIDRejectsCrossRecordLineage(t *testing.T) {
 		`INSERT INTO chunks (record_ref, chunk_index, heading, content, parent_chunk_id) VALUES (?, ?, ?, ?, ?)`,
 		"doc-a", 99, "child", "child body", aChunk); err != nil {
 		t.Fatalf("INSERT with same-record parent_chunk_id failed: %v (trigger over-rejects)", err)
+	}
+}
+
+// TestExpandContextRejectsCrossRecordParentInLoad is defense in depth.
+// The v5 same-record triggers (#16) reject cross-record parent links on
+// INSERT/UPDATE, but a malformed or tampered snapshot could still carry
+// one. ExpandContext must refuse to surface a parent that does not
+// share the requested chunk's record_ref. This test bypasses the
+// triggers (DROP TRIGGER + UPDATE), then asserts ExpandContext silently
+// drops the cross-record parent — caller sees no parent in the result,
+// no error, no leak.
+func TestExpandContextRejectsCrossRecordParentInLoad(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{
+		{Ref: "doc-a", Kind: "note", Title: "A", SourceRef: "a", BodyFormat: corpus.FormatPlaintext, BodyText: "alpha"},
+		{Ref: "doc-b", Kind: "note", Title: "B", SourceRef: "b", BodyFormat: corpus.FormatPlaintext, BodyText: "bravo"},
+	}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	// Bypass the same-record triggers so we can plant a malformed link
+	// that simulates a tampered snapshot.
+	for _, stmt := range []string{
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_insert`,
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_update`,
+	} {
+		if _, err := rwDB.ExecContext(context.Background(), stmt); err != nil {
+			_ = rwDB.Close()
+			t.Fatalf("drop trigger: %v", err)
+		}
+	}
+	var aChunk, bChunk int64
+	if err := rwDB.QueryRowContext(context.Background(),
+		`SELECT id FROM chunks WHERE record_ref = 'doc-a' LIMIT 1`).Scan(&aChunk); err != nil {
+		_ = rwDB.Close()
+		t.Fatalf("read doc-a chunk: %v", err)
+	}
+	if err := rwDB.QueryRowContext(context.Background(),
+		`SELECT id FROM chunks WHERE record_ref = 'doc-b' LIMIT 1`).Scan(&bChunk); err != nil {
+		_ = rwDB.Close()
+		t.Fatalf("read doc-b chunk: %v", err)
+	}
+	if _, err := rwDB.ExecContext(context.Background(),
+		`UPDATE chunks SET parent_chunk_id = ? WHERE id = ?`, aChunk, bChunk); err != nil {
+		_ = rwDB.Close()
+		t.Fatalf("plant cross-record parent: %v", err)
+	}
+	if err := rwDB.Close(); err != nil {
+		t.Fatalf("close rwDB: %v", err)
+	}
+
+	snap, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	t.Cleanup(func() { _ = snap.Close() })
+
+	got, err := snap.ExpandContext(context.Background(), bChunk, ContextOptions{IncludeParent: true})
+	if err != nil {
+		t.Fatalf("ExpandContext(IncludeParent on cross-record parent) error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ExpandContext returned %d sections, want 1 (just the chunk; cross-record parent must be dropped)", len(got))
+	}
+	if got[0].ChunkID != bChunk {
+		t.Fatalf("ExpandContext returned ChunkID %d, want %d", got[0].ChunkID, bChunk)
+	}
+	if got[0].Ref != "doc-b" {
+		t.Fatalf("ExpandContext returned Ref %q, want %q", got[0].Ref, "doc-b")
 	}
 }
 

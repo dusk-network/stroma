@@ -121,7 +121,7 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	// HashRecord uses the new encoding; chunk-level reuse still picks up
 	// every unchanged chunk.
 	trimmed := strings.TrimSpace(schema)
-	if trimmed != schemaVersion && trimmed != prevSchemaVersion && trimmed != legacySchemaVersionV2 {
+	if trimmed != schemaVersion && trimmed != prevSchemaVersion && trimmed != legacySchemaVersionV3 && trimmed != legacySchemaVersionV2 {
 		return false, false
 	}
 	storedFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")

@@ -105,11 +105,13 @@ type Section struct {
 }
 
 // OpenSnapshot opens a read-only Stroma snapshot. The snapshot's
-// schema_version metadata must be either the current schemaVersion or
-// prevSchemaVersion (which the Update path knows how to migrate forward);
-// anything else returns ErrUnsupportedSchemaVersion wrapped with the
-// observed version, so callers can surface a clear upgrade/downgrade
-// message instead of silently misdecoding data against a future schema.
+// schema_version metadata must be one of the accept-listed versions —
+// schemaVersion (current), prevSchemaVersion, legacySchemaVersionV3,
+// or legacySchemaVersionV2 — all of which read paths can decode
+// directly without forcing an Update. Anything else returns
+// ErrUnsupportedSchemaVersion wrapped with the observed version, so
+// callers can surface a clear upgrade/downgrade message instead of
+// silently misdecoding data against a future schema.
 func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()
