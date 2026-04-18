@@ -59,10 +59,12 @@ if err != nil {
 }
 
 hits, err := index.Search(ctx, index.SearchQuery{
-	Path:     "stroma.db",
-	Text:     "synchronized batches",
-	Limit:    5,
-	Embedder: fixture,
+	Path: "stroma.db",
+	SearchParams: index.SearchParams{
+		Text:     "synchronized batches",
+		Limit:    5,
+		Embedder: fixture,
+	},
 })
 if err != nil {
 	log.Fatal(err)
