@@ -53,6 +53,13 @@ const (
 // embedder calls + rows.
 const DefaultMaxChunkSections = 10_000
 
+// DefaultSearchLimit is the hit cap applied to Snapshot.Search and
+// Snapshot.SearchVector when SearchParams.Limit / VectorSearchQuery.Limit
+// is zero or negative. The choice is conservative; pick an explicit
+// Limit if throughput matters or if the caller needs a stable shortlist
+// size across snapshots.
+const DefaultSearchLimit = 10
+
 // resolveMaxChunkSections maps a caller-provided MaxChunkSections knob
 // onto the chunk.Options.MaxSections value: zero → safe default,
 // negative → chunk-level "unlimited", positive → verbatim.
@@ -109,6 +116,9 @@ var ErrUpdateCommittedIntegrityCheckFailed = errors.New("update committed but po
 
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
+	// Path is the OS-native filesystem path where the built snapshot
+	// is written. On Windows both forward and back slashes are
+	// accepted — the store package normalizes drive prefixes on open.
 	Path string
 
 	// ReuseFromPath points at an existing Stroma snapshot whose embeddings
@@ -191,6 +201,9 @@ type BuildResult struct {
 
 // UpdateOptions controls how an existing Stroma index is updated in place.
 type UpdateOptions struct {
+	// Path is the OS-native filesystem path to the existing snapshot
+	// to update in place. On Windows both forward and back slashes are
+	// accepted — the store package normalizes drive prefixes on open.
 	Path     string
 	Embedder embed.Embedder
 
@@ -268,11 +281,26 @@ type Stats struct {
 // and lets the top-level Search forward its params verbatim instead of
 // hand-copying six fields.
 type SearchParams struct {
-	Text     string
-	Limit    int
-	Kinds    []string
+	// Text is the free-form query text. Empty rejects with a
+	// "search text is required" error — this field has no default.
+	Text string
+	// Limit caps the number of SearchHits returned. Zero or negative
+	// selects DefaultSearchLimit (10). Pass an explicit Limit when
+	// throughput matters or when a downstream consumer needs a stable
+	// shortlist size across snapshots.
+	Limit int
+	// Kinds filters candidate records to the supplied kind list. Nil
+	// or empty means "no filter, all kinds".
+	Kinds []string
+	// Embedder produces the query vector(s) used by the dense arm.
+	// Nil rejects with a "search embedder is required" error — this
+	// field has no default.
 	Embedder embed.Embedder
-	Fusion   FusionStrategy
+	// Fusion optionally overrides the hybrid fusion strategy. Nil
+	// uses DefaultFusion().
+	Fusion FusionStrategy
+	// Reranker optionally refines the candidate shortlist after
+	// fusion. Nil skips reranking.
 	Reranker Reranker
 
 	// SearchDimension optionally runs a truncated-prefix vector prefilter
@@ -295,6 +323,9 @@ type SearchParams struct {
 // parameters live on the embedded SearchParams so the same shape flows
 // through Search, Snapshot.Search, and any downstream adapter wrapper.
 type SearchQuery struct {
+	// Path is the OS-native filesystem path to the snapshot. On
+	// Windows both forward and back slashes are accepted — the store
+	// package normalizes drive prefixes on open.
 	Path string
 	SearchParams
 }
@@ -318,6 +349,16 @@ type SearchHit struct {
 
 // Reranker optionally refines one search candidate shortlist before the final
 // limit truncation.
+//
+// Aliasing contract: implementations must treat the input candidates
+// slice and every SearchHit it contains as read-only. They must not
+// mutate Hit fields, must not mutate a Hit's Metadata map (which may
+// alias storage shared with other hits), and must not return the
+// input slice — return a freshly allocated []SearchHit instead.
+// Snapshot.Search defensively shallow-copies the candidates slice
+// before handing it to the reranker, but that copy is shallow so
+// maps and sub-slices inside each SearchHit remain shared.
+// Reorderings and truncations are fine; mutations are not.
 type Reranker interface {
 	Rerank(ctx context.Context, query string, candidates []SearchHit) ([]SearchHit, error)
 }
@@ -373,6 +414,13 @@ type HitProvenance struct {
 // fails closed on an upstream arm error. Callers treat errors the same way
 // as any other retrieval failure. Strategies that want to tolerate
 // partial-arm failures do so internally and return a nil error.
+//
+// Aliasing contract: implementations must treat each input arm's Hits
+// slice and every SearchHit it contains as read-only. They must not
+// mutate Hit fields, must not mutate a Hit's Metadata map (which may
+// alias storage shared across arms when the same ChunkID matched on
+// more than one retrieval path), and must return a freshly allocated
+// []SearchHit rather than repurposing an input arm's slice.
 type FusionStrategy interface {
 	Fuse(arms []RetrievalArm, limit int) ([]SearchHit, error)
 }
@@ -521,6 +569,9 @@ func prepareBuildInputs(ctx context.Context, records []corpus.Record, options Bu
 	if options.Embedder == nil {
 		return rebuildInputs{}, fmt.Errorf("build embedder is required")
 	}
+	if err := validateChunkPolicyConflict(options.ChunkPolicy, options.MaxChunkTokens, options.ChunkOverlapTokens, options.MaxChunkSections); err != nil {
+		return rebuildInputs{}, err
+	}
 
 	normalized, err := normalizeRecords(records)
 	if err != nil {
@@ -575,6 +626,9 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 		return nil, fmt.Errorf("update path is required")
 	}
 	if err := ensureExistingIndex(indexPath); err != nil {
+		return nil, err
+	}
+	if err := validateChunkPolicyConflict(options.ChunkPolicy, options.MaxChunkTokens, options.ChunkOverlapTokens, options.MaxChunkSections); err != nil {
 		return nil, err
 	}
 
@@ -762,10 +816,39 @@ func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
 	return snapshot.Search(ctx, SnapshotSearchQuery{SearchParams: query.SearchParams})
 }
 
+// validateChunkPolicyConflict rejects a BuildOptions / UpdateOptions
+// value that sets both ChunkPolicy and at least one of the flat
+// chunking knobs. The flat knobs (MaxChunkTokens / ChunkOverlapTokens
+// / MaxChunkSections) are read by the default MarkdownPolicy but
+// silently ignored when ChunkPolicy is non-nil — so a caller who
+// populates both gets their knob values dropped without feedback.
+// This guard converts the silent drop into an explicit error so
+// downstream consumers notice the conflict at call time instead of
+// chasing stale chunking behavior later.
+func validateChunkPolicyConflict(policy chunk.Policy, maxTokens, overlapTokens, maxSections int) error {
+	if policy == nil {
+		return nil
+	}
+	var conflicts []string
+	if maxTokens != 0 {
+		conflicts = append(conflicts, "MaxChunkTokens")
+	}
+	if overlapTokens != 0 {
+		conflicts = append(conflicts, "ChunkOverlapTokens")
+	}
+	if maxSections != 0 {
+		conflicts = append(conflicts, "MaxChunkSections")
+	}
+	if len(conflicts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("cannot set both ChunkPolicy and legacy knob(s) %s: policies carry their own chunking config, so flat knobs would be silently ignored; drop one or the other", strings.Join(conflicts, ", "))
+}
+
 func normalizeRecords(records []corpus.Record) ([]corpus.Record, error) {
 	normalized := make([]corpus.Record, 0, len(records))
 	for _, record := range records {
-		normalizedRecord, err := record.Normalized()
+		normalizedRecord, err := record.Normalize()
 		if err != nil {
 			return nil, err
 		}
@@ -2292,7 +2375,7 @@ ORDER BY ref ASC`)
 			return nil, fmt.Errorf("scan ref/content_hash row: %w", err)
 		}
 		// Guard the byte-identity contract with corpus.Fingerprint([]Record).
-		// That path runs each record through Normalized(), which regenerates
+		// That path runs each record through Normalize(), which regenerates
 		// ContentHash via HashRecord when empty (an O(row_size) step we
 		// deliberately skip here). If a row ever lands with an empty
 		// content_hash — only possible via a writer bypass or external DB

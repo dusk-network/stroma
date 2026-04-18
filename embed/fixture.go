@@ -12,6 +12,10 @@ import (
 const fixtureStrategy = "hash-bigram-v1"
 
 // Fixture is a deterministic embedder for tests and offline use.
+//
+// Safe for concurrent use by multiple goroutines once constructed:
+// Fixture is immutable post-NewFixture and every embed path operates
+// on local state only.
 type Fixture struct {
 	model      string
 	dimensions int

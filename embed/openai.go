@@ -134,6 +134,11 @@ func redactedToken(token string) string {
 }
 
 // OpenAI implements Embedder against an OpenAI-compatible HTTP embeddings API.
+//
+// Safe for concurrent use by multiple goroutines once constructed: the
+// cached dimension is guarded by a sync.Mutex, and http.Client is
+// goroutine-safe by contract. Callers may share a single *OpenAI
+// across a long-lived service without additional synchronization.
 type OpenAI struct {
 	config   OpenAIConfig
 	strategy string

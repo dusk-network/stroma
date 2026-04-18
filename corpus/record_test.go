@@ -2,15 +2,49 @@ package corpus
 
 import "testing"
 
+func TestNewRecordProducesNormalizableRecord(t *testing.T) {
+	t.Parallel()
+
+	const (
+		wantRef   = "alpha"
+		wantTitle = "Alpha"
+	)
+
+	raw := NewRecord(wantRef, wantTitle, "body text")
+	if raw.Ref != wantRef {
+		t.Fatalf("Ref = %q, want %q", raw.Ref, wantRef)
+	}
+	if raw.BodyFormat != FormatMarkdown {
+		t.Fatalf("BodyFormat = %q, want %q", raw.BodyFormat, FormatMarkdown)
+	}
+
+	// The struct returned by NewRecord is not yet normalized — Kind
+	// defaults through Normalize, not through the constructor — but it
+	// must round-trip cleanly through Normalize without error.
+	normalized, err := raw.Normalize()
+	if err != nil {
+		t.Fatalf("NewRecord(...).Normalize() error = %v", err)
+	}
+	if normalized.Kind != DefaultKind {
+		t.Fatalf("normalized Kind = %q, want %q", normalized.Kind, DefaultKind)
+	}
+	if normalized.Title != wantTitle {
+		t.Fatalf("normalized Title = %q, want %q", normalized.Title, wantTitle)
+	}
+	if normalized.ContentHash == "" {
+		t.Fatal("normalized ContentHash = empty, want regenerated hash")
+	}
+}
+
 func TestRecordNormalizedAppliesDefaults(t *testing.T) {
 	t.Parallel()
 
 	record, err := (Record{
 		Ref:      " alpha ",
 		BodyText: " body ",
-	}).Normalized()
+	}).Normalize()
 	if err != nil {
-		t.Fatalf("Normalized() error = %v", err)
+		t.Fatalf("Normalize() error = %v", err)
 	}
 	if record.Kind != DefaultKind {
 		t.Fatalf("Kind = %q, want %q", record.Kind, DefaultKind)
@@ -36,9 +70,9 @@ func TestRecordNormalizedRejectsUnknownBodyFormat(t *testing.T) {
 		Ref:        "alpha",
 		SourceRef:  "file://alpha.md",
 		BodyFormat: "html",
-	}).Normalized()
+	}).Normalize()
 	if err == nil {
-		t.Fatal("Normalized() error = nil, want unsupported body_format")
+		t.Fatal("Normalize() error = nil, want unsupported body_format")
 	}
 }
 
@@ -67,7 +101,7 @@ func TestFingerprintIsOrderIndependent(t *testing.T) {
 }
 
 // TestFingerprintSurfacesMalformedRecords locks the loud-failure contract:
-// previously, Fingerprint silently dropped records that failed Normalized(),
+// previously, Fingerprint silently dropped records that failed Normalize(),
 // so a corpus with an invalid record produced the same digest as the same
 // corpus without that record. Combined with ReuseFromPath, that masked
 // silent reuse of snapshots missing data the caller thought they had.
@@ -141,7 +175,7 @@ func TestFingerprintFromPairsMatchesRecords(t *testing.T) {
 	normalized := make([]Record, 0, len(raw))
 	pairs := make([]RefHash, 0, len(raw))
 	for _, r := range raw {
-		n, err := r.Normalized()
+		n, err := r.Normalize()
 		if err != nil {
 			t.Fatalf("Normalized(%q) error = %v", r.Ref, err)
 		}

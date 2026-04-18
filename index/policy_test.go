@@ -309,11 +309,16 @@ func TestRebuildPreservesByteCompatibilityWithoutChunkPolicy(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Rebuild(no policy) error = %v", err)
 	}
+	// Since #62 F2, setting both ChunkPolicy and the flat chunking
+	// knobs is an explicit error (the flat knobs would be silently
+	// ignored). Pass MaxTokens only through the policy here; the
+	// byte-equivalence claim is still exercised because the first
+	// Rebuild above uses the flat MaxChunkTokens path and this second
+	// one uses the equivalent ChunkPolicy path.
 	if _, err := Rebuild(context.Background(), records, BuildOptions{
-		Path:           pathB,
-		Embedder:       fixture,
-		MaxChunkTokens: 4,
-		ChunkPolicy:    chunk.MarkdownPolicy{Options: chunk.Options{MaxTokens: 4}},
+		Path:        pathB,
+		Embedder:    fixture,
+		ChunkPolicy: chunk.MarkdownPolicy{Options: chunk.Options{MaxTokens: 4}},
 	}); err != nil {
 		t.Fatalf("Rebuild(explicit MarkdownPolicy) error = %v", err)
 	}
@@ -365,6 +370,55 @@ func TestRebuildPreservesByteCompatibilityWithoutChunkPolicy(t *testing.T) {
 		if notNull != 0 {
 			t.Fatalf("snapshot %s has %d parent_chunk_id IS NOT NULL rows; default MarkdownPolicy must emit only flat chunks", p, notNull)
 		}
+	}
+}
+
+// TestRebuildRejectsChunkPolicyWithLegacyKnobs pins the #62 F2 fix:
+// populating both BuildOptions.ChunkPolicy and any of the flat
+// chunking knobs (MaxChunkTokens / ChunkOverlapTokens /
+// MaxChunkSections) used to silently drop the knob value, which was
+// a quiet foot-gun for callers who populated the struct by hand.
+// Rebuild and Update must now reject the conflicting shape loudly.
+func TestRebuildRejectsChunkPolicyWithLegacyKnobs(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	records := []corpus.Record{
+		{Ref: "doc", Kind: "note", Title: "Doc", BodyFormat: corpus.FormatMarkdown, BodyText: "alpha bravo charlie"},
+	}
+	cases := []struct {
+		name string
+		opts BuildOptions
+	}{
+		{
+			name: "MaxChunkTokens",
+			opts: BuildOptions{Embedder: fixture, MaxChunkTokens: 4, ChunkPolicy: chunk.MarkdownPolicy{}},
+		},
+		{
+			name: "ChunkOverlapTokens",
+			opts: BuildOptions{Embedder: fixture, ChunkOverlapTokens: 2, ChunkPolicy: chunk.MarkdownPolicy{}},
+		},
+		{
+			name: "MaxChunkSections",
+			opts: BuildOptions{Embedder: fixture, MaxChunkSections: 5, ChunkPolicy: chunk.MarkdownPolicy{}},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.opts.Path = t.TempDir() + "/stroma.db"
+			_, err := Rebuild(context.Background(), records, tc.opts)
+			if err == nil {
+				t.Fatalf("Rebuild() with %s + ChunkPolicy succeeded, want validation error", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("error does not mention the conflicting knob %q: %v", tc.name, err)
+			}
+		})
 	}
 }
 
