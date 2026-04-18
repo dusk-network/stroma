@@ -364,6 +364,72 @@ func TestRebuildPreservesByteCompatibilityWithoutChunkPolicy(t *testing.T) {
 	}
 }
 
+// TestRebuildBinaryWithLateChunkPolicyOpensAndSearches is a Codex
+// follow-up regression. checkChunksVecFullCompleteness used to require
+// every chunks row to have a chunks_vec_full companion, which broke
+// hierarchical binary snapshots: parent rows are storage-only context
+// and intentionally have no companion vector. The fix exempts parent
+// rows from the completeness check; this test pins the contract
+// end-to-end by building a binary + LateChunkPolicy snapshot,
+// reopening it (where the check fires), and exercising both Search
+// and Sections(IncludeEmbeddings=true).
+func TestRebuildBinaryWithLateChunkPolicyOpensAndSearches(t *testing.T) {
+	t.Parallel()
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	path := t.TempDir() + "/stroma.db"
+	body := "# Heading\n\n" + strings.Repeat("alpha bravo charlie delta ", 8)
+	if _, err := Rebuild(context.Background(), []corpus.Record{
+		{Ref: "doc", Kind: "note", Title: "Doc", BodyFormat: corpus.FormatMarkdown, BodyText: body},
+	}, BuildOptions{
+		Path:         path,
+		Embedder:     fixture,
+		Quantization: store.QuantizationBinary,
+		ChunkPolicy:  chunk.LateChunkPolicy{ChildMaxTokens: 6, ChildOverlapTokens: 1},
+	}); err != nil {
+		t.Fatalf("Rebuild(binary + LateChunkPolicy) error = %v", err)
+	}
+
+	// OpenSnapshot runs checkChunksVecFullCompleteness — without the
+	// parent exemption this would fail with "N chunk(s) missing from
+	// chunks_vec_full."
+	snap, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot(binary + LateChunkPolicy) error = %v", err)
+	}
+	t.Cleanup(func() { _ = snap.Close() })
+
+	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
+		Text:     "alpha bravo",
+		Limit:    5,
+		Embedder: fixture,
+	})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("Search() returned 0 hits on binary + LateChunkPolicy snapshot")
+	}
+
+	// Sections(IncludeEmbeddings=true) must return leaves with
+	// populated Embedding via the chunks_vec_full join. Parents are
+	// silently filtered (no companion row).
+	secs, err := snap.Sections(context.Background(), SectionQuery{IncludeEmbeddings: true})
+	if err != nil {
+		t.Fatalf("Sections(IncludeEmbeddings) error = %v", err)
+	}
+	if len(secs) == 0 {
+		t.Fatal("Sections(IncludeEmbeddings) returned 0; binary leaves should be visible")
+	}
+	for _, s := range secs {
+		if len(s.Embedding) == 0 {
+			t.Fatalf("section %d has empty Embedding under IncludeEmbeddings=true", s.ChunkID)
+		}
+	}
+}
+
 // TestReuseHonorsLateChunkPolicyLeaves rebuilds the same record body
 // against itself with LateChunkPolicy. The leaves' (heading, content,
 // prefix) keys are unchanged across rebuilds, so the leaves' embeddings

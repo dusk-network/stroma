@@ -1332,10 +1332,22 @@ func runIntegrityChecks(ctx context.Context, query queryContextRunner) error {
 }
 
 // checkChunksVecFullCompleteness is a no-op for non-binary snapshots; for
-// binary snapshots it verifies that every chunk has a companion
-// chunks_vec_full row and vice versa. Without this check a missing
-// companion row would silently drop that chunk from binary search (the
-// rescore join is an inner join) and from Sections(IncludeEmbeddings).
+// binary snapshots it verifies that every searchable chunk has a
+// companion chunks_vec_full row and vice versa. Without this check a
+// missing companion row would silently drop that chunk from binary
+// search (the rescore join is an inner join) and from
+// Sections(IncludeEmbeddings).
+//
+// Hierarchical chunks (#16): parent rows are storage-only context and
+// intentionally have no chunks_vec / chunks_vec_full entry — they
+// cannot surface from either arm of hybrid search. The completeness
+// check exempts parent rows so hierarchical late-chunked snapshots
+// open cleanly under binary quantization. A parent is identified as
+// "any chunks row referenced by another row's parent_chunk_id."
+//
+// On legacy schemas (v2/v3/v4) the parent_chunk_id column does not
+// exist; the parent-exemption subquery is gated by a presence probe so
+// the check still runs unchanged on pre-v5 snapshots.
 func checkChunksVecFullCompleteness(ctx context.Context, query queryContextRunner) error {
 	has, err := hasTable(ctx, query, "chunks_vec_full")
 	if err != nil {
@@ -1344,12 +1356,24 @@ func checkChunksVecFullCompleteness(ctx context.Context, query queryContextRunne
 	if !has {
 		return nil
 	}
+	hasParentCol, err := hasChunkColumn(ctx, query, "parent_chunk_id")
+	if err != nil {
+		return fmt.Errorf("probe chunks.parent_chunk_id: %w", err)
+	}
+	parentExclusion := ""
+	if hasParentCol {
+		// Exclude rows that other chunks point at via parent_chunk_id —
+		// those are storage-only parents and intentionally have no
+		// chunks_vec_full entry.
+		parentExclusion = `
+  AND c.id NOT IN (SELECT parent_chunk_id FROM chunks WHERE parent_chunk_id IS NOT NULL)`
+	}
 	var missingCompanion int
 	row := query.QueryRowContext(ctx, `
 SELECT COUNT(*)
 FROM chunks c
 LEFT JOIN chunks_vec_full v ON v.chunk_id = c.id
-WHERE v.chunk_id IS NULL`)
+WHERE v.chunk_id IS NULL`+parentExclusion)
 	if err := row.Scan(&missingCompanion); err != nil {
 		return fmt.Errorf("count missing chunks_vec_full rows: %w", err)
 	}
