@@ -193,10 +193,12 @@ func TestSearchReturnsClosestHit(t *testing.T) {
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "background workers batches",
-		Limit:    3,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "background workers batches",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -248,10 +250,12 @@ func TestSearchHybridBoostsExactMatch(t *testing.T) {
 	// FTS because the hash-bigram fixture embedder has no special affinity
 	// for this token.
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "ERR_TIMEOUT_42",
-		Limit:    5,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "ERR_TIMEOUT_42",
+			Limit:    5,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -363,10 +367,12 @@ func TestSearchAppliesRerankerBeforeLimitTruncation(t *testing.T) {
 	}
 
 	baseline, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "background workers",
-		Limit:    3,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "background workers",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(baseline) error = %v", err)
@@ -377,11 +383,13 @@ func TestSearchAppliesRerankerBeforeLimitTruncation(t *testing.T) {
 
 	reranker := &reverseReranker{}
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "background workers",
-		Limit:    2,
-		Embedder: fixture,
-		Reranker: reranker,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "background workers",
+			Limit:    2,
+			Embedder: fixture,
+			Reranker: reranker,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(reranker) error = %v", err)
@@ -475,10 +483,12 @@ func TestRebuildWithInt8Quantization(t *testing.T) {
 
 	// Search should still work with int8.
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "burst handling",
-		Limit:    3,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "burst handling",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(int8) error = %v", err)
@@ -663,19 +673,23 @@ func TestRebuildInt8PreservesTopHitQuality(t *testing.T) {
 
 	for _, tc := range testCases {
 		floatHits, err := Search(context.Background(), SearchQuery{
-			Path:     floatPath,
-			Text:     tc.query,
-			Limit:    3,
-			Embedder: fixture,
+			Path: floatPath,
+			SearchParams: SearchParams{
+				Text:     tc.query,
+				Limit:    3,
+				Embedder: fixture,
+			},
 		})
 		if err != nil {
 			t.Fatalf("Search(float32, %q) error = %v", tc.query, err)
 		}
 		int8Hits, err := Search(context.Background(), SearchQuery{
-			Path:     int8Path,
-			Text:     tc.query,
-			Limit:    3,
-			Embedder: fixture,
+			Path: int8Path,
+			SearchParams: SearchParams{
+				Text:     tc.query,
+				Limit:    3,
+				Embedder: fixture,
+			},
 		})
 		if err != nil {
 			t.Fatalf("Search(int8, %q) error = %v", tc.query, err)
@@ -718,9 +732,12 @@ func TestSnapshotRejectsMalformedQuantizationMetadata(t *testing.T) {
 	}
 
 	// Corrupt the quantization metadata directly to simulate a stale or
-	// tampered snapshot. Any non-supported value should be caught by
-	// Snapshot's read paths instead of silently misdecoding int8 blobs as
-	// float32.
+	// tampered snapshot. Since #57, quantization is resolved once at
+	// OpenSnapshot time and cached on the handle, but the error is
+	// *deferred* so non-vector reads (Records, Stats, Sections without
+	// embeddings) still work against a corrupted handle — recovery and
+	// inspection workflows stay open. Vector-touching reads surface the
+	// cached error on first call.
 	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadWriteContext() error = %v", err)
@@ -751,9 +768,11 @@ func TestSnapshotRejectsMalformedQuantizationMetadata(t *testing.T) {
 
 	t.Run("Search", func(t *testing.T) {
 		_, err := snapshot.Search(context.Background(), SnapshotSearchQuery{
-			Text:     "burst",
-			Limit:    3,
-			Embedder: fixture,
+			SearchParams: SearchParams{
+				Text:     "burst",
+				Limit:    3,
+				Embedder: fixture,
+			},
 		})
 		if err == nil {
 			t.Fatal("want error for malformed quantization, got nil")
@@ -783,6 +802,26 @@ func TestSnapshotRejectsMalformedQuantizationMetadata(t *testing.T) {
 		}
 		if len(sections) == 0 {
 			t.Fatal("expected at least one section")
+		}
+	})
+
+	t.Run("Records_still_works", func(t *testing.T) {
+		records, err := snapshot.Records(context.Background(), RecordQuery{})
+		if err != nil {
+			t.Fatalf("Records() should not depend on quantization; got %v", err)
+		}
+		if len(records) == 0 {
+			t.Fatal("expected at least one record")
+		}
+	})
+
+	t.Run("Stats_still_works", func(t *testing.T) {
+		stats, err := snapshot.Stats(context.Background())
+		if err != nil {
+			t.Fatalf("Stats() should not depend on quantization; got %v", err)
+		}
+		if stats.RecordCount == 0 {
+			t.Fatal("expected at least one record in stats")
 		}
 	})
 }
@@ -823,10 +862,12 @@ func TestSearchFTSRequiresAllTokens(t *testing.T) {
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "ERR_TIMEOUT_42",
-		Limit:    5,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "ERR_TIMEOUT_42",
+			Limit:    5,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -955,10 +996,12 @@ func TestSearchRejectsEmbedderMismatch(t *testing.T) {
 	}
 
 	_, err = Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "burst handling",
-		Limit:    3,
-		Embedder: queryEmbedder,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "burst handling",
+			Limit:    3,
+			Embedder: queryEmbedder,
+		},
 	})
 	if err == nil {
 		t.Fatal("Search() error = nil, want embedder mismatch")
@@ -1002,10 +1045,12 @@ func TestSnapshotSearchPropagatesRerankerError(t *testing.T) {
 	defer func() { _ = snapshot.Close() }()
 
 	_, err = snapshot.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "burst handling",
-		Limit:    3,
-		Embedder: fixture,
-		Reranker: errorReranker{err: errors.New("boom")},
+		SearchParams: SearchParams{
+			Text:     "burst handling",
+			Limit:    3,
+			Embedder: fixture,
+			Reranker: errorReranker{err: errors.New("boom")},
+		},
 	})
 	if err == nil {
 		t.Fatal("Snapshot.Search() error = nil, want reranker failure")
@@ -1093,10 +1138,12 @@ func TestUpdateAddsRecord(t *testing.T) {
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "exponential backoff",
-		Limit:    3,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "exponential backoff",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -1240,10 +1287,12 @@ func TestUpdateReplacesRecord(t *testing.T) {
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "30 minutes",
-		Limit:    3,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "30 minutes",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -1346,19 +1395,23 @@ func TestUpdateMixedOperationsMatchEquivalentRebuild(t *testing.T) {
 	}
 
 	updateHits, err := Search(context.Background(), SearchQuery{
-		Path:     updatePath,
-		Text:     "retry budgets",
-		Limit:    3,
-		Embedder: fixture,
+		Path: updatePath,
+		SearchParams: SearchParams{
+			Text:     "retry budgets",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(updatePath) error = %v", err)
 	}
 	rebuildHits, err := Search(context.Background(), SearchQuery{
-		Path:     rebuildPath,
-		Text:     "retry budgets",
-		Limit:    3,
-		Embedder: fixture,
+		Path: rebuildPath,
+		SearchParams: SearchParams{
+			Text:     "retry budgets",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(rebuildPath) error = %v", err)
@@ -1586,10 +1639,12 @@ func TestSearchFTSMatchesContextualPrefix(t *testing.T) {
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "contextAlphaToken",
-		Limit:    5,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "contextAlphaToken",
+			Limit:    5,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -2148,9 +2203,11 @@ func TestSearchSucceedsOnSnapshotWithoutFTSChunks(t *testing.T) {
 	}
 
 	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha content",
-		Limit:    5,
-		Embedder: fixture,
+		SearchParams: SearchParams{
+			Text:     "alpha content",
+			Limit:    5,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() on snapshot without fts_chunks: %v", err)
@@ -2901,10 +2958,12 @@ func TestRebuildBinaryQuantizationReturnsClosestHit(t *testing.T) {
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "background workers batches",
-		Limit:    3,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "background workers batches",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(binary) error = %v", err)
@@ -3191,10 +3250,12 @@ func TestSearchMatryoshkaTruncatedPrefilterRescoresAtFullDim(t *testing.T) {
 	}
 
 	baseline, err := Search(context.Background(), SearchQuery{
-		Path:     path,
-		Text:     "background workers batches",
-		Limit:    3,
-		Embedder: fixture,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "background workers batches",
+			Limit:    3,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(baseline) error = %v", err)
@@ -3208,11 +3269,13 @@ func TestSearchMatryoshkaTruncatedPrefilterRescoresAtFullDim(t *testing.T) {
 	// the rescored result should carry the same score the baseline path
 	// assigned to it.
 	truncated, err := Search(context.Background(), SearchQuery{
-		Path:            path,
-		Text:            "background workers batches",
-		Limit:           3,
-		Embedder:        fixture,
-		SearchDimension: 8,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:            "background workers batches",
+			Limit:           3,
+			Embedder:        fixture,
+			SearchDimension: 8,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(SearchDimension=8) error = %v", err)
@@ -3239,11 +3302,13 @@ func TestSearchMatryoshkaTruncatedPrefilterRescoresAtFullDim(t *testing.T) {
 	// SearchDimension == stored dim is a no-op: it must collapse to the
 	// same result set as the baseline search.
 	noop, err := Search(context.Background(), SearchQuery{
-		Path:            path,
-		Text:            "background workers batches",
-		Limit:           3,
-		Embedder:        fixture,
-		SearchDimension: 16,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:            "background workers batches",
+			Limit:           3,
+			Embedder:        fixture,
+			SearchDimension: 16,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(SearchDimension=16) error = %v", err)
@@ -3284,11 +3349,13 @@ func TestSearchMatryoshkaRejectsInvalidDimension(t *testing.T) {
 	}
 
 	if _, err := Search(context.Background(), SearchQuery{
-		Path:            path,
-		Text:            "alpha",
-		Limit:           3,
-		Embedder:        fixture,
-		SearchDimension: 17,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:            "alpha",
+			Limit:           3,
+			Embedder:        fixture,
+			SearchDimension: 17,
+		},
 	}); err == nil || !strings.Contains(err.Error(), "exceeds stored embedder_dimension") {
 		t.Fatalf("oversized SearchDimension err = %v, want exceeds-stored error", err)
 	}
@@ -3320,11 +3387,13 @@ func TestSearchMatryoshkaRejectsInt8Index(t *testing.T) {
 	}
 
 	if _, err := Search(context.Background(), SearchQuery{
-		Path:            path,
-		Text:            "alpha",
-		Limit:           3,
-		Embedder:        fixture,
-		SearchDimension: 8,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:            "alpha",
+			Limit:           3,
+			Embedder:        fixture,
+			SearchDimension: 8,
+		},
 	}); err == nil || !strings.Contains(err.Error(), "only supported for float32") {
 		t.Fatalf("int8 SearchDimension err = %v, want float32-only error", err)
 	}
@@ -3372,12 +3441,14 @@ func TestSearchMatryoshkaHonorsKindFilterInsidePrefilter(t *testing.T) {
 	}
 
 	hits, err := Search(context.Background(), SearchQuery{
-		Path:            path,
-		Text:            "background workers batches",
-		Limit:           3,
-		Kinds:           []string{"note"},
-		Embedder:        fixture,
-		SearchDimension: 8,
+		Path: path,
+		SearchParams: SearchParams{
+			Text:            "background workers batches",
+			Limit:           3,
+			Kinds:           []string{"note"},
+			Embedder:        fixture,
+			SearchDimension: 8,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search(Kinds=note, SearchDimension=8) error = %v", err)

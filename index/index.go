@@ -261,9 +261,13 @@ type Stats struct {
 	CreatedAt           string
 }
 
-// SearchQuery defines one semantic search.
-type SearchQuery struct {
-	Path     string
+// SearchParams are the retrieval parameters shared by SearchQuery (the
+// top-level one-shot API against an index path) and SnapshotSearchQuery
+// (the long-lived API against an open Snapshot). Extracting the shared
+// shape lets downstream adapters thread one value through both surfaces
+// and lets the top-level Search forward its params verbatim instead of
+// hand-copying six fields.
+type SearchParams struct {
 	Text     string
 	Limit    int
 	Kinds    []string
@@ -285,6 +289,14 @@ type SearchQuery struct {
 	// pays off when the truncated prefix preserves ranking. Treat this as
 	// a tuning knob for MRL snapshots rather than a blanket speedup.
 	SearchDimension int
+}
+
+// SearchQuery defines one semantic search against an index path. Retrieval
+// parameters live on the embedded SearchParams so the same shape flows
+// through Search, Snapshot.Search, and any downstream adapter wrapper.
+type SearchQuery struct {
+	Path string
+	SearchParams
 }
 
 // SearchHit is one retrieved section.
@@ -747,15 +759,7 @@ func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
 		return nil, err
 	}
 	defer func() { _ = snapshot.Close() }()
-	return snapshot.Search(ctx, SnapshotSearchQuery{
-		Text:            query.Text,
-		Limit:           query.Limit,
-		Kinds:           query.Kinds,
-		Embedder:        query.Embedder,
-		Fusion:          query.Fusion,
-		Reranker:        query.Reranker,
-		SearchDimension: query.SearchDimension,
-	})
+	return snapshot.Search(ctx, SnapshotSearchQuery{SearchParams: query.SearchParams})
 }
 
 func normalizeRecords(records []corpus.Record) ([]corpus.Record, error) {

@@ -165,7 +165,7 @@ WHERE c.id = ? AND c.record_ref = ?`)
 	row := s.db.QueryRowContext(ctx, qb.String(), parentID, expectedRecordRef)
 	var (
 		section      Section
-		metadataJSON string
+		metadataJSON []byte
 	)
 	scanErr := row.Scan(
 		&section.ChunkID,
@@ -263,7 +263,7 @@ ORDER BY c.chunk_index ASC, c.id ASC`)
 	for rows.Next() {
 		var (
 			section      Section
-			metadataJSON string
+			metadataJSON []byte
 		)
 		if err := rows.Scan(
 			&section.ChunkID,

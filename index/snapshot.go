@@ -1,6 +1,7 @@
 package index
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/dusk-network/stroma/corpus"
-	"github.com/dusk-network/stroma/embed"
 	"github.com/dusk-network/stroma/store"
 )
 
@@ -54,25 +54,31 @@ type Snapshot struct {
 	// v2/v3/v4 snapshots degrade cleanly to flat-chunk semantics without
 	// an extra PRAGMA per call.
 	hasParentChunkID bool
+	// quantization and storedDimension are resolved from immutable
+	// metadata at OpenSnapshot time so Search/SearchVector/Sections do
+	// not reread the metadata table on every call. Both values are fixed
+	// by the index build and cannot change while the snapshot is open.
+	//
+	// Errors encountered while parsing either field are cached in
+	// quantizationErr / storedDimensionErr and deferred to the first
+	// vector-touching read (Search, SearchVector, Sections with
+	// IncludeEmbeddings=true). Non-vector reads (Records, Stats,
+	// Sections with IncludeEmbeddings=false) continue to work against a
+	// snapshot whose vector metadata is malformed, so recovery and
+	// inspection workflows are not bricked by corrupted quantization or
+	// embedder_dimension values.
+	quantization       string
+	quantizationErr    error
+	storedDimension    int
+	storedDimensionErr error
 }
 
 // SnapshotSearchQuery defines one text search against an opened snapshot.
+// Retrieval parameters live on the embedded SearchParams so the same
+// value can be forwarded verbatim from SearchQuery.SearchParams without
+// hand-copying fields.
 type SnapshotSearchQuery struct {
-	Text     string
-	Limit    int
-	Kinds    []string
-	Embedder embed.Embedder
-	// Fusion optionally overrides the hybrid fusion strategy. Nil uses
-	// DefaultFusion(), which preserves pre-#17 ordering on every path and
-	// pre-#17 Score on every path except the vector-empty + FTS-non-empty
-	// case (see DefaultFusion for details).
-	Fusion   FusionStrategy
-	Reranker Reranker
-
-	// SearchDimension optionally runs a truncated-prefix vector prefilter
-	// at this dimension, then rescores the shortlist with full-dim cosine.
-	// See SearchQuery.SearchDimension for the full contract.
-	SearchDimension int
+	SearchParams
 }
 
 // VectorSearchQuery defines one vector search against an opened snapshot.
@@ -199,13 +205,61 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		return nil, fmt.Errorf("open snapshot %s: schema_version=%q but chunks.parent_chunk_id presence=%t (want %t); snapshot metadata and table shape disagree",
 			path, trimmedSchema, hasParentColumn, expectParentChunkID)
 	}
+	// Resolve immutable vector metadata once. Quantization and the stored
+	// embedder dimension are fixed by the index build, so caching them on
+	// the handle lets Search/SearchVector/Sections avoid reopening the
+	// metadata table on every call.
+	//
+	// Errors are deferred: a malformed quantization or embedder_dimension
+	// must not brick non-vector reads (Records, Stats, Sections without
+	// embeddings) or diagnostic workflows. The deferred error is surfaced
+	// at the first vector-touching read instead.
+	quantization, quantizationErr := resolveSnapshotQuantization(ctx, db)
+	storedDimension, storedDimensionErr := resolveSnapshotDimension(ctx, db)
 	return &Snapshot{
-		path:             path,
-		db:               db,
-		hasContextPrefix: expectContextPrefix,
-		hasFTS:           hasFTS,
-		hasParentChunkID: expectParentChunkID,
+		path:               path,
+		db:                 db,
+		hasContextPrefix:   expectContextPrefix,
+		hasFTS:             hasFTS,
+		hasParentChunkID:   expectParentChunkID,
+		quantization:       quantization,
+		quantizationErr:    quantizationErr,
+		storedDimension:    storedDimension,
+		storedDimensionErr: storedDimensionErr,
 	}, nil
+}
+
+// resolveSnapshotQuantization reads and normalizes the quantization
+// metadata once at OpenSnapshot time. On any error the returned string
+// is empty and the error is returned for the caller to cache; read
+// paths that actually depend on quantization check the cached error
+// before using the value.
+func resolveSnapshotQuantization(ctx context.Context, db *sql.DB) (string, error) {
+	raw, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return "", fmt.Errorf("read quantization: %w", err)
+	}
+	return normalizeQuantization(raw)
+}
+
+// resolveSnapshotDimension reads and parses the embedder_dimension
+// metadata once at OpenSnapshot time. On any error the returned dim is
+// zero and the error is returned for the caller to cache; read paths
+// that actually depend on the stored dimension check the cached error
+// before using the value.
+func resolveSnapshotDimension(ctx context.Context, db *sql.DB) (int, error) {
+	raw, err := readMetadataValue(ctx, db, "embedder_dimension")
+	if err != nil {
+		return 0, fmt.Errorf("read embedder_dimension: %w", err)
+	}
+	dim, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("parse embedder_dimension %q: %w", raw, err)
+	}
+	if dim <= 0 {
+		return 0, fmt.Errorf("stored embedder_dimension %d is non-positive", dim)
+	}
+	return dim, nil
 }
 
 // Close releases the opened snapshot handle.
@@ -339,7 +393,7 @@ ORDER BY ref ASC`)
 func scanRecord(rows *sql.Rows) (corpus.Record, error) {
 	var (
 		record      corpus.Record
-		metadataRaw string
+		metadataRaw []byte
 	)
 	if err := rows.Scan(
 		&record.Ref,
@@ -373,11 +427,10 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	quantization := store.QuantizationFloat32
 	embeddingsFromFullTable := false
 	if query.IncludeEmbeddings {
-		var err error
-		quantization, err = s.resolveQuantization(ctx)
-		if err != nil {
-			return nil, err
+		if s.quantizationErr != nil {
+			return nil, s.quantizationErr
 		}
+		quantization = s.quantization
 		if quantization == store.QuantizationBinary {
 			// Read from the full-precision companion so callers get
 			// the real float32 vector, not its sign-packed stub, and
@@ -454,40 +507,26 @@ ORDER BY r.ref ASC, c.chunk_index ASC, c.id ASC`)
 	return sqlText, args
 }
 
-// resolveQuantization reads the snapshot's quantization metadata and
-// validates it against the supported set. It fails fast on unsupported
-// values so callers cannot silently misdecode vectors against stale or
-// malformed metadata. An empty / missing key defaults to float32 via
-// readMetadataValueOptional, which then passes normalizeQuantization.
-func (s *Snapshot) resolveQuantization(ctx context.Context) (string, error) {
-	raw, err := readMetadataValueOptional(ctx, s.db, "quantization", store.QuantizationFloat32)
-	if err != nil {
-		return "", err
-	}
-	return normalizeQuantization(raw)
-}
-
 // resolveSearchDimension validates SearchDimension against the stored
 // embedder dimension and quantization. Zero means "no truncation"; any
 // positive value must be <= stored dim. Matryoshka-style truncation is
 // only supported for float32 indexes because the sqlite-vec int8 storage
 // path packs vec_int8 bytes and vec_slice over that packed form would
 // not yield a valid truncated int8 vector for cosine distance.
-func (s *Snapshot) resolveSearchDimension(ctx context.Context, requested int, quantization string) (int, error) {
+func (s *Snapshot) resolveSearchDimension(requested int) (int, error) {
 	if requested <= 0 {
 		return 0, nil
 	}
-	if quantization != store.QuantizationFloat32 {
-		return 0, fmt.Errorf("SearchDimension is only supported for float32 indexes, got %q", quantization)
+	if s.storedDimensionErr != nil {
+		return 0, s.storedDimensionErr
 	}
-	storedDim, err := s.resolveDimension(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("resolve search dimension: %w", err)
+	if s.quantization != store.QuantizationFloat32 {
+		return 0, fmt.Errorf("SearchDimension is only supported for float32 indexes, got %q", s.quantization)
 	}
-	if requested > storedDim {
-		return 0, fmt.Errorf("SearchDimension %d exceeds stored embedder_dimension %d", requested, storedDim)
+	if requested > s.storedDimension {
+		return 0, fmt.Errorf("SearchDimension %d exceeds stored embedder_dimension %d", requested, s.storedDimension)
 	}
-	if requested == storedDim {
+	if requested == s.storedDimension {
 		// No-op truncation: skip the Matryoshka path and fall back to the
 		// existing vec0 MATCH route so callers do not pay the scan cost
 		// just because they passed the stored dim explicitly.
@@ -496,26 +535,10 @@ func (s *Snapshot) resolveSearchDimension(ctx context.Context, requested int, qu
 	return requested, nil
 }
 
-// resolveDimension reads the snapshot's stored embedder dimension.
-func (s *Snapshot) resolveDimension(ctx context.Context) (int, error) {
-	raw, err := readMetadataValue(ctx, s.db, "embedder_dimension")
-	if err != nil {
-		return 0, err
-	}
-	dim, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil {
-		return 0, fmt.Errorf("parse embedder_dimension %q: %w", raw, err)
-	}
-	if dim <= 0 {
-		return 0, fmt.Errorf("stored embedder_dimension %d is non-positive", dim)
-	}
-	return dim, nil
-}
-
 func scanSectionRow(rows *sql.Rows, includeEmbeddings bool, quantization string) (Section, error) {
 	var (
 		section     Section
-		metadataRaw string
+		metadataRaw []byte
 		blob        []byte
 	)
 	scanArgs := []any{
@@ -571,11 +594,10 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	if err := ensureCompatibleEmbedder(ctx, s.db, query.Embedder); err != nil {
 		return nil, err
 	}
-
-	quantization, err := s.resolveQuantization(ctx)
-	if err != nil {
-		return nil, err
+	if s.quantizationErr != nil {
+		return nil, s.quantizationErr
 	}
+
 	vectors, err := query.Embedder.EmbedQueries(ctx, []string{query.Text})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -584,50 +606,61 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 		return nil, fmt.Errorf("embedder returned %d query vectors, want 1", len(vectors))
 	}
 
-	searchDim, err := s.resolveSearchDimension(ctx, query.SearchDimension, quantization)
+	searchDim, err := s.resolveSearchDimension(query.SearchDimension)
 	if err != nil {
 		return nil, err
 	}
 
 	candidateCount := candidateLimit(query.Limit)
 
-	vectorHits, err := s.searchVectorCandidates(ctx, vectors[0], candidateCount, query.Kinds, quantization, searchDim)
-	if err != nil {
-		return nil, err
+	vectorArm := runArm(ArmVector, func() ([]SearchHit, error) {
+		return s.searchVectorCandidates(ctx, vectors[0], candidateCount, query.Kinds, s.quantization, searchDim)
+	})
+	if vectorArm.Err != nil {
+		// Pre-#17 behavior: vector-arm errors always fail the search
+		// fast with the arm's own error shape, independent of the
+		// configured FusionStrategy.
+		return nil, vectorArm.Err
 	}
 
-	ftsHits, ftsErr := s.searchFTS(ctx, query.Text, candidateCount, query.Kinds)
-	// The default path preserves the pre-#17 fail-fast behavior on FTS
-	// errors so existing callers keep seeing the same error shape. Callers
-	// who supply a custom FusionStrategy opt into seeing the error through
-	// RetrievalArm.Err instead, and may tolerate partial-arm failures.
-	if ftsErr != nil && query.Fusion == nil {
-		return nil, fmt.Errorf("fts search: %w", ftsErr)
-	}
 	// searchFTS returns (nil, nil) on legacy snapshots without fts_chunks
 	// (!s.hasFTS) and on queries whose sanitized form is empty. The first
 	// case is surfaced to FusionStrategy as Available=false; the second as
 	// Available=true with empty Hits ("arm ran, zero matches").
-	arms := []RetrievalArm{
-		{Name: ArmVector, Hits: vectorHits, Available: true},
-		{
-			Name:      ArmFTS,
-			Hits:      ftsHits,
-			Available: s.hasFTS && ftsErr == nil,
-			Err:       ftsErr,
-		},
+	ftsArm := runArm(ArmFTS, func() ([]SearchHit, error) {
+		return s.searchFTS(ctx, query.Text, candidateCount, query.Kinds)
+	})
+	if !s.hasFTS {
+		// Legacy snapshot without the fts_chunks virtual table. searchFTS
+		// already short-circuits to (nil, nil); reflect that to the
+		// FusionStrategy as an unavailable arm so custom strategies can
+		// see the explicit signal rather than an empty available arm.
+		ftsArm.Available = false
 	}
 
 	strategy := query.Fusion
 	if strategy == nil {
 		strategy = DefaultFusion()
 	}
-	fused, err := strategy.Fuse(arms, candidateCount)
+	fused, err := strategy.Fuse([]RetrievalArm{vectorArm, ftsArm}, candidateCount)
 	if err != nil {
 		return nil, fmt.Errorf("fuse candidates: %w", err)
 	}
 
 	return rerankCandidates(ctx, query.Text, query.Limit, fused, query.Reranker)
+}
+
+// runArm invokes fn and packs the result into a RetrievalArm. A non-nil
+// error produces an Available=false arm with empty Hits; a nil error
+// produces an Available=true arm with the returned hits. FusionStrategy
+// implementations that want partial-arm tolerance can inspect Err; the
+// default RRFFusion fails closed on any non-nil Err via validateArms.
+func runArm(name string, fn func() ([]SearchHit, error)) RetrievalArm {
+	hits, err := fn()
+	if err != nil {
+		return RetrievalArm{Name: name, Available: false, Err: err}
+	}
+	return RetrievalArm{Name: name, Hits: hits, Available: true}
 }
 
 // SearchVector runs a vector search against the opened snapshot.
@@ -644,12 +677,11 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	if query.Limit <= 0 {
 		query.Limit = 10
 	}
-
-	quantization, err := s.resolveQuantization(ctx)
-	if err != nil {
-		return nil, err
+	if s.quantizationErr != nil {
+		return nil, s.quantizationErr
 	}
-	hits, err := s.searchVectorCandidates(ctx, query.Embedding, candidateLimit(query.Limit), query.Kinds, quantization, 0)
+
+	hits, err := s.searchVectorCandidates(ctx, query.Embedding, candidateLimit(query.Limit), query.Kinds, s.quantization, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -694,7 +726,7 @@ func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float
 	for rows.Next() {
 		var (
 			hit          SearchHit
-			metadataJSON string
+			metadataJSON []byte
 			distance     float64
 		)
 		if err := rows.Scan(
@@ -775,7 +807,7 @@ LIMIT ?`)
 	for rows.Next() {
 		var (
 			hit          SearchHit
-			metadataJSON string
+			metadataJSON []byte
 			ftsRank      float64
 		)
 		if err := rows.Scan(
@@ -836,12 +868,18 @@ func appendRecordQueryFilter(builder *strings.Builder, args *[]any, column strin
 	builder.WriteString(")")
 }
 
-func unmarshalMetadata(ref, raw string) (map[string]string, error) {
-	if strings.TrimSpace(raw) == "" || raw == "{}" {
+// unmarshalMetadata decodes the per-record metadata_json column into a
+// string map. The raw bytes are expected to be the exact buffer returned
+// by database/sql's scan into a *[]byte destination — taking []byte keeps
+// this off the string-to-[]byte copy path that json.Unmarshal([]byte(str))
+// forces on every hit in the hot search loop (A2 in #57).
+func unmarshalMetadata(ref string, raw []byte) (map[string]string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("{}")) {
 		return map[string]string{}, nil
 	}
 	metadata := map[string]string{}
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+	if err := json.Unmarshal(trimmed, &metadata); err != nil {
 		return nil, fmt.Errorf("decode metadata for %s: %w", ref, err)
 	}
 	return metadata, nil

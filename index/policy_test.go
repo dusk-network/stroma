@@ -194,9 +194,11 @@ func TestSearchSurfacesLeavesOnlyUnderLateChunkPolicy(t *testing.T) {
 	t.Cleanup(func() { _ = snap.Close() })
 
 	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha bravo",
-		Limit:    10,
-		Embedder: fixture,
+		SearchParams: SearchParams{
+			Text:     "alpha bravo",
+			Limit:    10,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -254,9 +256,11 @@ func TestExpandContextWalksParentForLateChunkLeaf(t *testing.T) {
 	t.Cleanup(func() { _ = snap.Close() })
 
 	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha bravo",
-		Limit:    1,
-		Embedder: fixture,
+		SearchParams: SearchParams{
+			Text:     "alpha bravo",
+			Limit:    1,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -402,9 +406,11 @@ func TestRebuildBinaryWithLateChunkPolicyOpensAndSearches(t *testing.T) {
 	t.Cleanup(func() { _ = snap.Close() })
 
 	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha bravo",
-		Limit:    5,
-		Embedder: fixture,
+		SearchParams: SearchParams{
+			Text:     "alpha bravo",
+			Limit:    5,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)

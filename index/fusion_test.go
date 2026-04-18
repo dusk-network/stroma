@@ -205,11 +205,13 @@ func TestSearchCustomFusionReceivesArmsFromSnapshot(t *testing.T) {
 	rr := &provenanceRecordingReranker{}
 
 	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha content",
-		Limit:    5,
-		Embedder: fixture,
-		Fusion:   fusion,
-		Reranker: rr,
+		SearchParams: SearchParams{
+			Text:     "alpha content",
+			Limit:    5,
+			Embedder: fixture,
+			Fusion:   fusion,
+			Reranker: rr,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -279,10 +281,12 @@ func TestSearchCustomFusionSeesLegacyNoFTSArmUnavailable(t *testing.T) {
 
 	fusion := &capturingFusion{result: []SearchHit{}}
 	_, err = snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha content",
-		Limit:    5,
-		Embedder: fixture,
-		Fusion:   fusion,
+		SearchParams: SearchParams{
+			Text:     "alpha content",
+			Limit:    5,
+			Embedder: fixture,
+			Fusion:   fusion,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -342,9 +346,11 @@ func TestSearchDefaultFusionPreservesVectorScoreOnLegacyNoFTS(t *testing.T) {
 	t.Cleanup(func() { _ = snap.Close() })
 
 	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha content",
-		Limit:    5,
-		Embedder: fixture,
+		SearchParams: SearchParams{
+			Text:     "alpha content",
+			Limit:    5,
+			Embedder: fixture,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
@@ -401,10 +407,12 @@ func TestSearchCustomFusionErrorPropagates(t *testing.T) {
 
 	sentinel := errors.New("fusion strategy refused")
 	hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha content",
-		Limit:    5,
-		Embedder: fixture,
-		Fusion:   &capturingFusion{err: sentinel},
+		SearchParams: SearchParams{
+			Text:     "alpha content",
+			Limit:    5,
+			Embedder: fixture,
+			Fusion:   &capturingFusion{err: sentinel},
+		},
 	})
 	if err == nil {
 		t.Fatal("Search() error = nil, want fusion error")
@@ -445,10 +453,12 @@ func TestRerankerSeesProvenance(t *testing.T) {
 
 	rr := &provenanceRecordingReranker{}
 	if _, err := snap.Search(context.Background(), SnapshotSearchQuery{
-		Text:     "alpha content",
-		Limit:    5,
-		Embedder: fixture,
-		Reranker: rr,
+		SearchParams: SearchParams{
+			Text:     "alpha content",
+			Limit:    5,
+			Embedder: fixture,
+			Reranker: rr,
+		},
 	}); err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
