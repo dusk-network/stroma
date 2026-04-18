@@ -333,6 +333,131 @@ func TestExpandContextOnLegacyV4SnapshotDegradesGracefully(t *testing.T) {
 	}
 }
 
+// TestParentChunkIDRejectsCrossRecordLineage proves the v5 same-record
+// invariant: SQLite triggers reject any chunk whose parent_chunk_id
+// points at a row in a different record. The blast radius without this
+// guard is real — ExpandContext would walk a parent across record
+// boundaries (privacy/isolation leak), and DELETE FROM records would
+// CASCADE-delete child chunks while leaving their chunks_vec /
+// fts_chunks rows orphaned (silent corruption).
+//
+// The test installs a synthetic cross-record link via direct SQL on a
+// freshly-built snapshot and asserts both an INSERT-time and an
+// UPDATE-time attempt are aborted.
+func TestParentChunkIDRejectsCrossRecordLineage(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{
+		{Ref: "doc-a", Kind: "note", Title: "A", SourceRef: "a", BodyFormat: corpus.FormatPlaintext, BodyText: "alpha"},
+		{Ref: "doc-b", Kind: "note", Title: "B", SourceRef: "b", BodyFormat: corpus.FormatPlaintext, BodyText: "bravo"},
+	}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	defer func() { _ = rwDB.Close() }()
+
+	var aChunk, bChunk int64
+	if err := rwDB.QueryRowContext(context.Background(),
+		`SELECT id FROM chunks WHERE record_ref = 'doc-a' LIMIT 1`).Scan(&aChunk); err != nil {
+		t.Fatalf("read doc-a chunk: %v", err)
+	}
+	if err := rwDB.QueryRowContext(context.Background(),
+		`SELECT id FROM chunks WHERE record_ref = 'doc-b' LIMIT 1`).Scan(&bChunk); err != nil {
+		t.Fatalf("read doc-b chunk: %v", err)
+	}
+
+	// UPDATE: pointing doc-b's chunk at doc-a's chunk must abort.
+	_, err = rwDB.ExecContext(context.Background(),
+		`UPDATE chunks SET parent_chunk_id = ? WHERE id = ?`, aChunk, bChunk)
+	if err == nil {
+		t.Fatal("UPDATE setting cross-record parent_chunk_id succeeded; same-record trigger missing")
+	}
+	if !strings.Contains(err.Error(), "same record_ref") {
+		t.Fatalf("UPDATE error = %v, want message mentioning same record_ref", err)
+	}
+
+	// INSERT: a fresh chunk under doc-b pointing at doc-a's chunk must abort.
+	_, err = rwDB.ExecContext(context.Background(),
+		`INSERT INTO chunks (record_ref, chunk_index, heading, content, parent_chunk_id) VALUES (?, ?, ?, ?, ?)`,
+		"doc-b", 99, "synthetic", "synthetic body", aChunk)
+	if err == nil {
+		t.Fatal("INSERT with cross-record parent_chunk_id succeeded; same-record trigger missing")
+	}
+	if !strings.Contains(err.Error(), "same record_ref") {
+		t.Fatalf("INSERT error = %v, want message mentioning same record_ref", err)
+	}
+
+	// Same-record link still works (sanity check that the trigger does
+	// not over-reject the legitimate path PR-B will exercise).
+	if _, err := rwDB.ExecContext(context.Background(),
+		`INSERT INTO chunks (record_ref, chunk_index, heading, content, parent_chunk_id) VALUES (?, ?, ?, ?, ?)`,
+		"doc-a", 99, "child", "child body", aChunk); err != nil {
+		t.Fatalf("INSERT with same-record parent_chunk_id failed: %v (trigger over-rejects)", err)
+	}
+}
+
+// TestMigrateV4ToV5InstallsSameRecordTrigger proves upgraded snapshots
+// also get the same-record lineage trigger. Without this, a v4 file
+// migrated forward could accept cross-record parents from any later
+// writer that runs against the upgraded handle.
+func TestMigrateV4ToV5InstallsSameRecordTrigger(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{
+		{Ref: "doc-a", Kind: "note", Title: "A", SourceRef: "a", BodyFormat: corpus.FormatPlaintext, BodyText: "alpha"},
+		{Ref: "doc-b", Kind: "note", Title: "B", SourceRef: "b", BodyFormat: corpus.FormatPlaintext, BodyText: "bravo"},
+	}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if err := rewriteSnapshotToV4(path); err != nil {
+		t.Fatalf("rewriteSnapshotToV4() error = %v", err)
+	}
+	if _, err := Update(context.Background(), nil, nil, UpdateOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Update(v4→v5) error = %v", err)
+	}
+
+	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	defer func() { _ = rwDB.Close() }()
+
+	var aChunk, bChunk int64
+	if err := rwDB.QueryRowContext(context.Background(),
+		`SELECT id FROM chunks WHERE record_ref = 'doc-a' LIMIT 1`).Scan(&aChunk); err != nil {
+		t.Fatalf("read doc-a chunk: %v", err)
+	}
+	if err := rwDB.QueryRowContext(context.Background(),
+		`SELECT id FROM chunks WHERE record_ref = 'doc-b' LIMIT 1`).Scan(&bChunk); err != nil {
+		t.Fatalf("read doc-b chunk: %v", err)
+	}
+	_, err = rwDB.ExecContext(context.Background(),
+		`UPDATE chunks SET parent_chunk_id = ? WHERE id = ?`, aChunk, bChunk)
+	if err == nil {
+		t.Fatal("UPDATE setting cross-record parent_chunk_id on upgraded snapshot succeeded; trigger missing on migration path")
+	}
+	if !strings.Contains(err.Error(), "same record_ref") {
+		t.Fatalf("UPDATE error = %v, want message mentioning same record_ref", err)
+	}
+}
+
 // firstChunkID returns one chunk_id from the snapshot. The snapshot must
 // have at least one chunk.
 func firstChunkID(t *testing.T, snap *Snapshot) int64 {

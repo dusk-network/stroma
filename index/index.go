@@ -710,6 +710,17 @@ func createSchema(ctx context.Context, db *sql.DB, dimension int, quantization s
 		`CREATE INDEX idx_records_kind ON records(kind)`,
 		`CREATE INDEX idx_chunks_record_ref ON chunks(record_ref)`,
 		`CREATE INDEX idx_chunks_parent ON chunks(parent_chunk_id)`,
+		// Same-record lineage invariant for parent_chunk_id (#16). SQLite
+		// CHECK constraints cannot reference other rows, so the
+		// invariant is enforced via BEFORE INSERT / BEFORE UPDATE
+		// triggers that RAISE(ABORT) when a chunk's parent points at a
+		// row in a different record. This blocks cross-record lineage
+		// at the storage layer so ExpandContext's parent walks cannot
+		// leak content across records, and so DELETE FROM records
+		// cascades cannot orphan chunks_vec / fts_chunks rows in an
+		// unrelated record.
+		chunksParentSameRecordInsertTriggerSQL,
+		chunksParentSameRecordUpdateTriggerSQL,
 	}
 	if quantization == store.QuantizationBinary {
 		// Companion full-precision column for the rescore pass. The
@@ -1754,6 +1765,35 @@ func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// chunksParentSameRecordInsertTriggerSQL and
+// chunksParentSameRecordUpdateTriggerSQL guard the v5 lineage column
+// against cross-record parent assignments. SQLite CHECK constraints
+// cannot reference other rows, so the same-record invariant is enforced
+// via BEFORE triggers that RAISE(ABORT) when NEW.parent_chunk_id points
+// at a row in a different record. The trigger is a no-op when
+// parent_chunk_id IS NULL (the only shape PR-A produces), so it adds
+// zero overhead until PR-B's chunk.Policy framework starts emitting
+// parents.
+const (
+	chunksParentSameRecordInsertTriggerSQL = `
+CREATE TRIGGER chunks_parent_same_record_insert
+BEFORE INSERT ON chunks
+WHEN NEW.parent_chunk_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'chunks.parent_chunk_id must reference a chunk in the same record_ref')
+    WHERE NEW.record_ref != (SELECT record_ref FROM chunks WHERE id = NEW.parent_chunk_id);
+END`
+
+	chunksParentSameRecordUpdateTriggerSQL = `
+CREATE TRIGGER chunks_parent_same_record_update
+BEFORE UPDATE OF parent_chunk_id ON chunks
+WHEN NEW.parent_chunk_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'chunks.parent_chunk_id must reference a chunk in the same record_ref')
+    WHERE NEW.record_ref != (SELECT record_ref FROM chunks WHERE id = NEW.parent_chunk_id);
+END`
+)
+
 // migrateV4ToV5InjectFault is a test-only seam that runs between the
 // ALTER + index-create and the metadata bump inside migrateV4ToV5.
 // Production leaves it nil. Tests set it to simulate a crash
@@ -1791,6 +1831,21 @@ func migrateV4ToV5(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_chunk_id)`); err != nil {
 		return fmt.Errorf("migrate v4 to v5: create idx_chunks_parent: %w", err)
+	}
+	// Same-record lineage invariant: install the same triggers a fresh
+	// v5 schema gets so upgraded snapshots cannot accept cross-record
+	// parent_chunk_id values from any later writer. CREATE TRIGGER does
+	// not support IF NOT EXISTS in the SQL standard but SQLite does, so
+	// the migration is idempotent if re-entered on a v5 file.
+	if _, err := tx.ExecContext(ctx,
+		strings.Replace(chunksParentSameRecordInsertTriggerSQL,
+			"CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1)); err != nil {
+		return fmt.Errorf("migrate v4 to v5: create chunks_parent_same_record_insert trigger: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		strings.Replace(chunksParentSameRecordUpdateTriggerSQL,
+			"CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1)); err != nil {
+		return fmt.Errorf("migrate v4 to v5: create chunks_parent_same_record_update trigger: %w", err)
 	}
 	if migrateV4ToV5InjectFault != nil {
 		if err := migrateV4ToV5InjectFault(); err != nil {

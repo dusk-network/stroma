@@ -1955,6 +1955,8 @@ func rewriteSnapshotToV2(path string) error {
 	}
 	defer func() { _ = db.Close() }()
 	for _, stmt := range []string{
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_insert`,
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_update`,
 		`DROP INDEX IF EXISTS idx_chunks_parent`,
 		`ALTER TABLE chunks DROP COLUMN parent_chunk_id`,
 		`ALTER TABLE chunks DROP COLUMN context_prefix`,
@@ -1979,6 +1981,8 @@ func rewriteSnapshotToV3(path string) error {
 	}
 	defer func() { _ = db.Close() }()
 	for _, stmt := range []string{
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_insert`,
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_update`,
 		`DROP INDEX IF EXISTS idx_chunks_parent`,
 		`ALTER TABLE chunks DROP COLUMN parent_chunk_id`,
 		`UPDATE metadata SET value = '3' WHERE key = 'schema_version'`,
@@ -2001,6 +2005,8 @@ func rewriteSnapshotToV4(path string) error {
 	}
 	defer func() { _ = db.Close() }()
 	for _, stmt := range []string{
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_insert`,
+		`DROP TRIGGER IF EXISTS chunks_parent_same_record_update`,
 		`DROP INDEX IF EXISTS idx_chunks_parent`,
 		`ALTER TABLE chunks DROP COLUMN parent_chunk_id`,
 		`UPDATE metadata SET value = '4' WHERE key = 'schema_version'`,
