@@ -839,16 +839,25 @@ func TestSearchFTSRequiresAllTokens(t *testing.T) {
 	}
 }
 
-func TestMergeRRFUsesFusedScores(t *testing.T) {
+func TestRRFFusionUsesFusedScores(t *testing.T) {
 	t.Parallel()
 
-	hits := mergeRRF(
-		[]SearchHit{{ChunkID: 1, Ref: "vector-only", Score: 0.8}, {ChunkID: 2, Ref: "shared", Score: 0.7}},
-		[]SearchHit{{ChunkID: 2, Ref: "shared", Score: -0.2}, {ChunkID: 3, Ref: "fts-only", Score: -0.1}},
-		3,
-	)
+	arms := []RetrievalArm{
+		{
+			Name: ArmVector, Available: true,
+			Hits: []SearchHit{{ChunkID: 1, Ref: "vector-only", Score: 0.8}, {ChunkID: 2, Ref: "shared", Score: 0.7}},
+		},
+		{
+			Name: ArmFTS, Available: true,
+			Hits: []SearchHit{{ChunkID: 2, Ref: "shared", Score: -0.2}, {ChunkID: 3, Ref: "fts-only", Score: -0.1}},
+		},
+	}
+	hits, err := DefaultFusion().Fuse(arms, 3)
+	if err != nil {
+		t.Fatalf("Fuse() error = %v", err)
+	}
 	if len(hits) != 3 {
-		t.Fatalf("len(mergeRRF) = %d, want 3", len(hits))
+		t.Fatalf("len(Fuse) = %d, want 3", len(hits))
 	}
 	for _, hit := range hits {
 		if hit.Score <= 0 {
@@ -857,6 +866,22 @@ func TestMergeRRFUsesFusedScores(t *testing.T) {
 	}
 	if hits[0].Ref != "shared" {
 		t.Fatalf("top fused hit = %q, want shared", hits[0].Ref)
+	}
+	shared := hits[0]
+	if shared.Provenance == nil {
+		t.Fatalf("shared hit has nil Provenance")
+	}
+	if _, ok := shared.Provenance.Arms[ArmVector]; !ok {
+		t.Fatalf("shared hit missing vector arm evidence")
+	}
+	if _, ok := shared.Provenance.Arms[ArmFTS]; !ok {
+		t.Fatalf("shared hit missing fts arm evidence")
+	}
+	if shared.Provenance.Arms[ArmVector].Score != 0.7 {
+		t.Fatalf("shared vector evidence Score = %v, want 0.7", shared.Provenance.Arms[ArmVector].Score)
+	}
+	if shared.Provenance.Arms[ArmFTS].Score != -0.2 {
+		t.Fatalf("shared fts evidence Score = %v, want -0.2", shared.Provenance.Arms[ArmFTS].Score)
 	}
 }
 

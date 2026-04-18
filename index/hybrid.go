@@ -1,6 +1,7 @@
 package index
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"unicode"
@@ -8,42 +9,113 @@ import (
 
 const rrfK = 60
 
-// mergeRRF combines vector and FTS search hits using reciprocal rank fusion.
-// The returned hits use the fused RRF score so callers can compare scores
-// across vector-only, FTS-only, and blended results.
+// RRFFusion is the default FusionStrategy. K controls the RRF constant;
+// K<=0 is treated as K=60 for backward compatibility with the pre-#17
+// mergeRRF helper.
 //
-// Ties are broken by source count (hits found by both retrieval paths beat
-// single-source hits) and then by best rank across sources, so FTS-only exact
-// matches are not buried by vector-only hits at the same RRF score.
-func mergeRRF(vectorHits, ftsHits []SearchHit, limit int) []SearchHit {
-	rrfScores := make(map[int64]float64)
-	sources := make(map[int64]int)  // number of retrieval paths that found this hit
-	bestRank := make(map[int64]int) // best (lowest) rank across sources
-	hitMap := make(map[int64]SearchHit)
+// PreserveSingleArmScore controls the single-arm degenerate case. When
+// true (the default used by DefaultFusion) and exactly one arm is
+// available-and-non-empty, Fuse returns that arm's hits in arm order with
+// arm-native Score preserved. When false, Fuse rewrites Score to the
+// RRF-derived 1/(K+rank+1) on every path. Callers that want numerically
+// uniform fused scores across single-arm and multi-arm paths opt in by
+// setting this to false.
+type RRFFusion struct {
+	K                      int
+	PreserveSingleArmScore bool
+}
 
-	for rank, hit := range vectorHits {
-		rrfScores[hit.ChunkID] += 1.0 / float64(rrfK+rank+1)
-		sources[hit.ChunkID]++
-		bestRank[hit.ChunkID] = rank
-		hitMap[hit.ChunkID] = hit
+// Fuse implements FusionStrategy. See RRFFusion for the single-arm
+// contract. Ties in RRF score are broken by (more contributing arms first)
+// then (better cross-arm rank first).
+func (r RRFFusion) Fuse(arms []RetrievalArm, limit int) ([]SearchHit, error) {
+	if limit <= 0 {
+		return nil, nil
 	}
-	for rank, hit := range ftsHits {
-		rrfScores[hit.ChunkID] += 1.0 / float64(rrfK+rank+1)
-		sources[hit.ChunkID]++
-		if prev, ok := bestRank[hit.ChunkID]; !ok || rank < prev {
-			bestRank[hit.ChunkID] = rank
+	k := r.K
+	if k <= 0 {
+		k = rrfK
+	}
+
+	for i := range arms {
+		arm := arms[i]
+		if arm.Name == "" {
+			return nil, fmt.Errorf("retrieval arm at index %d has empty Name", i)
 		}
-		if _, ok := hitMap[hit.ChunkID]; !ok {
-			hitMap[hit.ChunkID] = hit
+		if arm.Available && arm.Err != nil {
+			return nil, fmt.Errorf("retrieval arm %q: Available=true with non-nil Err", arm.Name)
 		}
+		if !arm.Available && len(arm.Hits) > 0 {
+			return nil, fmt.Errorf("retrieval arm %q: Available=false with non-empty Hits", arm.Name)
+		}
+		// RRFFusion fails closed on upstream arm errors, matching pre-#17
+		// Snapshot.Search behavior. Custom strategies that want partial-arm
+		// tolerance implement it themselves.
+		if arm.Err != nil {
+			return nil, fmt.Errorf("retrieval arm %q failed: %w", arm.Name, arm.Err)
+		}
+	}
+
+	nonEmpty := 0
+	singleIdx := -1
+	for i := range arms {
+		if arms[i].Available && len(arms[i].Hits) > 0 {
+			nonEmpty++
+			singleIdx = i
+		}
+	}
+
+	if nonEmpty == 0 {
+		return nil, nil
+	}
+
+	if nonEmpty == 1 && r.PreserveSingleArmScore {
+		arm := arms[singleIdx]
+		out := make([]SearchHit, 0, min(len(arm.Hits), limit))
+		for rank, hit := range arm.Hits {
+			if rank >= limit {
+				break
+			}
+			hit.Provenance = &HitProvenance{Arms: map[string]ArmEvidence{
+				arm.Name: {Rank: rank, Score: hit.Score},
+			}}
+			out = append(out, hit)
+		}
+		return out, nil
 	}
 
 	type scored struct {
 		id       int64
 		rrfScore float64
-		sources  int // how many retrieval paths found this hit
-		best     int // best rank across sources (lower = better)
+		sources  int
+		best     int
 	}
+	rrfScores := make(map[int64]float64)
+	sources := make(map[int64]int)
+	bestRank := make(map[int64]int)
+	hitMap := make(map[int64]SearchHit)
+	evidence := make(map[int64]map[string]ArmEvidence)
+
+	for _, arm := range arms {
+		if !arm.Available {
+			continue
+		}
+		for rank, hit := range arm.Hits {
+			rrfScores[hit.ChunkID] += 1.0 / float64(k+rank+1)
+			sources[hit.ChunkID]++
+			if prev, ok := bestRank[hit.ChunkID]; !ok || rank < prev {
+				bestRank[hit.ChunkID] = rank
+			}
+			if _, ok := hitMap[hit.ChunkID]; !ok {
+				hitMap[hit.ChunkID] = hit
+			}
+			if _, ok := evidence[hit.ChunkID]; !ok {
+				evidence[hit.ChunkID] = make(map[string]ArmEvidence)
+			}
+			evidence[hit.ChunkID][arm.Name] = ArmEvidence{Rank: rank, Score: hit.Score}
+		}
+	}
+
 	ranked := make([]scored, 0, len(rrfScores))
 	for id, rs := range rrfScores {
 		ranked = append(ranked, scored{id, rs, sources[id], bestRank[id]})
@@ -52,11 +124,9 @@ func mergeRRF(vectorHits, ftsHits []SearchHit, limit int) []SearchHit {
 		if ranked[i].rrfScore != ranked[j].rrfScore {
 			return ranked[i].rrfScore > ranked[j].rrfScore
 		}
-		// Prefer hits found by more retrieval paths.
 		if ranked[i].sources != ranked[j].sources {
 			return ranked[i].sources > ranked[j].sources
 		}
-		// Among same-source-count ties, prefer the better original rank.
 		return ranked[i].best < ranked[j].best
 	})
 	if len(ranked) > limit {
@@ -67,9 +137,10 @@ func mergeRRF(vectorHits, ftsHits []SearchHit, limit int) []SearchHit {
 	for _, s := range ranked {
 		hit := hitMap[s.id]
 		hit.Score = s.rrfScore
+		hit.Provenance = &HitProvenance{Arms: evidence[s.id]}
 		result = append(result, hit)
 	}
-	return result
+	return result, nil
 }
 
 // sanitizeFTSQuery converts free text into an FTS5 AND query with quoted

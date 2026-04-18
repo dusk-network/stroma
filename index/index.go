@@ -268,6 +268,7 @@ type SearchQuery struct {
 	Limit    int
 	Kinds    []string
 	Embedder embed.Embedder
+	Fusion   FusionStrategy
 	Reranker Reranker
 
 	// SearchDimension optionally runs a truncated-prefix vector prefilter
@@ -297,12 +298,79 @@ type SearchHit struct {
 	Content   string
 	Metadata  map[string]string
 	Score     float64
+	// Provenance records which retrieval arms contributed to this hit.
+	// It is populated by FusionStrategy implementations; non-fusion paths
+	// (SearchVector, direct searchFTS callers) leave it nil.
+	Provenance *HitProvenance
 }
 
 // Reranker optionally refines one search candidate shortlist before the final
 // limit truncation.
 type Reranker interface {
 	Rerank(ctx context.Context, query string, candidates []SearchHit) ([]SearchHit, error)
+}
+
+// Arm name constants used by the default Snapshot.Search pipeline. Custom
+// FusionStrategy implementations may introduce additional arm names.
+const (
+	ArmVector = "vector"
+	ArmFTS    = "fts"
+)
+
+// RetrievalArm is one candidate list from one retrieval path, ordered by
+// the arm's own ranking. Hits[i].Score is the arm-native score (cosine
+// distance derivative for vector, negative bm25-equivalent for FTS).
+//
+// Available and Err distinguish three otherwise identical-looking states:
+//   - Available=true, Err=nil, len(Hits)==0: arm ran, zero matches.
+//   - Available=false, Err=nil: arm unavailable on this snapshot (for
+//     example a legacy snapshot without fts_chunks). Hits must be empty.
+//   - Available=false, Err!=nil: arm failed. Hits must be empty.
+//
+// Available=true with a non-nil Err is invalid; FusionStrategy
+// implementations should return an error when they observe it.
+type RetrievalArm struct {
+	Name      string
+	Hits      []SearchHit
+	Available bool
+	Err       error
+}
+
+// ArmEvidence is one arm's contribution to a fused hit.
+type ArmEvidence struct {
+	// Rank is the zero-based position of the hit within the arm.
+	Rank int
+	// Score is the arm-native score at the time the arm returned the hit
+	// (cosine derivative for vector, negative bm25 for FTS).
+	Score float64
+}
+
+// HitProvenance records which arms found a fused hit. The map is keyed by
+// arm name; arms that did not return the hit are absent from the map.
+type HitProvenance struct {
+	Arms map[string]ArmEvidence
+}
+
+// FusionStrategy combines one or more RetrievalArms into a single ranked
+// list, truncated to limit. Implementations must be deterministic and must
+// attach HitProvenance to every returned hit covering each arm that
+// contributed.
+//
+// Fuse returns an error when inputs are malformed (for example Available=true
+// with a non-nil Err, or an arm with an empty Name) or when the strategy
+// fails closed on an upstream arm error. Callers treat errors the same way
+// as any other retrieval failure. Strategies that want to tolerate
+// partial-arm failures do so internally and return a nil error.
+type FusionStrategy interface {
+	Fuse(arms []RetrievalArm, limit int) ([]SearchHit, error)
+}
+
+// DefaultFusion returns the FusionStrategy used when SearchQuery.Fusion is
+// nil. It is byte-identical to pre-#17 Snapshot.Search behavior on every
+// path: hybrid arms fused with RRF (K=60), single-available-arm results
+// returned with arm-native Score preserved, zero-arm results empty.
+func DefaultFusion() FusionStrategy {
+	return RRFFusion{K: rrfK, PreserveSingleArmScore: true}
 }
 
 // ChunkContextualizer produces a short explanatory prefix for each section

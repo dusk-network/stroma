@@ -62,6 +62,9 @@ type SnapshotSearchQuery struct {
 	Limit    int
 	Kinds    []string
 	Embedder embed.Embedder
+	// Fusion optionally overrides the hybrid fusion strategy. Nil uses
+	// DefaultFusion(), which is byte-identical to pre-#17 behavior.
+	Fusion   FusionStrategy
 	Reranker Reranker
 
 	// SearchDimension optionally runs a truncated-prefix vector prefilter
@@ -595,12 +598,25 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	if ftsErr != nil {
 		return nil, fmt.Errorf("fts search: %w", ftsErr)
 	}
-
-	if len(ftsHits) == 0 {
-		return rerankCandidates(ctx, query.Text, query.Limit, vectorHits, query.Reranker)
+	// searchFTS returns (nil, nil) on legacy snapshots without fts_chunks
+	// (!s.hasFTS) and on queries whose sanitized form is empty. The first
+	// case is surfaced to FusionStrategy as Available=false; the second as
+	// Available=true with empty Hits ("arm ran, zero matches").
+	arms := []RetrievalArm{
+		{Name: ArmVector, Hits: vectorHits, Available: true},
+		{Name: ArmFTS, Hits: ftsHits, Available: s.hasFTS},
 	}
 
-	return rerankCandidates(ctx, query.Text, query.Limit, mergeRRF(vectorHits, ftsHits, candidateCount), query.Reranker)
+	strategy := query.Fusion
+	if strategy == nil {
+		strategy = DefaultFusion()
+	}
+	fused, err := strategy.Fuse(arms, candidateCount)
+	if err != nil {
+		return nil, fmt.Errorf("fuse candidates: %w", err)
+	}
+
+	return rerankCandidates(ctx, query.Text, query.Limit, fused, query.Reranker)
 }
 
 // SearchVector runs a vector search against the opened snapshot.
