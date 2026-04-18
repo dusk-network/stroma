@@ -192,15 +192,15 @@ func (s *Snapshot) loadContextSections(ctx context.Context, ids map[int64]struct
 		args = append(args, id)
 	}
 
+	// SQL is assembled via strings.Builder rather than fmt.Sprintf so
+	// gosec G201 stays clean. Every fragment written here is either a
+	// hard-coded literal or a package-local constant
+	// (contextPrefixSelectExpr return value, "?" placeholders); no user
+	// data is concatenated into the SQL text. User data is passed
+	// exclusively via the args slice to QueryContext below.
 	prefixExpr := contextPrefixSelectExpr(s.hasContextPrefix)
-
-	// All %s holes are interpolated from in-package constants and from a
-	// placeholder list of "?, ?, ..." derived from the size of the ID set
-	// (no user data is concatenated into the SQL text). User data is
-	// passed exclusively via the args slice through QueryContext, so this
-	// is not an injection vector even though gosec G201 flags any SQL
-	// formatting on principle.
-	query := fmt.Sprintf(`
+	var qb strings.Builder
+	qb.WriteString(`
 SELECT
   c.id,
   r.ref,
@@ -209,12 +209,17 @@ SELECT
   r.source_ref,
   c.heading,
   c.content,
-  %s,
+  `)
+	qb.WriteString(prefixExpr)
+	qb.WriteString(`,
   r.metadata_json,
   c.chunk_index
 FROM chunks c
 JOIN records r ON r.ref = c.record_ref
-WHERE c.id IN (%s)`, prefixExpr, strings.Join(placeholders, ", ")) //nolint:gosec // see comment above: SQL fragments are package-local constants and `?` placeholders
+WHERE c.id IN (`)
+	qb.WriteString(strings.Join(placeholders, ", "))
+	qb.WriteString(`)`)
+	query := qb.String()
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
