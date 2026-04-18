@@ -62,6 +62,11 @@ type SnapshotSearchQuery struct {
 	Limit    int
 	Kinds    []string
 	Embedder embed.Embedder
+	// Fusion optionally overrides the hybrid fusion strategy. Nil uses
+	// DefaultFusion(), which preserves pre-#17 ordering on every path and
+	// pre-#17 Score on every path except the vector-empty + FTS-non-empty
+	// case (see DefaultFusion for details).
+	Fusion   FusionStrategy
 	Reranker Reranker
 
 	// SearchDimension optionally runs a truncated-prefix vector prefilter
@@ -592,15 +597,37 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	}
 
 	ftsHits, ftsErr := s.searchFTS(ctx, query.Text, candidateCount, query.Kinds)
-	if ftsErr != nil {
+	// The default path preserves the pre-#17 fail-fast behavior on FTS
+	// errors so existing callers keep seeing the same error shape. Callers
+	// who supply a custom FusionStrategy opt into seeing the error through
+	// RetrievalArm.Err instead, and may tolerate partial-arm failures.
+	if ftsErr != nil && query.Fusion == nil {
 		return nil, fmt.Errorf("fts search: %w", ftsErr)
 	}
-
-	if len(ftsHits) == 0 {
-		return rerankCandidates(ctx, query.Text, query.Limit, vectorHits, query.Reranker)
+	// searchFTS returns (nil, nil) on legacy snapshots without fts_chunks
+	// (!s.hasFTS) and on queries whose sanitized form is empty. The first
+	// case is surfaced to FusionStrategy as Available=false; the second as
+	// Available=true with empty Hits ("arm ran, zero matches").
+	arms := []RetrievalArm{
+		{Name: ArmVector, Hits: vectorHits, Available: true},
+		{
+			Name:      ArmFTS,
+			Hits:      ftsHits,
+			Available: s.hasFTS && ftsErr == nil,
+			Err:       ftsErr,
+		},
 	}
 
-	return rerankCandidates(ctx, query.Text, query.Limit, mergeRRF(vectorHits, ftsHits, candidateCount), query.Reranker)
+	strategy := query.Fusion
+	if strategy == nil {
+		strategy = DefaultFusion()
+	}
+	fused, err := strategy.Fuse(arms, candidateCount)
+	if err != nil {
+		return nil, fmt.Errorf("fuse candidates: %w", err)
+	}
+
+	return rerankCandidates(ctx, query.Text, query.Limit, fused, query.Reranker)
 }
 
 // SearchVector runs a vector search against the opened snapshot.
