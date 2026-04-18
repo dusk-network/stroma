@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dusk-network/stroma/corpus"
-	"github.com/dusk-network/stroma/store"
+	"github.com/dusk-network/stroma/v2/corpus"
+	"github.com/dusk-network/stroma/v2/store"
 )
 
 // SQL fragments for projecting the chunks.context_prefix column. v2

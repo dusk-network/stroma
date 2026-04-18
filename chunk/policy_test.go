@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dusk-network/stroma/corpus"
+	"github.com/dusk-network/stroma/v2/corpus"
 )
 
 // TestMarkdownPolicyMatchesMarkdownWithOptions pins the default-behavior

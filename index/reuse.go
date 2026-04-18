@@ -11,9 +11,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dusk-network/stroma/chunk"
-	"github.com/dusk-network/stroma/corpus"
-	"github.com/dusk-network/stroma/store"
+	"github.com/dusk-network/stroma/v2/chunk"
+	"github.com/dusk-network/stroma/v2/corpus"
+	"github.com/dusk-network/stroma/v2/store"
 )
 
 // reuseState holds a live read-only handle to the prior snapshot. Record and

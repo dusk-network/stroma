@@ -1,4 +1,4 @@
-module github.com/dusk-network/stroma
+module github.com/dusk-network/stroma/v2
 
 go 1.25.9
 

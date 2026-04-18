@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/dusk-network/stroma/corpus"
-	"github.com/dusk-network/stroma/embed"
-	"github.com/dusk-network/stroma/store"
+	"github.com/dusk-network/stroma/v2/corpus"
+	"github.com/dusk-network/stroma/v2/embed"
+	"github.com/dusk-network/stroma/v2/store"
 )
 
 // TestReuseScanBlobSurvivesNext pins the contract that D2 (#60) depends
