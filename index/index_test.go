@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dusk-network/stroma/chunk"
-	"github.com/dusk-network/stroma/corpus"
-	"github.com/dusk-network/stroma/embed"
-	"github.com/dusk-network/stroma/store"
+	"github.com/dusk-network/stroma/v2/chunk"
+	"github.com/dusk-network/stroma/v2/corpus"
+	"github.com/dusk-network/stroma/v2/embed"
+	"github.com/dusk-network/stroma/v2/store"
 )
 
 const (

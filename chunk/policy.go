@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/dusk-network/stroma/corpus"
+	"github.com/dusk-network/stroma/v2/corpus"
 )
 
 // NoParent is the sentinel used by SectionWithLineage.ParentIndex to
