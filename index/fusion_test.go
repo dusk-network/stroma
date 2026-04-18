@@ -29,8 +29,8 @@ type provenanceRecordingReranker struct {
 }
 
 func (r *provenanceRecordingReranker) Rerank(_ context.Context, _ string, candidates []SearchHit) ([]SearchHit, error) {
-	for _, hit := range candidates {
-		r.seenProvenance = append(r.seenProvenance, hit.Provenance)
+	for i := range candidates {
+		r.seenProvenance = append(r.seenProvenance, candidates[i].Provenance)
 	}
 	return candidates, nil
 }
@@ -123,6 +123,18 @@ func TestRRFFusionEmptyArmNameIsInvalid(t *testing.T) {
 	arms := []RetrievalArm{{Name: "", Available: true}}
 	if _, err := DefaultFusion().Fuse(arms, 5); err == nil {
 		t.Fatalf("Fuse() error = nil, want validation error")
+	}
+}
+
+func TestRRFFusionDuplicateArmNameIsInvalid(t *testing.T) {
+	t.Parallel()
+
+	arms := []RetrievalArm{
+		{Name: ArmVector, Available: true, Hits: []SearchHit{{ChunkID: 1, Score: 0.5}}},
+		{Name: ArmVector, Available: true, Hits: []SearchHit{{ChunkID: 2, Score: 0.4}}},
+	}
+	if _, err := DefaultFusion().Fuse(arms, 5); err == nil {
+		t.Fatalf("Fuse() error = nil, want duplicate-name validation error")
 	}
 }
 

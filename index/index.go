@@ -366,9 +366,13 @@ type FusionStrategy interface {
 }
 
 // DefaultFusion returns the FusionStrategy used when SearchQuery.Fusion is
-// nil. It is byte-identical to pre-#17 Snapshot.Search behavior on every
-// path: hybrid arms fused with RRF (K=60), single-available-arm results
-// returned with arm-native Score preserved, zero-arm results empty.
+// nil. Ordering is identical to pre-#17 Snapshot.Search on every path, and
+// SearchHit.Score is identical on every path except one: when the vector
+// arm returns zero hits and the FTS arm is non-empty, DefaultFusion
+// preserves the bm25-derived arm-native Score instead of the pre-#17
+// RRF-rewritten score. Callers who read Score on that specific path can
+// recover both the arm-native and pre-#17-style scores via the
+// HitProvenance attached to each hit.
 func DefaultFusion() FusionStrategy {
 	return RRFFusion{K: rrfK, PreserveSingleArmScore: true}
 }
@@ -748,6 +752,7 @@ func Search(ctx context.Context, query SearchQuery) ([]SearchHit, error) {
 		Limit:           query.Limit,
 		Kinds:           query.Kinds,
 		Embedder:        query.Embedder,
+		Fusion:          query.Fusion,
 		Reranker:        query.Reranker,
 		SearchDimension: query.SearchDimension,
 	})

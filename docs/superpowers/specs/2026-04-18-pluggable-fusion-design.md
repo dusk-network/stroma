@@ -94,12 +94,14 @@ type FusionStrategy interface {
 
 // ArmEvidence is one arm's contribution to a fused hit.
 type ArmEvidence struct {
-    Rank  int     // zero-based rank within the arm; -1 if the arm did not return this hit
+    Rank  int     // zero-based rank within the arm
     Score float64 // arm-native score at the time the arm returned the hit
 }
 
 // HitProvenance records which arms found a fused hit. The map is keyed by arm
-// name. Arms that did not return the hit are absent from the map.
+// name. Arms that did not return the hit are absent from the map, so absence
+// (rather than a sentinel Rank value) is the signal that an arm did not
+// contribute.
 type HitProvenance struct {
     Arms map[string]ArmEvidence
 }
@@ -165,7 +167,10 @@ type SearchQuery struct {
     // ... existing fields unchanged ...
 
     // Fusion optionally overrides the hybrid fusion strategy. Nil uses
-    // RRFFusion{K: 60}, which is byte-identical to the pre-#17 behavior.
+    // DefaultFusion() (equivalent to RRFFusion{K: 60, PreserveSingleArmScore: true}),
+    // which preserves pre-#17 ordering on every path and pre-#17 Score on
+    // every path except the vector-empty + FTS-non-empty case described
+    // in the backward-compatibility section.
     Fusion FusionStrategy
 
     Reranker Reranker

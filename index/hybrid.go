@@ -32,93 +32,125 @@ func (r RRFFusion) Fuse(arms []RetrievalArm, limit int) ([]SearchHit, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
+	if err := validateArms(arms); err != nil {
+		return nil, err
+	}
 	k := r.K
 	if k <= 0 {
 		k = rrfK
 	}
 
+	nonEmpty, singleIdx := countAvailableNonEmpty(arms)
+	if nonEmpty == 0 {
+		return nil, nil
+	}
+	if nonEmpty == 1 && r.PreserveSingleArmScore {
+		return fuseSingleArm(arms[singleIdx], limit), nil
+	}
+	return fuseRRF(arms, k, limit), nil
+}
+
+// validateArms rejects malformed RetrievalArm inputs before any scoring
+// happens so custom FusionStrategy implementations (and the default
+// RRFFusion) see a consistent contract. Duplicate arm names are rejected
+// because HitProvenance.Arms is keyed by name; silently overwriting would
+// corrupt provenance evidence for shared hits.
+func validateArms(arms []RetrievalArm) error {
+	seen := make(map[string]struct{}, len(arms))
 	for i := range arms {
-		arm := arms[i]
+		arm := &arms[i]
 		if arm.Name == "" {
-			return nil, fmt.Errorf("retrieval arm at index %d has empty Name", i)
+			return fmt.Errorf("retrieval arm at index %d has empty Name", i)
 		}
+		if _, dup := seen[arm.Name]; dup {
+			return fmt.Errorf("retrieval arm %q appears more than once", arm.Name)
+		}
+		seen[arm.Name] = struct{}{}
 		if arm.Available && arm.Err != nil {
-			return nil, fmt.Errorf("retrieval arm %q: Available=true with non-nil Err", arm.Name)
+			return fmt.Errorf("retrieval arm %q: Available=true with non-nil Err", arm.Name)
 		}
 		if !arm.Available && len(arm.Hits) > 0 {
-			return nil, fmt.Errorf("retrieval arm %q: Available=false with non-empty Hits", arm.Name)
+			return fmt.Errorf("retrieval arm %q: Available=false with non-empty Hits", arm.Name)
 		}
 		// RRFFusion fails closed on upstream arm errors, matching pre-#17
 		// Snapshot.Search behavior. Custom strategies that want partial-arm
 		// tolerance implement it themselves.
 		if arm.Err != nil {
-			return nil, fmt.Errorf("retrieval arm %q failed: %w", arm.Name, arm.Err)
+			return fmt.Errorf("retrieval arm %q failed: %w", arm.Name, arm.Err)
 		}
 	}
+	return nil
+}
 
-	nonEmpty := 0
-	singleIdx := -1
+func countAvailableNonEmpty(arms []RetrievalArm) (count, singleIdx int) {
+	singleIdx = -1
 	for i := range arms {
 		if arms[i].Available && len(arms[i].Hits) > 0 {
-			nonEmpty++
+			count++
 			singleIdx = i
 		}
 	}
+	return count, singleIdx
+}
 
-	if nonEmpty == 0 {
-		return nil, nil
-	}
-
-	if nonEmpty == 1 && r.PreserveSingleArmScore {
-		arm := arms[singleIdx]
-		out := make([]SearchHit, 0, min(len(arm.Hits), limit))
-		for rank, hit := range arm.Hits {
-			if rank >= limit {
-				break
-			}
-			hit.Provenance = &HitProvenance{Arms: map[string]ArmEvidence{
-				arm.Name: {Rank: rank, Score: hit.Score},
-			}}
-			out = append(out, hit)
+// fuseSingleArm returns the arm's hits in arm order with arm-native Score
+// preserved and HitProvenance populated. Used when exactly one arm is
+// available-and-non-empty and PreserveSingleArmScore is true.
+func fuseSingleArm(arm RetrievalArm, limit int) []SearchHit {
+	out := make([]SearchHit, 0, min(len(arm.Hits), limit))
+	for rank := range arm.Hits {
+		if rank >= limit {
+			break
 		}
-		return out, nil
+		hit := arm.Hits[rank]
+		hit.Provenance = &HitProvenance{Arms: map[string]ArmEvidence{
+			arm.Name: {Rank: rank, Score: hit.Score},
+		}}
+		out = append(out, hit)
 	}
+	return out
+}
 
-	type scored struct {
-		id       int64
+// fuseRRF runs the full RRF scoring pass across all available arms. Ties
+// are broken by source count (more contributing arms first) then by best
+// cross-arm rank (lower is better).
+func fuseRRF(arms []RetrievalArm, k, limit int) []SearchHit {
+	type aggregate struct {
+		hit      SearchHit
 		rrfScore float64
 		sources  int
-		best     int
+		bestRank int
+		evidence map[string]ArmEvidence
 	}
-	rrfScores := make(map[int64]float64)
-	sources := make(map[int64]int)
-	bestRank := make(map[int64]int)
-	hitMap := make(map[int64]SearchHit)
-	evidence := make(map[int64]map[string]ArmEvidence)
-
-	for _, arm := range arms {
+	agg := make(map[int64]*aggregate)
+	for i := range arms {
+		arm := &arms[i]
 		if !arm.Available {
 			continue
 		}
-		for rank, hit := range arm.Hits {
-			rrfScores[hit.ChunkID] += 1.0 / float64(k+rank+1)
-			sources[hit.ChunkID]++
-			if prev, ok := bestRank[hit.ChunkID]; !ok || rank < prev {
-				bestRank[hit.ChunkID] = rank
+		for rank := range arm.Hits {
+			hit := arm.Hits[rank]
+			entry, ok := agg[hit.ChunkID]
+			if !ok {
+				entry = &aggregate{
+					hit:      hit,
+					bestRank: rank,
+					evidence: make(map[string]ArmEvidence),
+				}
+				agg[hit.ChunkID] = entry
 			}
-			if _, ok := hitMap[hit.ChunkID]; !ok {
-				hitMap[hit.ChunkID] = hit
+			entry.rrfScore += 1.0 / float64(k+rank+1)
+			entry.sources++
+			if rank < entry.bestRank {
+				entry.bestRank = rank
 			}
-			if _, ok := evidence[hit.ChunkID]; !ok {
-				evidence[hit.ChunkID] = make(map[string]ArmEvidence)
-			}
-			evidence[hit.ChunkID][arm.Name] = ArmEvidence{Rank: rank, Score: hit.Score}
+			entry.evidence[arm.Name] = ArmEvidence{Rank: rank, Score: hit.Score}
 		}
 	}
 
-	ranked := make([]scored, 0, len(rrfScores))
-	for id, rs := range rrfScores {
-		ranked = append(ranked, scored{id, rs, sources[id], bestRank[id]})
+	ranked := make([]*aggregate, 0, len(agg))
+	for _, entry := range agg {
+		ranked = append(ranked, entry)
 	}
 	sort.Slice(ranked, func(i, j int) bool {
 		if ranked[i].rrfScore != ranked[j].rrfScore {
@@ -127,20 +159,20 @@ func (r RRFFusion) Fuse(arms []RetrievalArm, limit int) ([]SearchHit, error) {
 		if ranked[i].sources != ranked[j].sources {
 			return ranked[i].sources > ranked[j].sources
 		}
-		return ranked[i].best < ranked[j].best
+		return ranked[i].bestRank < ranked[j].bestRank
 	})
 	if len(ranked) > limit {
 		ranked = ranked[:limit]
 	}
 
 	result := make([]SearchHit, 0, len(ranked))
-	for _, s := range ranked {
-		hit := hitMap[s.id]
-		hit.Score = s.rrfScore
-		hit.Provenance = &HitProvenance{Arms: evidence[s.id]}
+	for _, entry := range ranked {
+		hit := entry.hit
+		hit.Score = entry.rrfScore
+		hit.Provenance = &HitProvenance{Arms: entry.evidence}
 		result = append(result, hit)
 	}
-	return result, nil
+	return result
 }
 
 // sanitizeFTSQuery converts free text into an FTS5 AND query with quoted

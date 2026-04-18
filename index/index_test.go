@@ -3705,8 +3705,8 @@ func snapshotContents(t *testing.T, path string) ([]corpus.Record, []comparableS
 
 func searchRefs(hits []SearchHit) []string {
 	result := make([]string, 0, len(hits))
-	for _, hit := range hits {
-		result = append(result, hit.Ref)
+	for i := range hits {
+		result = append(result, hits[i].Ref)
 	}
 	return result
 }
