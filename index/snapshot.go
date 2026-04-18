@@ -85,8 +85,16 @@ type RecordQuery struct {
 
 // SectionQuery filters sections from an opened snapshot.
 type SectionQuery struct {
-	Refs              []string
-	Kinds             []string
+	Refs  []string
+	Kinds []string
+
+	// IncludeEmbeddings asks Sections() to populate Section.Embedding
+	// from the stored vector column. Snapshots produced by hierarchical
+	// policies (e.g., chunk.LateChunkPolicy) hold parent rows that are
+	// storage-only context with no vector — those rows are filtered
+	// out of an IncludeEmbeddings = true query because the underlying
+	// chunks → chunks_vec join is inner. Set IncludeEmbeddings = false
+	// to receive every chunk row (parents + leaves) without embeddings.
 	IncludeEmbeddings bool
 }
 

@@ -127,8 +127,8 @@ The existing single-pass insert becomes two passes:
 2. **Insert pass.**
     - For each section in order:
         - Insert the chunk row. If the section is a parent (`parentIndices` contains its index), `parent_chunk_id = NULL` and skip the embed call. If it is a leaf with `ParentIndex != NoParent`, resolve the FK to the parent's `chunks.id` from a slice-index → chunk-id map.
-        - Insert the FTS5 row (parents and leaves both go into FTS so `ExpandContext` can return their text).
-        - For non-parents, run the embedder and insert the vector blob (and the binary companion if applicable).
+        - Parents skip both the FTS5 row and the vector blob — they are storage-only context and must not surface from either arm of hybrid search. `ExpandContext` reads `chunks` directly, so the parent's text is still available for parent-walk retrieval.
+        - For non-parents, insert the FTS5 row, run the embedder, and insert the vector blob (and the binary companion if applicable).
 
 Reuse keying stays leaf-centric. The reuse map continues to key on `(heading, content, context_prefix)`; parents get fresh rows on every rebuild because they have no embedding to reuse. If a record's body changes such that the leaves are stable but a parent's text shifts, the leaves correctly reuse their embeddings while the parent row is rewritten.
 
