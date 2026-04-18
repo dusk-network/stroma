@@ -278,15 +278,16 @@ ORDER BY c.chunk_index ASC, c.id ASC`, prefixExpr, embeddingSource, joinClause),
 			prefix    string
 			embedding []byte
 		)
-		// database/sql already clones the BLOB column into a caller-owned
-		// []byte for *[]byte scan destinations (see Go stdlib
-		// convert.go: `*d = bytes.Clone(s)` on the `*[]byte` arm). The
-		// ncruces wasm driver hands raw wasm-memory views into its driver
-		// values, but those views are cloned on the stdlib Scan boundary
-		// before the caller ever sees them — so `embedding` here outlives
-		// the next rows.Next() call without an additional defensive copy.
-		// Do NOT reintroduce `append([]byte(nil), embedding...)`; it is
-		// pure duplicated work on the reuse hot path.
+		// database/sql documents that scanning into a []byte gives the
+		// caller an owned copy of the column data. The ncruces wasm
+		// driver may expose raw wasm-memory views in its driver values,
+		// but Scan copies those into `embedding` before the caller sees
+		// them, so this value remains valid after the next rows.Next()
+		// call. The unsafe type here would be sql.RawBytes, whose
+		// contents are only valid until the next Scan. Do NOT
+		// reintroduce `append([]byte(nil), embedding...)`; it is pure
+		// duplicated work on the reuse hot path.
+		// TestReuseScanBlobSurvivesNext pins this contract.
 		if err := rows.Scan(&heading, &content, &prefix, &embedding); err != nil {
 			return nil, fmt.Errorf("scan stored chunk for %s: %w", ref, err)
 		}

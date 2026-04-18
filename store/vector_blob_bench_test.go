@@ -61,7 +61,8 @@ func TestDecodeVectorBlobEdgeBitPatterns(t *testing.T) {
 // []float64); the pre-#60 implementation with binary.Read + bytes.Reader
 // showed 2 extra allocations per call.
 func BenchmarkDecodeVectorBlob(b *testing.B) {
-	// 1536 is the OpenAI text-embedding-3-small / -large dimension.
+	// 1536 is a representative embedding dimension for this benchmark
+	// (for example, OpenAI text-embedding-3-small).
 	const dim = 1536
 	vector := make([]float64, dim)
 	for i := range vector {
