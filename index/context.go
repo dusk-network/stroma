@@ -192,11 +192,14 @@ func (s *Snapshot) loadContextSections(ctx context.Context, ids map[int64]struct
 		args = append(args, id)
 	}
 
-	prefixExpr := "'' AS context_prefix"
-	if s.hasContextPrefix {
-		prefixExpr = "c.context_prefix"
-	}
+	prefixExpr := contextPrefixSelectExpr(s.hasContextPrefix)
 
+	// All %s holes are interpolated from in-package constants and from a
+	// placeholder list of "?, ?, ..." derived from the size of the ID set
+	// (no user data is concatenated into the SQL text). User data is
+	// passed exclusively via the args slice through QueryContext, so this
+	// is not an injection vector even though gosec G201 flags any SQL
+	// formatting on principle.
 	query := fmt.Sprintf(`
 SELECT
   c.id,
@@ -211,7 +214,7 @@ SELECT
   c.chunk_index
 FROM chunks c
 JOIN records r ON r.ref = c.record_ref
-WHERE c.id IN (%s)`, prefixExpr, strings.Join(placeholders, ", "))
+WHERE c.id IN (%s)`, prefixExpr, strings.Join(placeholders, ", ")) //nolint:gosec // see comment above: SQL fragments are package-local constants and `?` placeholders
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -219,16 +222,17 @@ WHERE c.id IN (%s)`, prefixExpr, strings.Join(placeholders, ", "))
 	}
 	defer func() { _ = rows.Close() }()
 
+	// Pointer-valued map so neither the map iteration nor the rest-slice
+	// build incurs a per-iteration copy of the ~160-byte Section struct
+	// (the gocritic rangeValCopy lint catches this).
 	type row struct {
 		section    Section
 		chunkIndex int64
 	}
-	loaded := make(map[int64]row, len(ids))
+	loaded := make(map[int64]*row, len(ids))
 	for rows.Next() {
-		var (
-			r            row
-			metadataJSON string
-		)
+		r := &row{}
+		var metadataJSON string
 		if err := rows.Scan(
 			&r.section.ChunkID,
 			&r.section.Ref,
@@ -260,7 +264,7 @@ WHERE c.id IN (%s)`, prefixExpr, strings.Join(placeholders, ", "))
 			delete(loaded, parentChunkID.Int64)
 		}
 	}
-	rest := make([]row, 0, len(loaded))
+	rest := make([]*row, 0, len(loaded))
 	for _, r := range loaded {
 		rest = append(rest, r)
 	}

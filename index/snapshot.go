@@ -13,6 +13,27 @@ import (
 	"github.com/dusk-network/stroma/store"
 )
 
+// SQL fragments for projecting the chunks.context_prefix column. v2
+// snapshots (and any future schema bump that drops the column) substitute
+// the missing variant so scan-row shapes stay uniform across versions.
+// Centralized here so reuse.go, snapshot.go, and context.go all read from
+// one source of truth — `c.` prefixed because every callsite joins
+// chunks AS c.
+const (
+	contextPrefixSelectMissing = "'' AS context_prefix"
+	contextPrefixSelectPresent = "c.context_prefix"
+)
+
+// contextPrefixSelectExpr returns the SQL fragment for the
+// context_prefix projection given whether the snapshot's chunks table
+// carries the column.
+func contextPrefixSelectExpr(hasContextPrefix bool) string {
+	if hasContextPrefix {
+		return contextPrefixSelectPresent
+	}
+	return contextPrefixSelectMissing
+}
+
 // Snapshot is one opened Stroma index snapshot.
 type Snapshot struct {
 	path string
@@ -378,10 +399,7 @@ func buildSectionsQuery(query SectionQuery, hasContextPrefix, embeddingsFromFull
 	args = make([]any, 0, len(query.Refs)+len(query.Kinds))
 	// v2 snapshots lack context_prefix; project an empty string so the
 	// row shape scanSectionRow expects stays stable across versions.
-	prefixExpr := "'' AS context_prefix"
-	if hasContextPrefix {
-		prefixExpr = "c.context_prefix"
-	}
+	prefixExpr := contextPrefixSelectExpr(hasContextPrefix)
 	builder.WriteString(`
 SELECT
   c.id,
