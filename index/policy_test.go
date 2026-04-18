@@ -81,8 +81,9 @@ func TestRebuildRejectsSelfReferencingParent(t *testing.T) {
 // TestRebuildWithLateChunkPolicyEmitsHierarchy is the end-to-end happy
 // path for PR-B: build a snapshot with LateChunkPolicy, assert that
 // chunks rows carry parent_chunk_id linking leaves to the parent, and
-// assert that only leaves are embedded (parents have no chunks_vec
-// row but do have a chunks row + an FTS row).
+// assert that only leaves are embedded and added to FTS (parents have
+// a chunks row but no chunks_vec or fts_chunks row, so they cannot
+// surface from either arm of hybrid search).
 func TestRebuildWithLateChunkPolicyEmitsHierarchy(t *testing.T) {
 	t.Parallel()
 	fixture, err := embed.NewFixture("fixture-a", 16)
@@ -165,10 +166,9 @@ WHERE c.parent_chunk_id IS NOT NULL
 
 // TestSearchSurfacesLeavesOnlyUnderLateChunkPolicy verifies that a
 // hybrid search against a LateChunkPolicy snapshot returns leaves only
-// (parents have no chunks_vec / FTS-rank participation in retrieval —
-// FTS indexes them but search results come from the leaves' embedding
-// matches). This is the design intent of "leaves embed, parents stay
-// storage-only context."
+// (parents participate in neither chunks_vec nor fts_chunks, so they
+// cannot surface from either arm of hybrid retrieval). This is the
+// design intent of "leaves embed, parents stay storage-only context."
 func TestSearchSurfacesLeavesOnlyUnderLateChunkPolicy(t *testing.T) {
 	t.Parallel()
 	fixture, err := embed.NewFixture("fixture-a", 16)

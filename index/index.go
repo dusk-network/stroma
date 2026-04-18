@@ -971,16 +971,19 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		return stats, fmt.Errorf("contextualize record %s: %w", record.Ref, err)
 	}
 
-	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), sections, prefixes)
+	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), sections, prefixes, parentSet)
 	stats.sections = len(sections)
+	stats.reusedChunks = plan.reusedChunkCount
+	stats.embeddedChunks = plan.embeddedChunkCount
+	stats.recordUnchanged = plan.recordUnchanged
 
 	if len(sections) == 0 {
 		return stats, nil
 	}
 
 	// Embedding pipeline: parents are storage-only context (Q decision
-	// in #16), so they never get embedded. Reused leaves carry their
-	// stored embedding forward via the reuse map. Only non-parent,
+	// in #16), so they never get embedded — planRecordReuse already
+	// excluded them from keys and reuse accounting. Only non-parent,
 	// non-reused leaves contribute texts to this batch.
 	texts := make([]string, 0, len(sections))
 	for i, section := range sections {
@@ -992,25 +995,6 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		}
 		texts = append(texts, contextualEmbeddingText(sectionPrefix(plan.prefixes, i), record.Title, section))
 	}
-
-	// Recompute reuse counters after factoring out parents — the
-	// substrate-facing stats should reflect the embedded surface, not
-	// the raw section count.
-	embeddedNonParent := 0
-	reusedNonParent := 0
-	for i := range sections {
-		if parentSet[i] {
-			continue
-		}
-		if _, ok := plan.reusedEmbeddings[plan.keys[i]]; ok {
-			reusedNonParent++
-		} else {
-			embeddedNonParent++
-		}
-	}
-	stats.reusedChunks = reusedNonParent
-	stats.embeddedChunks = embeddedNonParent
-	stats.recordUnchanged = plan.recordUnchanged && reusedNonParent == len(sections)-len(parentSet)
 
 	vectors := make([][]float64, 0, len(texts))
 	if len(texts) > 0 {
@@ -1078,12 +1062,14 @@ func identifyParents(sections []chunk.SectionWithLineage) map[int]bool {
 // been inserted, so chunkIDs[j] is populated and can resolve the
 // parent_chunk_id FK in a single pass.
 //
-// Parents (membership in parentSet) skip the embedder and the vector
-// insert; they still get a chunks row + an FTS row so ExpandContext
-// can return their text content. Leaves (everyone else) get the
-// embedding pipeline as before, with reuse keys gated on
-// non-parenthood — a parent cannot reuse a stored leaf's embedding
-// because parents are not embedded in the first place.
+// Parents (membership in parentSet) skip both the FTS row and the
+// vector insert; they only get a chunks row. They cannot surface from
+// either arm of hybrid search, but ExpandContext (which reads chunks
+// directly, not fts_chunks) returns their text on IncludeParent.
+// Leaves (everyone else) get the indexing and embedding pipeline as
+// before, with reuse keys gated on non-parenthood — a parent cannot
+// reuse a stored leaf's embedding because parents are not embedded
+// in the first place.
 func (s *indexSession) insertChunks(
 	ctx context.Context,
 	record corpus.Record,

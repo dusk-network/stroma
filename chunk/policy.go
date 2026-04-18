@@ -158,20 +158,18 @@ func (p LateChunkPolicy) Chunk(_ context.Context, record corpus.Record) ([]Secti
 				ErrTooManySections, p.MaxSections, record.Ref)
 		}
 		children := SplitSection(parent, p.ChildMaxTokens, p.ChildOverlapTokens)
-		// SplitSection returns a single-element slice when no split
-		// happened (section already fits). In that case the leaf would
-		// duplicate the parent body, doubling storage with no
-		// retrieval payoff. Skip leaf emission and fall back to a
-		// flat-chunk shape under that parent — the parent itself
-		// becomes the only retrievable surface for that span. (PR-A
-		// doesn't embed parents, so this would actually hide the
-		// section from search; emit one leaf that shares the parent's
-		// body so it stays retrievable.)
-		if len(children) == 1 {
-			children = []Section{{
-				Heading: parent.Heading,
-				Body:    parent.Body,
-			}}
+		// SplitSection returns a single-element slice when the section
+		// already fits ChildMaxTokens. In that case emitting a child
+		// with identical body would duplicate the parent's content —
+		// wasting storage and making ExpandContext(IncludeParent) echo
+		// the same text twice. Skip child emission instead. The parent
+		// stays in the slice with no children pointing at it, so the
+		// index layer's identifyParents excludes it from the
+		// parent-only set and treats it as a normal flat chunk: it
+		// gets embedded and indexed in FTS, so the span remains
+		// retrievable.
+		if len(children) <= 1 {
+			continue
 		}
 		for _, child := range children {
 			out = append(out, SectionWithLineage{
