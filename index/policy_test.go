@@ -422,6 +422,59 @@ func TestRebuildRejectsChunkPolicyWithLegacyKnobs(t *testing.T) {
 	}
 }
 
+// TestUpdateRejectsChunkPolicyWithLegacyKnobs mirrors the Rebuild
+// regression for the UpdateOptions shape. The incremental-update path
+// shares the same flat-knob vs ChunkPolicy ambiguity and must reject
+// the same conflicting combinations. This pins that behavior directly
+// so Rebuild's coverage does not silently imply Update's.
+func TestUpdateRejectsChunkPolicyWithLegacyKnobs(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{
+		{Ref: "seed", Kind: "note", Title: "Seed", BodyFormat: corpus.FormatMarkdown, BodyText: "seed body"},
+	}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
+		t.Fatalf("Rebuild() seed error = %v", err)
+	}
+
+	cases := []struct {
+		name string
+		opts UpdateOptions
+	}{
+		{
+			name: "MaxChunkTokens",
+			opts: UpdateOptions{Path: path, Embedder: fixture, MaxChunkTokens: 4, ChunkPolicy: chunk.MarkdownPolicy{}},
+		},
+		{
+			name: "ChunkOverlapTokens",
+			opts: UpdateOptions{Path: path, Embedder: fixture, ChunkOverlapTokens: 2, ChunkPolicy: chunk.MarkdownPolicy{}},
+		},
+		{
+			name: "MaxChunkSections",
+			opts: UpdateOptions{Path: path, Embedder: fixture, MaxChunkSections: 5, ChunkPolicy: chunk.MarkdownPolicy{}},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Update(context.Background(), []corpus.Record{
+				{Ref: "added", Kind: "note", Title: "Added", BodyFormat: corpus.FormatMarkdown, BodyText: "added body"},
+			}, nil, tc.opts)
+			if err == nil {
+				t.Fatalf("Update() with %s + ChunkPolicy succeeded, want validation error", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("error does not mention the conflicting knob %q: %v", tc.name, err)
+			}
+		})
+	}
+}
+
 // TestRebuildBinaryWithLateChunkPolicyOpensAndSearches is a Codex
 // follow-up regression. checkChunksVecFullCompleteness used to require
 // every chunks row to have a chunks_vec_full companion, which broke

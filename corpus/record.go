@@ -91,6 +91,16 @@ func (r Record) Normalize() (Record, error) {
 	return normalized, nil
 }
 
+// Normalized is a deprecated alias for Normalize retained so downstream
+// callers that upgrade without switching name immediately keep
+// compiling. New code should use Normalize. Scheduled for removal one
+// release after adoption settles.
+//
+// Deprecated: use Normalize.
+func (r Record) Normalized() (Record, error) {
+	return r.Normalize()
+}
+
 // Validate reports whether the record is complete enough to persist.
 // Callers constructing a Record by hand should prefer Normalize, which
 // applies safe defaults before validation — calling Validate directly

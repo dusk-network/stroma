@@ -36,6 +36,31 @@ func TestNewRecordProducesNormalizableRecord(t *testing.T) {
 	}
 }
 
+// TestRecordNormalizedShimMirrorsNormalize pins the Deprecated:
+// compatibility bridge. Downstream callers mid-upgrade should be
+// able to keep using the old name and get byte-identical behavior
+// from Normalize.
+func TestRecordNormalizedShimMirrorsNormalize(t *testing.T) {
+	t.Parallel()
+
+	seed := Record{Ref: " alpha ", BodyText: " body "}
+	legacy, legacyErr := seed.Normalized() //nolint:staticcheck // explicitly exercising the deprecated shim
+	modern, modernErr := seed.Normalize()
+	if (legacyErr == nil) != (modernErr == nil) {
+		t.Fatalf("error mismatch: Normalized err = %v, Normalize err = %v", legacyErr, modernErr)
+	}
+	// The Metadata field is a map, so direct struct comparison
+	// won't compile; assert on HashRecord — which folds Metadata
+	// into the digest — to confirm the two paths produced the same
+	// normalized record shape.
+	if HashRecord(legacy) != HashRecord(modern) {
+		t.Fatalf("Normalized() result diverged from Normalize() result\nlegacy: %#v\nmodern: %#v", legacy, modern)
+	}
+	if legacy.Ref != modern.Ref || legacy.ContentHash != modern.ContentHash {
+		t.Fatalf("Normalized/Normalize Ref or ContentHash diverged\nlegacy: %#v\nmodern: %#v", legacy, modern)
+	}
+}
+
 func TestRecordNormalizedAppliesDefaults(t *testing.T) {
 	t.Parallel()
 
