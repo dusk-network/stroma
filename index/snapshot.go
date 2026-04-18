@@ -21,6 +21,12 @@ type Snapshot struct {
 	// OpenSnapshot time so read paths do not need to reprobe PRAGMA
 	// table_info(chunks) on every Sections()/reuse call.
 	hasContextPrefix bool
+	// hasFTS records whether the snapshot carries the fts_chunks virtual
+	// table. Snapshots built before hybrid search lack it; cache the
+	// presence at open time so searchFTS can short-circuit cleanly
+	// instead of running the query and pattern-matching on the SQLite
+	// "no such table" error string.
+	hasFTS bool
 }
 
 // SnapshotSearchQuery defines one text search against an opened snapshot.
@@ -55,14 +61,6 @@ type SectionQuery struct {
 	Refs              []string
 	Kinds             []string
 	IncludeEmbeddings bool
-
-	// embeddingsFromFullTable, when true, pulls embeddings from the
-	// chunks_vec_full companion table (binary quantization only) so the
-	// returned vectors are the stored float32 source of truth instead of
-	// the sign-packed bit blob held in chunks_vec. Internal; callers
-	// continue to set IncludeEmbeddings and the Sections() method
-	// decides which column to read.
-	embeddingsFromFullTable bool
 }
 
 // Section is one stored section from a Stroma snapshot.
@@ -139,10 +137,16 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 		return nil, fmt.Errorf("open snapshot %s: schema_version=%q but chunks.context_prefix presence=%t (want %t); snapshot metadata and table shape disagree",
 			path, trimmedSchema, hasColumn, expectContextPrefix)
 	}
+	hasFTS, err := hasTable(ctx, db, "fts_chunks")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open snapshot %s: probe fts_chunks: %w", path, err)
+	}
 	return &Snapshot{
 		path:             path,
 		db:               db,
 		hasContextPrefix: expectContextPrefix,
+		hasFTS:           hasFTS,
 	}, nil
 }
 
@@ -309,6 +313,7 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	}
 
 	quantization := store.QuantizationFloat32
+	embeddingsFromFullTable := false
 	if query.IncludeEmbeddings {
 		var err error
 		quantization, err = s.resolveQuantization(ctx)
@@ -320,12 +325,12 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 			// the real float32 vector, not its sign-packed stub, and
 			// switch the decode path to float32 so scanSectionRow
 			// interprets the blob correctly.
-			query.embeddingsFromFullTable = true
+			embeddingsFromFullTable = true
 			quantization = store.QuantizationFloat32
 		}
 	}
 
-	sqlText, args := buildSectionsQuery(query, s.hasContextPrefix)
+	sqlText, args := buildSectionsQuery(query, s.hasContextPrefix, embeddingsFromFullTable)
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query sections: %w", err)
@@ -346,7 +351,7 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	return result, nil
 }
 
-func buildSectionsQuery(query SectionQuery, hasContextPrefix bool) (sqlText string, args []any) {
+func buildSectionsQuery(query SectionQuery, hasContextPrefix, embeddingsFromFullTable bool) (sqlText string, args []any) {
 	var builder strings.Builder
 	args = make([]any, 0, len(query.Refs)+len(query.Kinds))
 	// v2 snapshots lack context_prefix; project an empty string so the
@@ -376,7 +381,7 @@ JOIN records r ON r.ref = c.record_ref`)
 		// Binary snapshots surface full-precision vectors via the
 		// chunks_vec_full companion so IncludeEmbeddings yields usable
 		// float32 values instead of sign-expanded {-1, 1} stubs.
-		if query.embeddingsFromFullTable {
+		if embeddingsFromFullTable {
 			builder.WriteString(`
 JOIN chunks_vec_full v ON v.chunk_id = c.id`)
 		} else {
@@ -600,10 +605,7 @@ func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float
 		}
 		sqlText, args = buildBinarySearchSQL(limit, kinds, queryBlob, fullQueryBlob)
 	default:
-		sqlText, args = buildSearchSQL(SearchQuery{
-			Limit: limit,
-			Kinds: kinds,
-		}, queryBlob, quantization)
+		sqlText, args = buildSearchSQL(limit, kinds, queryBlob, quantization)
 	}
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
@@ -645,6 +647,14 @@ func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float
 }
 
 func (s *Snapshot) searchFTS(ctx context.Context, text string, limit int, kinds []string) ([]SearchHit, error) {
+	// fts_chunks is a virtual table that older snapshots (built before
+	// hybrid search) do not carry. The presence flag is cached on the
+	// snapshot at open time, so the lexical arm of hybrid search becomes
+	// a no-op against legacy indexes without firing a query that would
+	// fail with "no such table: fts_chunks".
+	if !s.hasFTS {
+		return nil, nil
+	}
 	ftsQuery := sanitizeFTSQuery(text)
 	if ftsQuery == "" {
 		return nil, nil
@@ -680,10 +690,6 @@ LIMIT ?`)
 
 	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {
-		// FTS table does not exist in indexes built before hybrid search.
-		if strings.Contains(err.Error(), "no such table: fts_chunks") {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("fts query: %w", err)
 	}
 	defer func() { _ = rows.Close() }()

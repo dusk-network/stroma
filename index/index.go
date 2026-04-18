@@ -135,9 +135,12 @@ type BuildOptions struct {
 	// instead of silently admitting the record.
 	MaxChunkSections int
 
-	// Quantization controls the vector storage format. Supported values
-	// are "float32" (default) and "int8". Int8 reduces storage by 4x at
-	// the cost of minor precision loss.
+	// Quantization controls the vector storage format. See the
+	// store.Quantization* constants for the accept-listed values:
+	// store.QuantizationFloat32 (default), store.QuantizationInt8 (4x
+	// smaller, minor precision loss), and store.QuantizationBinary
+	// (32x smaller via 1-bit sign packing, full-precision rescore on a
+	// companion table preserves ranking).
 	Quantization string
 }
 
@@ -180,8 +183,10 @@ type UpdateOptions struct {
 	// → no cap.
 	MaxChunkSections int
 
-	// Quantization, when provided, must match the existing index. Leaving it
-	// empty reuses the stored quantization metadata.
+	// Quantization, when provided, must match the existing index — see
+	// the store.Quantization* constants (float32, int8, binary) for the
+	// accept-listed values. Leaving it empty reuses the stored
+	// quantization metadata.
 	Quantization string
 }
 
@@ -770,8 +775,8 @@ type recordStats struct {
 }
 
 // indexSession owns the prepared statements, embedder branch, and reuse state
-// for the per-record write path. Rebuild delegates to it today; Update will
-// migrate in a follow-up so both write paths share the same invariants.
+// for the per-record write path. Both Rebuild and Update delegate to it so
+// the two write paths share the same invariants.
 type indexSession struct {
 	tx             *sql.Tx
 	embedder       embed.Embedder
@@ -914,39 +919,24 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		}
 	}
 
-	if err := insertChunks(
-		ctx,
-		record,
-		plan,
-		sections,
-		vectors,
-		s.dimension,
-		s.quantization,
-		s.chunkStmt,
-		s.ftsStmt,
-		s.vectorStmt,
-		s.vectorFullStmt,
-	); err != nil {
+	if err := s.insertChunks(ctx, record, plan, sections, vectors); err != nil {
 		return stats, err
 	}
 
 	return stats, nil
 }
 
-func insertChunks(
+func (s *indexSession) insertChunks(
 	ctx context.Context,
 	record corpus.Record,
 	plan recordReusePlan,
 	sections []chunk.Section,
 	vectors [][]float64,
-	dimension int,
-	quantization string,
-	chunkStmt, ftsStmt, vectorStmt, vectorFullStmt *sql.Stmt,
 ) error {
 	newVectorIndex := 0
 	for index, section := range sections {
 		prefix := sectionPrefix(plan.prefixes, index)
-		chunkResult, err := chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body, prefix)
+		chunkResult, err := s.chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body, prefix)
 		if err != nil {
 			return fmt.Errorf("insert record %s chunk %d: %w", record.Ref, index, err)
 		}
@@ -958,15 +948,15 @@ func insertChunks(
 		if prefix != "" {
 			ftsContent = prefix + "\n\n" + section.Body
 		}
-		if _, err := ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, ftsContent); err != nil {
+		if _, err := s.ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, ftsContent); err != nil {
 			return fmt.Errorf("insert fts for %s chunk %d: %w", record.Ref, index, err)
 		}
 		if reused, ok := plan.reusedEmbeddings[plan.keys[index]]; ok {
-			primary, full, err := reusedBlobsFor(quantization, reused)
+			primary, full, err := reusedBlobsFor(s.quantization, reused)
 			if err != nil {
 				return fmt.Errorf("prepare reused embedding for %s chunk %d: %w", record.Ref, index, err)
 			}
-			if err := insertVectorBlobs(ctx, chunkID, primary, full, vectorStmt, vectorFullStmt); err != nil {
+			if err := insertVectorBlobs(ctx, chunkID, primary, full, s.vectorStmt, s.vectorFullStmt); err != nil {
 				return fmt.Errorf("insert reused embedding for %s chunk %d: %w", record.Ref, index, err)
 			}
 			continue
@@ -974,14 +964,14 @@ func insertChunks(
 		if newVectorIndex >= len(vectors) {
 			return fmt.Errorf("record %s chunk %d is missing a new embedding", record.Ref, index)
 		}
-		if len(vectors[newVectorIndex]) != dimension {
-			return fmt.Errorf("record %s section %d embedding has dimension %d, want %d", record.Ref, index, len(vectors[newVectorIndex]), dimension)
+		if len(vectors[newVectorIndex]) != s.dimension {
+			return fmt.Errorf("record %s section %d embedding has dimension %d, want %d", record.Ref, index, len(vectors[newVectorIndex]), s.dimension)
 		}
-		primary, full, err := newBlobsFor(quantization, vectors[newVectorIndex])
+		primary, full, err := newBlobsFor(s.quantization, vectors[newVectorIndex])
 		if err != nil {
 			return fmt.Errorf("encode embedding for %s chunk %d: %w", record.Ref, index, err)
 		}
-		if err := insertVectorBlobs(ctx, chunkID, primary, full, vectorStmt, vectorFullStmt); err != nil {
+		if err := insertVectorBlobs(ctx, chunkID, primary, full, s.vectorStmt, s.vectorFullStmt); err != nil {
 			return fmt.Errorf("insert embedding for %s chunk %d: %w", record.Ref, index, err)
 		}
 		newVectorIndex++
@@ -1287,11 +1277,36 @@ func ensureCompatibleEmbedder(ctx context.Context, db queryContextRunner, embedd
 	return nil
 }
 
-func buildSearchSQL(query SearchQuery, queryBlob []byte, quantization string) (querySQL string, args []any) {
-	var builder strings.Builder
-	args = make([]any, 0, 4+len(query.Kinds))
+// Search-path overfetch multipliers. Each search stage that has a "this
+// pre-pass might miss the right hit" property scales the caller's limit up
+// before doing its work, then trims back down at the final stage. Tune them
+// here, in one place, so future calibration touches a single block instead
+// of three scattered consts:
+//
+//   - matryoshkaPrefilterMultiplier: the truncated-prefix prefilter ranks
+//     by a degraded representation, so candidates that would survive the
+//     full-dim rescore can sit just outside the top-N. Overfetch by 3× and
+//     let the rescore reorder.
+//   - binaryRescoreMultiplier: the 1-bit hamming prefilter is even coarser
+//     than the truncated-prefix prefilter, so the full-precision cosine
+//     rescore needs the same kind of slack. Overfetch by 3×.
+//   - candidateOverfetchMultiplier: hybrid search merges two independent
+//     candidate sets (vector + FTS) and then rank-fuses them. Each arm
+//     needs more candidates than the caller asked for so the fusion stage
+//     has room to reorder before the final LIMIT. Overfetch by 5× (with a
+//     [minCandidatePool, maxCandidatePool] floor/ceiling so tiny limits
+//     don't starve fusion and huge limits don't blow up per-query cost).
+const (
+	matryoshkaPrefilterMultiplier = 3
+	binaryRescoreMultiplier       = 3
+	candidateOverfetchMultiplier  = 5
+)
 
-	hasKindFilter := len(query.Kinds) > 0
+func buildSearchSQL(limit int, kinds []string, queryBlob []byte, quantization string) (querySQL string, args []any) {
+	var builder strings.Builder
+	args = make([]any, 0, 4+len(kinds))
+
+	hasKindFilter := len(kinds) > 0
 	matchExpr := "?"
 	sliceExpr := "?"
 	if quantization == store.QuantizationInt8 {
@@ -1324,7 +1339,7 @@ WITH vector_hits AS (
 		// query blob consumed by vec_distance_cosine, then the kinds in
 		// the WHERE r.kind IN (...) list, then the inner LIMIT.
 		args = append(args, queryBlob)
-		for i, kind := range query.Kinds {
+		for i, kind := range kinds {
 			if i > 0 {
 				builder.WriteString(", ")
 			}
@@ -1335,7 +1350,7 @@ WITH vector_hits AS (
   ORDER BY distance
   LIMIT ?
 )`)
-		args = append(args, query.Limit)
+		args = append(args, limit)
 	} else {
 		builder.WriteString(fmt.Sprintf(`
 WITH vector_hits AS (
@@ -1344,7 +1359,7 @@ WITH vector_hits AS (
   WHERE embedding MATCH %s AND k = ?
   ORDER BY distance
 )`, matchExpr))
-		args = append(args, queryBlob, query.Limit)
+		args = append(args, queryBlob, limit)
 	}
 
 	builder.WriteString(`
@@ -1363,15 +1378,9 @@ JOIN chunks c ON c.id = vh.chunk_id
 JOIN records r ON r.ref = c.record_ref
 ORDER BY vh.distance ASC, r.ref ASC, c.chunk_index ASC
 LIMIT ?`)
-	args = append(args, query.Limit)
+	args = append(args, limit)
 	return builder.String(), args
 }
-
-// matryoshkaPrefilterMultiplier scales the prefilter shortlist up from the
-// caller-requested candidate limit so that good candidates that only the
-// truncated prefix ranks lower still have a chance to survive into the
-// full-dim rescore. The final LIMIT then trims back to the caller's count.
-const matryoshkaPrefilterMultiplier = 3
 
 // buildMatryoshkaSearchSQL builds the truncated-prefix prefilter + full-dim
 // rescore query. The prefilter scans every chunks_vec row with cosine over
@@ -1452,12 +1461,6 @@ LIMIT ?`)
 	args = append(args, searchDim, truncatedQuery, prefilterLimit, queryBlob, limit)
 	return builder.String(), args, nil
 }
-
-// binaryRescoreMultiplier scales the hamming prefilter shortlist up from the
-// caller-requested candidate limit so good candidates that the 1-bit
-// prefilter under-ranks still have a chance to survive into the full-dim
-// cosine rescore.
-const binaryRescoreMultiplier = 3
 
 // buildBinarySearchSQL builds the two-stage binary search: a hamming-distance
 // prefilter over chunks_vec's bit[N] column, followed by a full-precision
@@ -1875,24 +1878,36 @@ func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.
 	if options.Embedder == nil {
 		return sessionConfig{}, fmt.Errorf("update embedder is required when adding records")
 	}
-
-	updateFingerprint := options.Embedder.Fingerprint()
-	if embedderFingerprint != updateFingerprint {
-		return sessionConfig{}, fmt.Errorf("embedder fingerprint mismatch: index=%q update=%q", embedderFingerprint, updateFingerprint)
-	}
-	updateDimension, err := options.Embedder.Dimension(ctx)
-	if err != nil {
-		return sessionConfig{}, fmt.Errorf("resolve update embedder dimension: %w", err)
-	}
-	if updateDimension <= 0 {
-		return sessionConfig{}, fmt.Errorf("embedder dimension must be positive")
-	}
-	if updateDimension != dimension {
-		return sessionConfig{}, fmt.Errorf("embedder dimension mismatch: index=%d update=%d", dimension, updateDimension)
+	if err := validateUpdateEmbedder(ctx, options.Embedder, embedderFingerprint, dimension); err != nil {
+		return sessionConfig{}, err
 	}
 
 	cfg.embedder = options.Embedder
 	return cfg, nil
+}
+
+// validateUpdateEmbedder checks that the update-time embedder agrees with
+// the snapshot's stored fingerprint and dimension. Update is incremental:
+// new chunks must encode under the same embedder identity and into the
+// same vector space as everything already in the index, otherwise hybrid
+// retrieval would compare vectors from two different embedding spaces and
+// silently mis-rank them.
+func validateUpdateEmbedder(ctx context.Context, embedder embed.Embedder, storedFingerprint string, storedDimension int) error {
+	updateFingerprint := embedder.Fingerprint()
+	if storedFingerprint != updateFingerprint {
+		return fmt.Errorf("embedder fingerprint mismatch: index=%q update=%q", storedFingerprint, updateFingerprint)
+	}
+	updateDimension, err := embedder.Dimension(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve update embedder dimension: %w", err)
+	}
+	if updateDimension <= 0 {
+		return fmt.Errorf("embedder dimension must be positive")
+	}
+	if updateDimension != storedDimension {
+		return fmt.Errorf("embedder dimension mismatch: index=%d update=%d", storedDimension, updateDimension)
+	}
+	return nil
 }
 
 func deleteRecord(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
@@ -1979,11 +1994,10 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil 
 }
 
 const (
-	// candidateOverfetchMultiplier scales the caller's limit up before
-	// merging hybrid search candidates, so rank-fusion has room to reorder.
-	candidateOverfetchMultiplier = 5
 	// minCandidatePool is the floor for the candidate shortlist, keeping
-	// tiny limits (e.g., 1-2 hits) from starving rank fusion.
+	// tiny limits (e.g., 1-2 hits) from starving rank fusion. The matching
+	// candidateOverfetchMultiplier lives in the colocated overfetch block
+	// above buildSearchSQL.
 	minCandidatePool = 25
 	// maxCandidatePool caps the shortlist to bound per-query cost.
 	maxCandidatePool = 250
