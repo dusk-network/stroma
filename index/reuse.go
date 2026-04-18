@@ -144,19 +144,34 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	return true, schemaHasContextPrefix(trimmed)
 }
 
-// planRecordReuse builds a per-record plan given the resolved sections and
-// aligned context prefixes. prefixes must be nil or the same length as
-// sections; a nil slice means "no contextualizer configured" and is
-// equivalent to an empty prefix per section.
-func planRecordReuse(record corpus.Record, stored storedRecord, sections []chunk.Section, prefixes []string) recordReusePlan {
+// planRecordReuse builds a per-record plan given the resolved sections,
+// aligned context prefixes, and the parent-index set produced by the
+// chunk policy. prefixes must be nil or the same length as sections;
+// a nil slice means "no contextualizer configured" and is equivalent
+// to an empty prefix per section.
+//
+// parentSet identifies indices that other sections point at via
+// ParentIndex (i.e., storage-only parent rows). Parents are excluded
+// from reuse keying and from the recordUnchanged accounting because
+// they have no embedding to reuse — storedRecordForReuse loads chunks
+// via an inner join on chunks_vec, so parents never appear in
+// stored.chunks. Including them would force recordUnchanged to false
+// on every hierarchical-policy rebuild, even when every leaf reused
+// cleanly. A nil parentSet (the common flat-policy case) accepts
+// every section as eligible for reuse.
+func planRecordReuse(record corpus.Record, stored storedRecord, sections []chunk.Section, prefixes []string, parentSet map[int]bool) recordReusePlan {
 	keys := make([]string, len(sections))
 	for i, section := range sections {
+		if parentSet[i] {
+			continue
+		}
 		prefix := ""
 		if i < len(prefixes) {
 			prefix = prefixes[i]
 		}
 		keys[i] = reuseChunkKey(record.Title, section.Heading, section.Body, prefix)
 	}
+	embeddable := len(sections) - len(parentSet)
 	plan := recordReusePlan{
 		sections:         sections,
 		prefixes:         prefixes,
@@ -164,18 +179,21 @@ func planRecordReuse(record corpus.Record, stored storedRecord, sections []chunk
 		reusedEmbeddings: make(map[string][]byte),
 	}
 	if stored.contentHash == "" {
-		plan.embeddedChunkCount = len(sections)
+		plan.embeddedChunkCount = embeddable
 		return plan
 	}
 
-	for _, key := range keys {
+	for i, key := range keys {
+		if parentSet[i] {
+			continue
+		}
 		if embedding, ok := stored.chunks[key]; ok {
 			plan.reusedEmbeddings[key] = embedding
 			plan.reusedChunkCount++
 		}
 	}
-	plan.embeddedChunkCount = len(sections) - plan.reusedChunkCount
-	plan.recordUnchanged = stored.contentHash == record.ContentHash && len(sections) == plan.reusedChunkCount
+	plan.embeddedChunkCount = embeddable - plan.reusedChunkCount
+	plan.recordUnchanged = stored.contentHash == record.ContentHash && embeddable == plan.reusedChunkCount
 	return plan
 }
 

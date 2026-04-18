@@ -289,16 +289,17 @@ func TestRebuildUsesContextualEmbedderWhenAvailable(t *testing.T) {
 		t.Fatalf("Rebuild() error = %v", err)
 	}
 
-	sections, err := sectionsForRecord(record, chunk.Options{
+	policy := chunk.MarkdownPolicy{Options: chunk.Options{
 		MaxTokens:     buildOpts.MaxChunkTokens,
 		OverlapTokens: buildOpts.ChunkOverlapTokens,
-	})
+	}}
+	lineaged, err := policy.Chunk(context.Background(), record)
 	if err != nil {
-		t.Fatalf("sectionsForRecord() error = %v", err)
+		t.Fatalf("MarkdownPolicy.Chunk() error = %v", err)
 	}
-	wantChunks := make([]string, 0, len(sections))
-	for _, section := range sections {
-		wantChunks = append(wantChunks, textForEmbedding(record.Title, section))
+	wantChunks := make([]string, 0, len(lineaged))
+	for _, l := range lineaged {
+		wantChunks = append(wantChunks, textForEmbedding(record.Title, l.Section))
 	}
 
 	if result.EmbeddedChunkCount != len(wantChunks) {

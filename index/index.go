@@ -159,6 +159,21 @@ type BuildOptions struct {
 	// (32x smaller via 1-bit sign packing, full-precision rescore on a
 	// companion table preserves ranking).
 	Quantization string
+
+	// ChunkPolicy selects the chunking strategy. Nil defaults to
+	// chunk.MarkdownPolicy{Options: chunk.Options{
+	//     MaxTokens: MaxChunkTokens,
+	//     OverlapTokens: ChunkOverlapTokens,
+	//     MaxSections: <resolved>,
+	// }}, which reproduces the pre-1.0 chunking pipeline exactly.
+	// Setting a non-nil policy overrides the per-Build chunking shape:
+	// MaxChunkTokens/ChunkOverlapTokens/MaxChunkSections are read by
+	// the default MarkdownPolicy but ignored when ChunkPolicy is set
+	// (the policy carries its own configuration). Hierarchical
+	// policies like chunk.LateChunkPolicy emit parent + leaf chunks
+	// linked via parent_chunk_id; ExpandContext can surface the
+	// parent on demand. See docs/superpowers/specs for the design.
+	ChunkPolicy chunk.Policy
 }
 
 // BuildResult summarizes a completed rebuild.
@@ -205,6 +220,17 @@ type UpdateOptions struct {
 	// accept-listed values. Leaving it empty reuses the stored
 	// quantization metadata.
 	Quantization string
+
+	// ChunkPolicy mirrors BuildOptions.ChunkPolicy for the incremental
+	// update path. Nil defaults to chunk.MarkdownPolicy with the
+	// MaxChunkTokens / ChunkOverlapTokens / MaxChunkSections knobs
+	// resolved here. The substrate does not enforce that the policy
+	// matches the one used to build the snapshot — callers who switch
+	// policies between Build and Update should expect reuse cache
+	// misses on the affected sections (the leaves still re-embed
+	// correctly; the snapshot just won't share embeddings across
+	// rebuilds).
+	ChunkPolicy chunk.Policy
 }
 
 // UpdateResult summarizes one incremental update.
@@ -339,6 +365,7 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 			OverlapTokens: options.ChunkOverlapTokens,
 			MaxSections:   resolveMaxChunkSections(options.MaxChunkSections),
 		},
+		chunkPolicy:  options.ChunkPolicy,
 		dimension:    inputs.dimension,
 		quantization: inputs.quantization,
 	})
@@ -799,6 +826,7 @@ type sessionConfig struct {
 	contextualizer      ChunkContextualizer
 	reuse               *reuseState
 	chunkOpts           chunk.Options
+	chunkPolicy         chunk.Policy
 	dimension           int
 	quantization        string
 }
@@ -820,6 +848,7 @@ type indexSession struct {
 	contextualizer ChunkContextualizer
 	reuse          *reuseState
 	chunkOpts      chunk.Options
+	chunkPolicy    chunk.Policy
 	dimension      int
 	quantization   string
 
@@ -837,8 +866,19 @@ func newIndexSession(ctx context.Context, tx *sql.Tx, cfg sessionConfig) (*index
 		contextualizer: cfg.contextualizer,
 		reuse:          cfg.reuse,
 		chunkOpts:      cfg.chunkOpts,
+		chunkPolicy:    cfg.chunkPolicy,
 		dimension:      cfg.dimension,
 		quantization:   cfg.quantization,
+	}
+	if s.chunkPolicy == nil {
+		// Default policy reproduces the pre-1.0 chunking pipeline
+		// exactly: heading-aware Markdown sectioning + optional
+		// token-budget split, flat output (every section's
+		// ParentIndex == NoParent). Snapshots built via the default
+		// policy carry parent_chunk_id NULL on every chunk row, so
+		// PR-A's storage layer is exercised but no lineage is
+		// recorded.
+		s.chunkPolicy = chunk.MarkdownPolicy{Options: cfg.chunkOpts}
 	}
 	if contextual, ok := cfg.embedder.(embed.ContextualEmbedder); ok {
 		s.contextual = contextual
@@ -854,8 +894,8 @@ ref, kind, title, source_ref, body_format, body_text, content_hash, metadata_jso
 	}
 
 	s.chunkStmt, err = tx.PrepareContext(ctx, `INSERT INTO chunks (
-record_ref, chunk_index, heading, content, context_prefix
-) VALUES (?, ?, ?, ?, ?)`)
+record_ref, chunk_index, heading, content, context_prefix, parent_chunk_id
+) VALUES (?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("prepare chunk insert: %w", err)
@@ -912,16 +952,26 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		return stats, err
 	}
 
-	sections, err := sectionsForRecord(record, s.chunkOpts)
+	lineaged, err := s.chunkPolicy.Chunk(ctx, record)
 	if err != nil {
+		return stats, fmt.Errorf("chunk record %s: %w", record.Ref, err)
+	}
+	if err := validateLineageTopology(record.Ref, lineaged); err != nil {
 		return stats, err
 	}
+	parentSet := identifyParents(lineaged)
+
+	sections := make([]chunk.Section, len(lineaged))
+	for i, l := range lineaged {
+		sections[i] = l.Section
+	}
+
 	prefixes, err := runContextualizer(ctx, s.contextualizer, record, sections)
 	if err != nil {
 		return stats, fmt.Errorf("contextualize record %s: %w", record.Ref, err)
 	}
 
-	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), sections, prefixes)
+	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), sections, prefixes, parentSet)
 	stats.sections = len(sections)
 	stats.reusedChunks = plan.reusedChunkCount
 	stats.embeddedChunks = plan.embeddedChunkCount
@@ -931,8 +981,15 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 		return stats, nil
 	}
 
+	// Embedding pipeline: parents are storage-only context (Q decision
+	// in #16), so they never get embedded — planRecordReuse already
+	// excluded them from keys and reuse accounting. Only non-parent,
+	// non-reused leaves contribute texts to this batch.
 	texts := make([]string, 0, len(sections))
 	for i, section := range sections {
+		if parentSet[i] {
+			continue
+		}
 		if _, ok := plan.reusedEmbeddings[plan.keys[i]]; ok {
 			continue
 		}
@@ -941,7 +998,6 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 
 	vectors := make([][]float64, 0, len(texts))
 	if len(texts) > 0 {
-		var err error
 		if s.contextual != nil {
 			vectors, err = s.contextual.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
 		} else {
@@ -951,28 +1007,89 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 			return stats, fmt.Errorf("embed record %s: %w", record.Ref, err)
 		}
 		if len(vectors) != len(texts) {
-			return stats, fmt.Errorf("embedder returned %d vectors for %d new sections on %s", len(vectors), len(texts), record.Ref)
+			return stats, fmt.Errorf("embedder returned %d vectors for %d new leaf sections on %s", len(vectors), len(texts), record.Ref)
 		}
 	}
 
-	if err := s.insertChunks(ctx, record, plan, sections, vectors); err != nil {
+	if err := s.insertChunks(ctx, record, lineaged, parentSet, plan, vectors); err != nil {
 		return stats, err
 	}
 
 	return stats, nil
 }
 
+// validateLineageTopology rejects forward parent references and
+// self-references in a Policy result. Forward-only ParentIndex
+// guarantees the FK chain is acyclic and that single-pass insertion
+// in slice order always sees a parent's chunks.id before any of its
+// children resolve their parent_chunk_id. NoParent (-1) is always
+// allowed.
+func validateLineageTopology(ref string, sections []chunk.SectionWithLineage) error {
+	for i, s := range sections {
+		if s.ParentIndex == chunk.NoParent {
+			continue
+		}
+		if s.ParentIndex < 0 {
+			return fmt.Errorf("chunk policy emitted invalid ParentIndex %d on record %q section %d (negative values other than NoParent are reserved)",
+				s.ParentIndex, ref, i)
+		}
+		if s.ParentIndex >= i {
+			return fmt.Errorf("chunk policy emitted forward parent reference on record %q: section %d points at section %d, which has not yet been emitted (parents must precede their leaves)",
+				ref, i, s.ParentIndex)
+		}
+	}
+	return nil
+}
+
+// identifyParents returns a set of section indices that other sections
+// in the slice point at via ParentIndex. Membership in this set means
+// "this section is a parent and must not be embedded."
+func identifyParents(sections []chunk.SectionWithLineage) map[int]bool {
+	out := make(map[int]bool)
+	for _, s := range sections {
+		if s.ParentIndex == chunk.NoParent {
+			continue
+		}
+		out[s.ParentIndex] = true
+	}
+	return out
+}
+
+// insertChunks writes one chunks row per Policy section in slice
+// order. Forward-only ParentIndex (validated upstream by
+// validateLineageTopology) guarantees that by the time a leaf with
+// ParentIndex = j arrives, the parent at slice index j has already
+// been inserted, so chunkIDs[j] is populated and can resolve the
+// parent_chunk_id FK in a single pass.
+//
+// Parents (membership in parentSet) skip both the FTS row and the
+// vector insert; they only get a chunks row. They cannot surface from
+// either arm of hybrid search, but ExpandContext (which reads chunks
+// directly, not fts_chunks) returns their text on IncludeParent.
+// Leaves (everyone else) get the indexing and embedding pipeline as
+// before, with reuse keys gated on non-parenthood — a parent cannot
+// reuse a stored leaf's embedding because parents are not embedded
+// in the first place.
 func (s *indexSession) insertChunks(
 	ctx context.Context,
 	record corpus.Record,
+	lineaged []chunk.SectionWithLineage,
+	parentSet map[int]bool,
 	plan recordReusePlan,
-	sections []chunk.Section,
 	vectors [][]float64,
 ) error {
+	chunkIDs := make([]int64, len(lineaged))
 	newVectorIndex := 0
-	for index, section := range sections {
+	for index, l := range lineaged {
+		section := l.Section
 		prefix := sectionPrefix(plan.prefixes, index)
-		chunkResult, err := s.chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body, prefix)
+
+		var parentChunkID sql.NullInt64
+		if l.ParentIndex != chunk.NoParent {
+			parentChunkID = sql.NullInt64{Int64: chunkIDs[l.ParentIndex], Valid: true}
+		}
+
+		chunkResult, err := s.chunkStmt.ExecContext(ctx, record.Ref, index, section.Heading, section.Body, prefix, parentChunkID)
 		if err != nil {
 			return fmt.Errorf("insert record %s chunk %d: %w", record.Ref, index, err)
 		}
@@ -980,6 +1097,18 @@ func (s *indexSession) insertChunks(
 		if err != nil {
 			return fmt.Errorf("read chunk id for %s chunk %d: %w", record.Ref, index, err)
 		}
+		chunkIDs[index] = chunkID
+
+		// Parents are storage-only context — no vector row and no FTS
+		// row, so they cannot surface from either arm of hybrid search.
+		// ExpandContext reads chunks directly (not fts_chunks), so
+		// keeping parents out of FTS is safe for the parent-walk
+		// retrieval surface. Skip both FTS and vector inserts for
+		// parents.
+		if parentSet[index] {
+			continue
+		}
+
 		ftsContent := section.Body
 		if prefix != "" {
 			ftsContent = prefix + "\n\n" + section.Body
@@ -987,6 +1116,7 @@ func (s *indexSession) insertChunks(
 		if _, err := s.ftsStmt.ExecContext(ctx, chunkID, record.Title, section.Heading, ftsContent); err != nil {
 			return fmt.Errorf("insert fts for %s chunk %d: %w", record.Ref, index, err)
 		}
+
 		if reused, ok := plan.reusedEmbeddings[plan.keys[index]]; ok {
 			primary, full, err := reusedBlobsFor(s.quantization, reused)
 			if err != nil {
@@ -1064,42 +1194,6 @@ func insertVectorBlobs(ctx context.Context, chunkID int64, primary, full []byte,
 		}
 	}
 	return nil
-}
-
-func sectionsForRecord(record corpus.Record, opts chunk.Options) ([]chunk.Section, error) {
-	switch record.BodyFormat {
-	case corpus.FormatPlaintext:
-		text := strings.TrimSpace(record.BodyText)
-		if text == "" {
-			return nil, nil
-		}
-		sections := []chunk.Section{{
-			Heading: record.Title,
-			Body:    text,
-		}}
-		if opts.MaxTokens > 0 {
-			var result []chunk.Section
-			for _, s := range sections {
-				result = append(result, chunk.SplitSection(s, opts.MaxTokens, opts.OverlapTokens)...)
-			}
-			sections = result
-		}
-		if opts.MaxSections > 0 && len(sections) > opts.MaxSections {
-			return nil, fmt.Errorf("record %q: %w: plaintext token-budget split produced %d sections, limit is %d",
-				record.Ref, chunk.ErrTooManySections, len(sections), opts.MaxSections)
-		}
-		return sections, nil
-	default:
-		// Always route through MarkdownWithOptions so the parser-side
-		// MaxSections guard fires during section emission, not after
-		// the full list is materialized. MarkdownWithOptions with
-		// MaxTokens == 0 skips the token-budget pass automatically.
-		sections, err := chunk.MarkdownWithOptions(record.Title, record.BodyText, opts)
-		if err != nil {
-			return nil, fmt.Errorf("record %q: %w", record.Ref, err)
-		}
-		return sections, nil
-	}
 }
 
 // runContextualizer calls the configured contextualizer and returns a slice
@@ -1224,10 +1318,22 @@ func runIntegrityChecks(ctx context.Context, query queryContextRunner) error {
 }
 
 // checkChunksVecFullCompleteness is a no-op for non-binary snapshots; for
-// binary snapshots it verifies that every chunk has a companion
-// chunks_vec_full row and vice versa. Without this check a missing
-// companion row would silently drop that chunk from binary search (the
-// rescore join is an inner join) and from Sections(IncludeEmbeddings).
+// binary snapshots it verifies that every searchable chunk has a
+// companion chunks_vec_full row and vice versa. Without this check a
+// missing companion row would silently drop that chunk from binary
+// search (the rescore join is an inner join) and from
+// Sections(IncludeEmbeddings).
+//
+// Hierarchical chunks (#16): parent rows are storage-only context and
+// intentionally have no chunks_vec / chunks_vec_full entry — they
+// cannot surface from either arm of hybrid search. The completeness
+// check exempts parent rows so hierarchical late-chunked snapshots
+// open cleanly under binary quantization. A parent is identified as
+// "any chunks row referenced by another row's parent_chunk_id."
+//
+// On legacy schemas (v2/v3/v4) the parent_chunk_id column does not
+// exist; the parent-exemption subquery is gated by a presence probe so
+// the check still runs unchanged on pre-v5 snapshots.
 func checkChunksVecFullCompleteness(ctx context.Context, query queryContextRunner) error {
 	has, err := hasTable(ctx, query, "chunks_vec_full")
 	if err != nil {
@@ -1236,12 +1342,24 @@ func checkChunksVecFullCompleteness(ctx context.Context, query queryContextRunne
 	if !has {
 		return nil
 	}
+	hasParentCol, err := hasChunkColumn(ctx, query, "parent_chunk_id")
+	if err != nil {
+		return fmt.Errorf("probe chunks.parent_chunk_id: %w", err)
+	}
+	parentExclusion := ""
+	if hasParentCol {
+		// Exclude rows that other chunks point at via parent_chunk_id —
+		// those are storage-only parents and intentionally have no
+		// chunks_vec_full entry.
+		parentExclusion = `
+  AND c.id NOT IN (SELECT parent_chunk_id FROM chunks WHERE parent_chunk_id IS NOT NULL)`
+	}
 	var missingCompanion int
 	row := query.QueryRowContext(ctx, `
 SELECT COUNT(*)
 FROM chunks c
 LEFT JOIN chunks_vec_full v ON v.chunk_id = c.id
-WHERE v.chunk_id IS NULL`)
+WHERE v.chunk_id IS NULL`+parentExclusion)
 	if err := row.Scan(&missingCompanion); err != nil {
 		return fmt.Errorf("count missing chunks_vec_full rows: %w", err)
 	}
@@ -2011,6 +2129,7 @@ func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.
 			OverlapTokens: options.ChunkOverlapTokens,
 			MaxSections:   resolveMaxChunkSections(options.MaxChunkSections),
 		},
+		chunkPolicy: options.ChunkPolicy,
 	}
 
 	if len(added) == 0 && options.Embedder == nil {
