@@ -278,10 +278,20 @@ ORDER BY c.chunk_index ASC, c.id ASC`, prefixExpr, embeddingSource, joinClause),
 			prefix    string
 			embedding []byte
 		)
+		// database/sql documents that scanning into a []byte gives the
+		// caller an owned copy of the column data. The ncruces wasm
+		// driver may expose raw wasm-memory views in its driver values,
+		// but Scan copies those into `embedding` before the caller sees
+		// them, so this value remains valid after the next rows.Next()
+		// call. The unsafe type here would be sql.RawBytes, whose
+		// contents are only valid until the next Scan. Do NOT
+		// reintroduce `append([]byte(nil), embedding...)`; it is pure
+		// duplicated work on the reuse hot path.
+		// TestReuseScanBlobSurvivesNext pins this contract.
 		if err := rows.Scan(&heading, &content, &prefix, &embedding); err != nil {
 			return nil, fmt.Errorf("scan stored chunk for %s: %w", ref, err)
 		}
-		out[reuseChunkKey(title, heading, content, prefix)] = append([]byte(nil), embedding...)
+		out[reuseChunkKey(title, heading, content, prefix)] = embedding
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate stored chunks for %s: %w", ref, err)
