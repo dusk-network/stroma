@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -31,17 +30,19 @@ func EncodeVectorBlob(vector []float64) ([]byte, error) {
 }
 
 // DecodeVectorBlob decodes a sqlite-vec float32 blob into float64 values.
+// The hot path does one allocation (the returned []float64) and reads each
+// 4-byte little-endian float32 directly from the input buffer — the earlier
+// binary.Read + bytes.Reader route allocated an intermediate []float32 plus
+// a reader wrapper per call, which compounded on reuse-heavy rebuilds where
+// this runs for every stored chunk.
 func DecodeVectorBlob(blob []byte) ([]float64, error) {
 	if len(blob)%4 != 0 {
 		return nil, fmt.Errorf("invalid vector blob length %d", len(blob))
 	}
-	decoded := make([]float32, len(blob)/4)
-	if err := binary.Read(bytes.NewReader(blob), binary.LittleEndian, decoded); err != nil {
-		return nil, fmt.Errorf("decode vector blob: %w", err)
-	}
-	vector := make([]float64, len(decoded))
-	for index, value := range decoded {
-		vector[index] = float64(value)
+	vector := make([]float64, len(blob)/4)
+	for i := range vector {
+		bits := binary.LittleEndian.Uint32(blob[i*4:])
+		vector[i] = float64(math.Float32frombits(bits))
 	}
 	return vector, nil
 }

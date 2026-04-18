@@ -278,10 +278,19 @@ ORDER BY c.chunk_index ASC, c.id ASC`, prefixExpr, embeddingSource, joinClause),
 			prefix    string
 			embedding []byte
 		)
+		// database/sql already clones the BLOB column into a caller-owned
+		// []byte for *[]byte scan destinations (see Go stdlib
+		// convert.go: `*d = bytes.Clone(s)` on the `*[]byte` arm). The
+		// ncruces wasm driver hands raw wasm-memory views into its driver
+		// values, but those views are cloned on the stdlib Scan boundary
+		// before the caller ever sees them — so `embedding` here outlives
+		// the next rows.Next() call without an additional defensive copy.
+		// Do NOT reintroduce `append([]byte(nil), embedding...)`; it is
+		// pure duplicated work on the reuse hot path.
 		if err := rows.Scan(&heading, &content, &prefix, &embedding); err != nil {
 			return nil, fmt.Errorf("scan stored chunk for %s: %w", ref, err)
 		}
-		out[reuseChunkKey(title, heading, content, prefix)] = append([]byte(nil), embedding...)
+		out[reuseChunkKey(title, heading, content, prefix)] = embedding
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate stored chunks for %s: %w", ref, err)
