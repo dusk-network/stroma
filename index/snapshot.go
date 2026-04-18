@@ -37,11 +37,12 @@ func contextPrefixSelectExpr(hasContextPrefix bool) string {
 // Snapshot is one opened Stroma index snapshot.
 //
 // Safe for concurrent use by multiple goroutines once returned from
-// OpenSnapshot: all read methods (Stats, Records, Sections, Search,
-// SearchVector, ExpandContext) share the underlying *sql.DB, which
-// serializes queries internally. Cached metadata fields
-// (quantization, storedDimension, hasFTS, …) are populated at open
-// time and read-only thereafter.
+// OpenSnapshot: *sql.DB is goroutine-safe per the database/sql
+// contract, and all Snapshot read methods (Stats, Records, Sections,
+// Search, SearchVector, ExpandContext) invoke it through that
+// contract. Cached metadata fields (quantization, storedDimension,
+// hasFTS, …) are populated at open time and read-only thereafter, so
+// no additional synchronization is required around Snapshot itself.
 type Snapshot struct {
 	path string
 	db   *sql.DB
@@ -149,9 +150,9 @@ type Section struct {
 // instead of silently misdecoding data against a future schema.
 //
 // The returned *Snapshot is safe for concurrent use by multiple
-// goroutines once constructed: all read methods (Stats, Records,
-// Sections, Search, SearchVector, ExpandContext) share the underlying
-// *sql.DB which serializes queries internally.
+// goroutines once constructed: *sql.DB is goroutine-safe per the
+// database/sql contract, and Snapshot's cached metadata fields are
+// populated at open time and read-only thereafter.
 func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()

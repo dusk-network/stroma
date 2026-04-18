@@ -373,12 +373,14 @@ func TestRebuildPreservesByteCompatibilityWithoutChunkPolicy(t *testing.T) {
 	}
 }
 
-// TestRebuildRejectsChunkPolicyWithLegacyKnobs pins the #62 F2 fix:
-// populating both BuildOptions.ChunkPolicy and any of the flat
-// chunking knobs (MaxChunkTokens / ChunkOverlapTokens /
+// TestRebuildRejectsChunkPolicyWithLegacyKnobs pins the #62 F2 fix on
+// the Rebuild path: populating both BuildOptions.ChunkPolicy and any
+// of the flat chunking knobs (MaxChunkTokens / ChunkOverlapTokens /
 // MaxChunkSections) used to silently drop the knob value, which was
 // a quiet foot-gun for callers who populated the struct by hand.
-// Rebuild and Update must now reject the conflicting shape loudly.
+// Rebuild must now reject the conflicting shape loudly.
+// TestUpdateRejectsChunkPolicyWithLegacyKnobs (below) pins the same
+// contract for the incremental-update path.
 func TestRebuildRejectsChunkPolicyWithLegacyKnobs(t *testing.T) {
 	t.Parallel()
 
