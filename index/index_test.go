@@ -733,9 +733,11 @@ func TestSnapshotRejectsMalformedQuantizationMetadata(t *testing.T) {
 
 	// Corrupt the quantization metadata directly to simulate a stale or
 	// tampered snapshot. Since #57, quantization is resolved once at
-	// OpenSnapshot time and cached on the handle, so any non-supported
-	// value fails fast at open rather than silently misdecoding blobs at
-	// first read.
+	// OpenSnapshot time and cached on the handle, but the error is
+	// *deferred* so non-vector reads (Records, Stats, Sections without
+	// embeddings) still work against a corrupted handle — recovery and
+	// inspection workflows stay open. Vector-touching reads surface the
+	// cached error on first call.
 	rwDB, err := store.OpenReadWriteContext(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadWriteContext() error = %v", err)
@@ -749,13 +751,79 @@ func TestSnapshotRejectsMalformedQuantizationMetadata(t *testing.T) {
 	}
 
 	snapshot, err := OpenSnapshot(context.Background(), path)
-	if err == nil {
-		_ = snapshot.Close()
-		t.Fatal("OpenSnapshot() want error for malformed quantization, got nil")
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "quantization") {
-		t.Errorf("OpenSnapshot error does not mention quantization: %v", err)
-	}
+	defer func() { _ = snapshot.Close() }()
+
+	t.Run("Sections_with_embeddings", func(t *testing.T) {
+		_, err := snapshot.Sections(context.Background(), SectionQuery{IncludeEmbeddings: true})
+		if err == nil {
+			t.Fatal("want error for malformed quantization, got nil")
+		}
+		if !strings.Contains(err.Error(), "quantization") {
+			t.Errorf("error does not mention quantization: %v", err)
+		}
+	})
+
+	t.Run("Search", func(t *testing.T) {
+		_, err := snapshot.Search(context.Background(), SnapshotSearchQuery{
+			SearchParams: SearchParams{
+				Text:     "burst",
+				Limit:    3,
+				Embedder: fixture,
+			},
+		})
+		if err == nil {
+			t.Fatal("want error for malformed quantization, got nil")
+		}
+		if !strings.Contains(err.Error(), "quantization") {
+			t.Errorf("error does not mention quantization: %v", err)
+		}
+	})
+
+	t.Run("SearchVector", func(t *testing.T) {
+		_, err := snapshot.SearchVector(context.Background(), VectorSearchQuery{
+			Embedding: make([]float64, 16),
+			Limit:     3,
+		})
+		if err == nil {
+			t.Fatal("want error for malformed quantization, got nil")
+		}
+		if !strings.Contains(err.Error(), "quantization") {
+			t.Errorf("error does not mention quantization: %v", err)
+		}
+	})
+
+	t.Run("Sections_without_embeddings_still_works", func(t *testing.T) {
+		sections, err := snapshot.Sections(context.Background(), SectionQuery{})
+		if err != nil {
+			t.Fatalf("Sections(IncludeEmbeddings=false) should skip quantization; got %v", err)
+		}
+		if len(sections) == 0 {
+			t.Fatal("expected at least one section")
+		}
+	})
+
+	t.Run("Records_still_works", func(t *testing.T) {
+		records, err := snapshot.Records(context.Background(), RecordQuery{})
+		if err != nil {
+			t.Fatalf("Records() should not depend on quantization; got %v", err)
+		}
+		if len(records) == 0 {
+			t.Fatal("expected at least one record")
+		}
+	})
+
+	t.Run("Stats_still_works", func(t *testing.T) {
+		stats, err := snapshot.Stats(context.Background())
+		if err != nil {
+			t.Fatalf("Stats() should not depend on quantization; got %v", err)
+		}
+		if stats.RecordCount == 0 {
+			t.Fatal("expected at least one record in stats")
+		}
+	})
 }
 
 func TestSearchFTSRequiresAllTokens(t *testing.T) {

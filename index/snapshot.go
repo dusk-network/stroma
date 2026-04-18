@@ -58,8 +58,19 @@ type Snapshot struct {
 	// metadata at OpenSnapshot time so Search/SearchVector/Sections do
 	// not reread the metadata table on every call. Both values are fixed
 	// by the index build and cannot change while the snapshot is open.
-	quantization    string
-	storedDimension int
+	//
+	// Errors encountered while parsing either field are cached in
+	// quantizationErr / storedDimensionErr and deferred to the first
+	// vector-touching read (Search, SearchVector, Sections with
+	// IncludeEmbeddings=true). Non-vector reads (Records, Stats,
+	// Sections with IncludeEmbeddings=false) continue to work against a
+	// snapshot whose vector metadata is malformed, so recovery and
+	// inspection workflows are not bricked by corrupted quantization or
+	// embedder_dimension values.
+	quantization       string
+	quantizationErr    error
+	storedDimension    int
+	storedDimensionErr error
 }
 
 // SnapshotSearchQuery defines one text search against an opened snapshot.
@@ -198,39 +209,57 @@ func OpenSnapshot(ctx context.Context, path string) (*Snapshot, error) {
 	// embedder dimension are fixed by the index build, so caching them on
 	// the handle lets Search/SearchVector/Sections avoid reopening the
 	// metadata table on every call.
-	quantizationRaw, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: read quantization: %w", path, err)
-	}
-	quantization, err := normalizeQuantization(quantizationRaw)
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: %w", path, err)
-	}
-	storedDimensionRaw, err := readMetadataValue(ctx, db, "embedder_dimension")
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: read embedder_dimension: %w", path, err)
-	}
-	storedDimension, err := strconv.Atoi(strings.TrimSpace(storedDimensionRaw))
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: parse embedder_dimension %q: %w", path, storedDimensionRaw, err)
-	}
-	if storedDimension <= 0 {
-		_ = db.Close()
-		return nil, fmt.Errorf("open snapshot %s: stored embedder_dimension %d is non-positive", path, storedDimension)
-	}
+	//
+	// Errors are deferred: a malformed quantization or embedder_dimension
+	// must not brick non-vector reads (Records, Stats, Sections without
+	// embeddings) or diagnostic workflows. The deferred error is surfaced
+	// at the first vector-touching read instead.
+	quantization, quantizationErr := resolveSnapshotQuantization(ctx, db)
+	storedDimension, storedDimensionErr := resolveSnapshotDimension(ctx, db)
 	return &Snapshot{
-		path:             path,
-		db:               db,
-		hasContextPrefix: expectContextPrefix,
-		hasFTS:           hasFTS,
-		hasParentChunkID: expectParentChunkID,
-		quantization:     quantization,
-		storedDimension:  storedDimension,
+		path:               path,
+		db:                 db,
+		hasContextPrefix:   expectContextPrefix,
+		hasFTS:             hasFTS,
+		hasParentChunkID:   expectParentChunkID,
+		quantization:       quantization,
+		quantizationErr:    quantizationErr,
+		storedDimension:    storedDimension,
+		storedDimensionErr: storedDimensionErr,
 	}, nil
+}
+
+// resolveSnapshotQuantization reads and normalizes the quantization
+// metadata once at OpenSnapshot time. On any error the returned string
+// is empty and the error is returned for the caller to cache; read
+// paths that actually depend on quantization check the cached error
+// before using the value.
+func resolveSnapshotQuantization(ctx context.Context, db *sql.DB) (string, error) {
+	raw, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
+	if err != nil {
+		return "", fmt.Errorf("read quantization: %w", err)
+	}
+	return normalizeQuantization(raw)
+}
+
+// resolveSnapshotDimension reads and parses the embedder_dimension
+// metadata once at OpenSnapshot time. On any error the returned dim is
+// zero and the error is returned for the caller to cache; read paths
+// that actually depend on the stored dimension check the cached error
+// before using the value.
+func resolveSnapshotDimension(ctx context.Context, db *sql.DB) (int, error) {
+	raw, err := readMetadataValue(ctx, db, "embedder_dimension")
+	if err != nil {
+		return 0, fmt.Errorf("read embedder_dimension: %w", err)
+	}
+	dim, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("parse embedder_dimension %q: %w", raw, err)
+	}
+	if dim <= 0 {
+		return 0, fmt.Errorf("stored embedder_dimension %d is non-positive", dim)
+	}
+	return dim, nil
 }
 
 // Close releases the opened snapshot handle.
@@ -398,6 +427,9 @@ func (s *Snapshot) Sections(ctx context.Context, query SectionQuery) ([]Section,
 	quantization := store.QuantizationFloat32
 	embeddingsFromFullTable := false
 	if query.IncludeEmbeddings {
+		if s.quantizationErr != nil {
+			return nil, s.quantizationErr
+		}
 		quantization = s.quantization
 		if quantization == store.QuantizationBinary {
 			// Read from the full-precision companion so callers get
@@ -485,6 +517,9 @@ func (s *Snapshot) resolveSearchDimension(requested int) (int, error) {
 	if requested <= 0 {
 		return 0, nil
 	}
+	if s.storedDimensionErr != nil {
+		return 0, s.storedDimensionErr
+	}
 	if s.quantization != store.QuantizationFloat32 {
 		return 0, fmt.Errorf("SearchDimension is only supported for float32 indexes, got %q", s.quantization)
 	}
@@ -558,6 +593,9 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 
 	if err := ensureCompatibleEmbedder(ctx, s.db, query.Embedder); err != nil {
 		return nil, err
+	}
+	if s.quantizationErr != nil {
+		return nil, s.quantizationErr
 	}
 
 	vectors, err := query.Embedder.EmbedQueries(ctx, []string{query.Text})
@@ -638,6 +676,9 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	}
 	if query.Limit <= 0 {
 		query.Limit = 10
+	}
+	if s.quantizationErr != nil {
+		return nil, s.quantizationErr
 	}
 
 	hits, err := s.searchVectorCandidates(ctx, query.Embedding, candidateLimit(query.Limit), query.Kinds, s.quantization, 0)
