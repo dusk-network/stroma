@@ -20,6 +20,12 @@ import (
 	"github.com/dusk-network/stroma/v2/provider"
 )
 
+// testEmbedPath is the path stub servers match to accept real
+// embeddings POSTs — BaseURL normalization appends "/v1" and the
+// client POSTs to BaseURL+"/embeddings", so every fake handler that
+// cares about routing uses this exact path.
+const testEmbedPath = "/v1/embeddings"
+
 func TestOpenAIUnconfigured(t *testing.T) {
 	t.Parallel()
 
@@ -239,7 +245,7 @@ func startOpenAIEmbedderStub(t *testing.T, resp stubResponse) (*httptest.Server,
 	received := &receivedOpenAIRequests{}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -673,7 +679,7 @@ func TestOpenAIMultiBatchDeadlineScalesWithBatchCount(t *testing.T) {
 		allInputs [][]string
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -793,7 +799,7 @@ func TestOpenAIEmbedRetriesOn5xxThenSucceeds(t *testing.T) {
 
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -888,7 +894,7 @@ func TestOpenAIEmbedHonoursRetryAfterHeader(t *testing.T) {
 		secondAttemptAt time.Time
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -953,7 +959,7 @@ func TestOpenAIEmbedMultiBatchBudgetScalesWithRetries(t *testing.T) {
 		attempt int
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -1045,7 +1051,7 @@ func TestOpenAINormalizesNegativeMaxRetries(t *testing.T) {
 
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -1110,7 +1116,7 @@ func TestOpenAIEmbedMultiBatchBudgetIncludesRetryAfterSlack(t *testing.T) {
 		attempt int
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
