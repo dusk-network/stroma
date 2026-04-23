@@ -6,3 +6,8 @@ coverage.out
 *.db
 *.db-shm
 *.db-wal
+
+# CCD (Claude Code Development) workspace marker — per-developer CCD
+# attachment pointer (project_id + display_name). Not a shared repo
+# convention; each developer who uses CCD gets their own local copy.
+.ccd.toml
