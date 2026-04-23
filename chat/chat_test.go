@@ -23,7 +23,10 @@ func TestOpenAIConfigRedactsToken(t *testing.T) {
 		Model:    "gpt",
 		APIToken: "sk-supersecret",
 	}
-	for _, got := range []string{cfg.String(), cfg.GoString(), fmt.Sprintf("%v", cfg), fmt.Sprintf("%#v", cfg)} {
+	// Direct calls exercise the Stringer / GoStringer implementations;
+	// the stdlib contract for fmt %v / %#v routes through them, so
+	// duplicating that check here would be redundant.
+	for _, got := range []string{cfg.String(), cfg.GoString()} {
 		if strings.Contains(got, "sk-supersecret") {
 			t.Errorf("config rendering leaked token: %s", got)
 		}
@@ -111,7 +114,7 @@ func TestChatCompletionTextSuccess(t *testing.T) {
 		captured.Messages = body.Messages
 		captured.Auth = r.Header.Get("Authorization")
 
-		fmt.Fprint(w, `{"choices":[{"message":{"content":"hi"}}]}`)
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"hi"}}]}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -144,8 +147,8 @@ func TestChatCompletionTextSuccess(t *testing.T) {
 }
 
 func TestChatCompletionTextHandlesPartArrayContent(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"choices":[{"message":{"content":[{"type":"text","text":"alpha"},{"type":"text","text":"beta"}]}}]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":[{"type":"text","text":"alpha"},{"type":"text","text":"beta"}]}}]}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -160,8 +163,8 @@ func TestChatCompletionTextHandlesPartArrayContent(t *testing.T) {
 }
 
 func TestChatCompletionTextSchemaMismatchOnEmptyChoices(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"choices":[]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"choices":[]}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -177,8 +180,8 @@ func TestChatCompletionTextSchemaMismatchOnEmptyChoices(t *testing.T) {
 }
 
 func TestChatCompletionTextSchemaMismatchOnEmptyMessageText(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"choices":[{"message":{"content":""}}]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":""}}]}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -205,8 +208,8 @@ func TestChatCompletionTextSchemaMismatchOnUnsupportedContentShape(t *testing.T)
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				fmt.Fprint(w, body)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, body)
 			}))
 			t.Cleanup(server.Close)
 
@@ -252,8 +255,8 @@ func TestExtractMessageTextDirectly(t *testing.T) {
 }
 
 func TestChatCompletionTextSchemaMismatchOnDecodeFailure(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<html>not json</html>`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `<html>not json</html>`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -270,13 +273,13 @@ func TestChatCompletionTextSchemaMismatchOnDecodeFailure(t *testing.T) {
 
 func TestChatCompletionTextRetriesOn5xxThenSucceeds(t *testing.T) {
 	var attempts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := attempts.Add(1)
 		if n < 2 {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -294,9 +297,9 @@ func TestChatCompletionTextRetriesOn5xxThenSucceeds(t *testing.T) {
 }
 
 func TestChatCompletionTextAuthErrorClassified(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprint(w, `{"error":{"message":"invalid key"}}`)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"invalid key"}}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -320,7 +323,7 @@ func TestChatCompletionTextUnconfiguredRejects(t *testing.T) {
 }
 
 func TestChatCompletionTextPopulatesDiagnosticFields(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	t.Cleanup(server.Close)

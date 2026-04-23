@@ -761,8 +761,8 @@ func TestOpenAIEmbedDecodeErrorClassifiesAsSchemaMismatch(t *testing.T) {
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				fmt.Fprint(w, body)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, body)
 			}))
 			t.Cleanup(server.Close)
 

@@ -124,109 +124,19 @@ func Do[T any](
 
 	var lastErr error
 	for attempt := 0; attempt <= policy.MaxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, method, target.URL, bytes.NewReader(target.Body))
-		if err != nil {
-			return zero, fmt.Errorf("stroma/provider: build request: %w", err)
+		value, retryAfter, statusCode, err := doAttempt(ctx, client, method, target, details, maxResponseBytes, decode)
+		if err == nil {
+			return value, nil
 		}
-		req.Header.Set("Content-Type", "application/json")
-		if target.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+target.Token)
+		// Context cancellation propagates immediately — retrying a
+		// cancelled caller would waste cycles and surprise them.
+		if errors.Is(err, context.Canceled) ||
+			(errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil) {
+			return zero, err
 		}
-		for key, values := range target.Header {
-			for _, value := range values {
-				req.Header.Add(key, value)
-			}
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			// Honour context cancellation immediately — retrying a
-			// cancelled caller would waste cycles and surprise them.
-			if errors.Is(err, context.Canceled) ||
-				(errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil) {
-				return zero, err
-			}
-			failure := classifiedFailureDetails(details, 0, err, err.Error())
-			lastErr = NewProviderError(failure, "call %s %s: %v", method, target.URL, err)
-			if shouldRetry(err, 0) && attempt < policy.MaxRetries {
-				if waitErr := waitBeforeRetry(ctx, attempt, 0); waitErr != nil {
-					return zero, waitErr
-				}
-				continue
-			}
-			return zero, lastErr
-		}
-
-		retryAfter := min(retryAfterDuration(resp.Header.Get("Retry-After")), maxRetryAfter)
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-		closeErr := resp.Body.Close()
-
-		oversized := int64(len(body)) > maxResponseBytes
-		non2xx := resp.StatusCode < 200 || resp.StatusCode >= 300
-		switch {
-		case readErr != nil && non2xx:
-			// A 401/429/5xx with a truncated body still carries its
-			// status — that's the strongest classification signal.
-			// Classify by status, record the read error in the message
-			// for diagnostics.
-			failure := classifiedFailureDetails(details, resp.StatusCode, nil, readErr.Error())
-			err = NewProviderErrorStatus(failure, resp.StatusCode,
-				"%s %s returned %s (response body read failed: %v)",
-				method, target.URL, resp.Status, readErr)
-		case readErr != nil:
-			failure := classifiedFailureDetails(details, 0, readErr, readErr.Error())
-			err = NewProviderError(failure, "read response: %v", readErr)
-		case non2xx:
-			// Status classification runs before overflow handling so
-			// an oversized 401/429/5xx body still surfaces as auth /
-			// rate_limit / server — the HTTP status is the strongest
-			// signal and callers branching on FailureClass need it
-			// intact even when the body is too large to display.
-			message := ExtractErrorMessage(body)
-			if message == "" {
-				message = strings.TrimSpace(string(body))
-			}
-			if message == "" {
-				message = http.StatusText(resp.StatusCode)
-			}
-			if oversized {
-				message = fmt.Sprintf("%s (response body exceeds %d bytes; truncated)", http.StatusText(resp.StatusCode), maxResponseBytes)
-			}
-			failure := classifiedFailureDetails(details, resp.StatusCode, nil, message)
-			err = NewProviderErrorStatus(failure, resp.StatusCode, "%s %s returned %s: %s", method, target.URL, resp.Status, message)
-		case oversized:
-			failure := details
-			failure.FailureClass = FailureClassSchemaMismatch
-			err = NewProviderError(failure, "response exceeds %d bytes; aborting decode", maxResponseBytes)
-		default:
-			value, decodeErr := decode(resp, body)
-			if decodeErr == nil {
-				if closeErr != nil {
-					failure := classifiedFailureDetails(details, 0, closeErr, closeErr.Error())
-					return zero, NewProviderError(failure, "close response: %v", closeErr)
-				}
-				return value, nil
-			}
-			// Decoders that already return a classified *ProviderError
-			// pass through; opaque errors from decoders that don't are
-			// wrapped as schema_mismatch so every Do return satisfies
-			// errors.As(*ProviderError) per the package contract.
-			var perr *ProviderError
-			if !errors.As(decodeErr, &perr) {
-				failure := details
-				failure.FailureClass = FailureClassSchemaMismatch
-				decodeErr = NewProviderError(failure, "decode response: %v", decodeErr)
-			}
-			err = decodeErr
-		}
-		if closeErr != nil && err == nil {
-			failure := classifiedFailureDetails(details, 0, closeErr, closeErr.Error())
-			err = NewProviderError(failure, "close response: %v", closeErr)
-		}
-
 		lastErr = err
-		if shouldRetry(err, resp.StatusCode) && attempt < policy.MaxRetries {
-			if waitErr := waitBeforeRetry(ctx, attempt, retryAfter); waitErr != nil {
+		if shouldRetry(err, statusCode) && attempt < policy.MaxRetries {
+			if waitErr := waitBeforeRetry(ctx, attempt, min(retryAfter, maxRetryAfter)); waitErr != nil {
 				return zero, waitErr
 			}
 			continue
@@ -238,6 +148,149 @@ func Do[T any](
 		lastErr = NewProviderError(details, "request failed")
 	}
 	return zero, lastErr
+}
+
+// doAttempt performs one HTTP attempt and classifies the outcome.
+// On success it returns (value, 0, statusCode, nil). On failure it
+// returns (_, retryAfter, statusCode, *ProviderError) — or the raw
+// ctx error when the context was cancelled, which Do propagates
+// without retry.
+func doAttempt[T any](
+	ctx context.Context,
+	client *http.Client,
+	method string,
+	target Target,
+	details FailureDetails,
+	maxResponseBytes int64,
+	decode DecodeFunc[T],
+) (T, time.Duration, int, error) {
+	var zero T
+	req, err := buildRequest(ctx, method, target)
+	if err != nil {
+		return zero, 0, 0, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) ||
+			(errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil) {
+			return zero, 0, 0, err
+		}
+		failure := classifiedFailureDetails(details, 0, err, err.Error())
+		return zero, 0, 0, NewProviderError(failure, "call %s %s: %v", method, target.URL, err)
+	}
+
+	retryAfter := retryAfterDuration(resp.Header.Get("Retry-After"))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	closeErr := resp.Body.Close()
+
+	value, outErr := interpretResponse(resp, method, target, body, readErr, closeErr, details, maxResponseBytes, decode)
+	return value, retryAfter, resp.StatusCode, outErr
+}
+
+// buildRequest assembles the http.Request including headers so
+// doAttempt stays focused on transport and classification.
+func buildRequest(ctx context.Context, method string, target Target) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target.URL, bytes.NewReader(target.Body))
+	if err != nil {
+		return nil, fmt.Errorf("stroma/provider: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if target.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+target.Token)
+	}
+	for key, values := range target.Header {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	return req, nil
+}
+
+// interpretResponse classifies a received HTTP response into a
+// decoded value or a *ProviderError. HTTP-status classification wins
+// over body-read and oversize concerns so the strongest signal
+// (auth / rate_limit / server) survives truncation or oversized error
+// payloads.
+func interpretResponse[T any](
+	resp *http.Response,
+	method string,
+	target Target,
+	body []byte,
+	readErr error,
+	closeErr error,
+	details FailureDetails,
+	maxResponseBytes int64,
+	decode DecodeFunc[T],
+) (T, error) {
+	var zero T
+	oversized := int64(len(body)) > maxResponseBytes
+	non2xx := resp.StatusCode < 200 || resp.StatusCode >= 300
+
+	if non2xx {
+		return zero, interpretNon2xx(resp, method, target, body, readErr, oversized, details, maxResponseBytes)
+	}
+	if readErr != nil {
+		failure := classifiedFailureDetails(details, 0, readErr, readErr.Error())
+		return zero, NewProviderError(failure, "read response: %v", readErr)
+	}
+	if oversized {
+		failure := details
+		failure.FailureClass = FailureClassSchemaMismatch
+		return zero, NewProviderError(failure, "response exceeds %d bytes; aborting decode", maxResponseBytes)
+	}
+
+	value, decodeErr := decode(resp, body)
+	if decodeErr == nil {
+		if closeErr != nil {
+			failure := classifiedFailureDetails(details, 0, closeErr, closeErr.Error())
+			return zero, NewProviderError(failure, "close response: %v", closeErr)
+		}
+		return value, nil
+	}
+	// Decoders that already return a classified *ProviderError pass
+	// through; opaque errors are wrapped as schema_mismatch so every
+	// Do return satisfies errors.As(*ProviderError).
+	var perr *ProviderError
+	if !errors.As(decodeErr, &perr) {
+		failure := details
+		failure.FailureClass = FailureClassSchemaMismatch
+		decodeErr = NewProviderError(failure, "decode response: %v", decodeErr)
+	}
+	return zero, decodeErr
+}
+
+// interpretNon2xx handles any non-2xx response: classify by status
+// even when the body read failed or the body exceeded the cap.
+func interpretNon2xx(
+	resp *http.Response,
+	method string,
+	target Target,
+	body []byte,
+	readErr error,
+	oversized bool,
+	details FailureDetails,
+	maxResponseBytes int64,
+) error {
+	if readErr != nil {
+		failure := classifiedFailureDetails(details, resp.StatusCode, nil, readErr.Error())
+		return NewProviderErrorStatus(failure, resp.StatusCode,
+			"%s %s returned %s (response body read failed: %v)",
+			method, target.URL, resp.Status, readErr)
+	}
+	message := ExtractErrorMessage(body)
+	if message == "" {
+		message = strings.TrimSpace(string(body))
+	}
+	if message == "" {
+		message = http.StatusText(resp.StatusCode)
+	}
+	if oversized {
+		message = fmt.Sprintf("%s (response body exceeds %d bytes; truncated)", http.StatusText(resp.StatusCode), maxResponseBytes)
+	}
+	failure := classifiedFailureDetails(details, resp.StatusCode, nil, message)
+	return NewProviderErrorStatus(failure, resp.StatusCode,
+		"%s %s returned %s: %s", method, target.URL, resp.Status, message)
 }
 
 func shouldRetry(err error, statusCode int) bool {

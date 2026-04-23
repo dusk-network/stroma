@@ -54,7 +54,7 @@ func TestDoSuccessSinglePass(t *testing.T) {
 			t.Errorf("Content-Type = %q, want application/json", ct)
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"value":"hi"}`)
+		_, _ = fmt.Fprint(w, `{"value":"hi"}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -62,7 +62,7 @@ func TestDoSuccessSinglePass(t *testing.T) {
 		Target{Method: http.MethodPost, URL: server.URL, Body: []byte(`{"q":"go"}`), Token: "secret"},
 		FailureDetails{},
 		Policy{MaxRetries: 2},
-		func(resp *http.Response, body []byte) (string, error) {
+		func(_ *http.Response, body []byte) (string, error) {
 			if !strings.Contains(string(body), "hi") {
 				return "", fmt.Errorf("unexpected body %q", body)
 			}
@@ -82,14 +82,14 @@ func TestDoSuccessSinglePass(t *testing.T) {
 
 func TestDoRetriesOn5xxThenSucceeds(t *testing.T) {
 	var attempts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := attempts.Add(1)
 		if n < 3 {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `ok`)
+		_, _ = fmt.Fprint(w, `ok`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -97,7 +97,7 @@ func TestDoRetriesOn5xxThenSucceeds(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 5},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	if err != nil {
 		t.Fatalf("Do() err = %v", err)
@@ -114,7 +114,7 @@ func TestDoHonoursRetryAfterHeader(t *testing.T) {
 	var attempts atomic.Int32
 	var firstAttemptAt time.Time
 	var secondAttemptAt time.Time
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := attempts.Add(1)
 		if n == 1 {
 			firstAttemptAt = time.Now()
@@ -124,7 +124,7 @@ func TestDoHonoursRetryAfterHeader(t *testing.T) {
 		}
 		secondAttemptAt = time.Now()
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	}))
 	t.Cleanup(server.Close)
 
@@ -132,7 +132,7 @@ func TestDoHonoursRetryAfterHeader(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 3},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	if err != nil {
 		t.Fatalf("Do() err = %v", err)
@@ -144,9 +144,9 @@ func TestDoHonoursRetryAfterHeader(t *testing.T) {
 }
 
 func TestDoClassifiesNon2xx(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprint(w, `{"error":{"message":"bad key"}}`)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"bad key"}}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -154,7 +154,7 @@ func TestDoClassifiesNon2xx(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{Model: "m", Endpoint: server.URL},
 		Policy{MaxRetries: 0},
-		func(resp *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, body []byte) (string, error) { return "", nil },
 	)
 	var perr *ProviderError
 	if !errors.As(err, &perr) {
@@ -173,7 +173,7 @@ func TestDoClassifiesNon2xx(t *testing.T) {
 
 func TestDoRespectsMaxRetriesExhaustion(t *testing.T) {
 	var attempts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempts.Add(1)
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
@@ -183,7 +183,7 @@ func TestDoRespectsMaxRetriesExhaustion(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 2},
-		func(resp *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, body []byte) (string, error) { return "", nil },
 	)
 	if err == nil {
 		t.Fatalf("Do() err = nil, want error after exhaustion")
@@ -203,9 +203,9 @@ func TestDoRespectsMaxRetriesExhaustion(t *testing.T) {
 func TestDoEnforcesResponseSizeCap(t *testing.T) {
 	// Emit a response larger than the configured cap.
 	payload := strings.Repeat("x", 64)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, payload)
+		_, _ = fmt.Fprint(w, payload)
 	}))
 	t.Cleanup(server.Close)
 
@@ -213,7 +213,7 @@ func TestDoEnforcesResponseSizeCap(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxResponseBytes: 16},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	var perr *ProviderError
 	if !errors.As(err, &perr) {
@@ -225,9 +225,9 @@ func TestDoEnforcesResponseSizeCap(t *testing.T) {
 }
 
 func TestDoContextCancellationShortCircuits(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	}))
 	t.Cleanup(server.Close)
 
@@ -238,7 +238,7 @@ func TestDoContextCancellationShortCircuits(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 3},
-		func(resp *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, body []byte) (string, error) { return "", nil },
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
@@ -246,9 +246,9 @@ func TestDoContextCancellationShortCircuits(t *testing.T) {
 }
 
 func TestDoDecoderSchemaMismatchPropagates(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"value":"x"}`)
+		_, _ = fmt.Fprint(w, `{"value":"x"}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -256,7 +256,7 @@ func TestDoDecoderSchemaMismatchPropagates(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 0},
-		func(resp *http.Response, body []byte) (string, error) {
+		func(_ *http.Response, body []byte) (string, error) {
 			return "", NewProviderError(FailureDetails{FailureClass: FailureClassSchemaMismatch}, "bad shape")
 		},
 	)
@@ -275,7 +275,7 @@ func TestDoHeaderPassthrough(t *testing.T) {
 			t.Errorf("X-Test header = %q, want yes", r.Header.Get("X-Test"))
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	}))
 	t.Cleanup(server.Close)
 
@@ -285,7 +285,7 @@ func TestDoHeaderPassthrough(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`), Header: h},
 		FailureDetails{},
 		Policy{},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	if err != nil {
 		t.Fatalf("Do() err = %v", err)
@@ -299,7 +299,7 @@ func TestRetryAfterCapBoundsHugeHeaderValue(t *testing.T) {
 	// tight budget, not after 86400s.
 	var firstAttemptAt, secondAttemptAt time.Time
 	var attempts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := attempts.Add(1)
 		if n == 1 {
 			firstAttemptAt = time.Now()
@@ -308,7 +308,7 @@ func TestRetryAfterCapBoundsHugeHeaderValue(t *testing.T) {
 			return
 		}
 		secondAttemptAt = time.Now()
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	}))
 	t.Cleanup(server.Close)
 
@@ -317,7 +317,7 @@ func TestRetryAfterCapBoundsHugeHeaderValue(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 2, MaxRetryAfter: 250 * time.Millisecond},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	if err != nil {
 		t.Fatalf("Do() err = %v", err)
@@ -342,14 +342,14 @@ func TestRetryAfterDefaultCapIs30s(t *testing.T) {
 	// rate-limiter window but well under our cap so the test doesn't
 	// block on it. The point is to confirm capping works from zero.
 	var attempts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := attempts.Add(1)
 		if n == 1 {
 			w.Header().Set("Retry-After", "3600") // 1 hour
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	}))
 	t.Cleanup(server.Close)
 
@@ -365,21 +365,17 @@ func TestRetryAfterDefaultCapIs30s(t *testing.T) {
 			Target{URL: server.URL, Body: []byte(`x`)},
 			FailureDetails{},
 			Policy{MaxRetries: 1}, // MaxRetryAfter zero → default
-			func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+			func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 		)
 		done <- err
 	}()
 
+	// The test passes if Do() returns within 10s. Without a default
+	// cap, a Retry-After of 3600s would block the goroutine for an
+	// hour and trip the deadline case below. Either a successful
+	// retry or a ctx-deadline-exceeded failure proves the cap fired.
 	select {
-	case err := <-done:
-		// If the cap is working, we hit ctx cancellation between the
-		// two attempts (30s > 5s), and Do returns ctx.Err.
-		if !errors.Is(err, context.DeadlineExceeded) {
-			// If we finished without ctx deadline, it means 1 hour
-			// wasn't capped, which would take an hour and trip the
-			// outer case — the only way we're here with a non-deadline
-			// err in <5s is if the cap did apply. Not a failure.
-		}
+	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("Do() did not return within 10s — default MaxRetryAfter cap is missing")
 	}
@@ -391,9 +387,9 @@ func TestDoOversizedNon2xxPreservesStatusClassification(t *testing.T) {
 	// signal. Before the reorder, oversize was checked first and
 	// clobbered the classification with schema_mismatch.
 	big := strings.Repeat("x", 64)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprint(w, big)
+		_, _ = fmt.Fprint(w, big)
 	}))
 	t.Cleanup(server.Close)
 
@@ -401,7 +397,7 @@ func TestDoOversizedNon2xxPreservesStatusClassification(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxResponseBytes: 16},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	var perr *ProviderError
 	if !errors.As(err, &perr) {
@@ -419,9 +415,9 @@ func TestDoOversized401PreservesAuthClass(t *testing.T) {
 	// Mirror test for auth: an oversized 401 body must still classify
 	// as auth, not schema_mismatch.
 	big := strings.Repeat("x", 64)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprint(w, big)
+		_, _ = fmt.Fprint(w, big)
 	}))
 	t.Cleanup(server.Close)
 
@@ -429,7 +425,7 @@ func TestDoOversized401PreservesAuthClass(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxResponseBytes: 16},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	var perr *ProviderError
 	if !errors.As(err, &perr) {
@@ -446,8 +442,8 @@ func TestDoWrapsOpaqueDecodeErrorAsSchemaMismatch(t *testing.T) {
 	// return plain fmt.Errorf values for protocol violations; the
 	// provider layer must wrap them so caller-side branching on
 	// FailureClass still works.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"anything":"goes"}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"anything":"goes"}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -455,7 +451,7 @@ func TestDoWrapsOpaqueDecodeErrorAsSchemaMismatch(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{Model: "m", Endpoint: server.URL},
 		Policy{},
-		func(resp *http.Response, body []byte) (string, error) {
+		func(_ *http.Response, body []byte) (string, error) {
 			return "", fmt.Errorf("wrong input count: got 3, want 1")
 		},
 	)
@@ -477,8 +473,8 @@ func TestDoWrapsOpaqueDecodeErrorAsSchemaMismatch(t *testing.T) {
 func TestDoPreservesClassifiedDecodeError(t *testing.T) {
 	// Decoders that already return *ProviderError must pass through
 	// unchanged — no double-wrapping, original FailureClass preserved.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `ok`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `ok`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -487,7 +483,7 @@ func TestDoPreservesClassifiedDecodeError(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{},
-		func(resp *http.Response, body []byte) (string, error) { return "", original },
+		func(_ *http.Response, body []byte) (string, error) { return "", original },
 	)
 	var perr *ProviderError
 	if !errors.As(err, &perr) {
@@ -508,9 +504,9 @@ func TestShouldRetryNonTimeoutNetErrorFallsThroughToStringMatch(t *testing.T) {
 	// broken pipe. An earlier implementation returned
 	// netErr.Timeout() directly and made these unreachable.
 	cases := []struct {
-		name    string
-		err     error
-		want    bool
+		name string
+		err  error
+		want bool
 	}{
 		{
 			name: "connection refused wrapped in url.Error",
@@ -572,7 +568,7 @@ func TestDoReadErrorOnNon2xxPreservesStatus(t *testing.T) {
 	// must still classify by HTTP status, not collapse to transport
 	// with status 0. The status was received before the body read, so
 	// it is still the strongest signal.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// Send 503 with Content-Length announcing more bytes than we
 		// actually emit, then close the connection so io.ReadAll
 		// observes an unexpected EOF.
@@ -596,7 +592,7 @@ func TestDoReadErrorOnNon2xxPreservesStatus(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 0},
-		func(resp *http.Response, body []byte) (string, error) { return string(body), nil },
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
 	var perr *ProviderError
 	if !errors.As(err, &perr) {
@@ -615,7 +611,7 @@ func TestDoRejectsNilClient(t *testing.T) {
 		Target{URL: "http://x"},
 		FailureDetails{},
 		Policy{},
-		func(resp *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, body []byte) (string, error) { return "", nil },
 	)
 	if err == nil || !strings.Contains(err.Error(), "nil http client") {
 		t.Errorf("err = %v, want nil http client", err)
