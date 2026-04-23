@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dusk-network/stroma/v2/provider"
 )
 
 func TestOpenAIUnconfigured(t *testing.T) {
@@ -739,5 +742,42 @@ func TestOpenAIMultiBatchDeadlineScalesWithBatchCount(t *testing.T) {
 		if flat[i] != want {
 			t.Fatalf("flattened[%d] = %q, want %q (ordering broke across scaled deadline)", i, flat[i], want)
 		}
+	}
+}
+
+// TestOpenAIEmbedDecodeErrorClassifiesAsSchemaMismatch confirms that a
+// malformed 2xx body — whether unparsable JSON or a count mismatch
+// from parseEmbedResponse — surfaces as a classified provider error
+// callers can branch on. Before the provider port, decode failures
+// returned plain fmt.Errorf values and silently bypassed any caller
+// FailureClass check.
+func TestOpenAIEmbedDecodeErrorClassifiesAsSchemaMismatch(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"not json":        `<html>nope</html>`,
+		"count mismatch":  `{"data":[{"embedding":[0.1],"index":0},{"embedding":[0.2],"index":1}]}`,
+		"empty embedding": `{"data":[{"embedding":[],"index":0}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, body)
+			}))
+			t.Cleanup(server.Close)
+
+			e := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "mami"})
+			_, err := e.EmbedQueries(context.Background(), []string{"probe"})
+			if err == nil {
+				t.Fatalf("err = nil, want classified schema_mismatch")
+			}
+			var perr *provider.Error
+			if !errors.As(err, &perr) {
+				t.Fatalf("err = %v, want *provider.Error via errors.As", err)
+			}
+			if perr.FailureClass() != provider.FailureClassSchemaMismatch {
+				t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
+			}
+		})
 	}
 }
