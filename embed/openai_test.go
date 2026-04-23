@@ -13,11 +13,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dusk-network/stroma/v2/provider"
 )
+
+// testEmbedPath is the path stub servers match to accept real
+// embeddings POSTs — BaseURL normalization appends "/v1" and the
+// client POSTs to BaseURL+"/embeddings", so every fake handler that
+// cares about routing uses this exact path.
+const testEmbedPath = "/v1/embeddings"
 
 func TestOpenAIUnconfigured(t *testing.T) {
 	t.Parallel()
@@ -238,7 +245,7 @@ func startOpenAIEmbedderStub(t *testing.T, resp stubResponse) (*httptest.Server,
 	received := &receivedOpenAIRequests{}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -672,7 +679,7 @@ func TestOpenAIMultiBatchDeadlineScalesWithBatchCount(t *testing.T) {
 		allInputs [][]string
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != testEmbedPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -779,5 +786,407 @@ func TestOpenAIEmbedDecodeErrorClassifiesAsSchemaMismatch(t *testing.T) {
 				t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
 			}
 		})
+	}
+}
+
+// TestOpenAIEmbedRetriesOn5xxThenSucceeds locks the #73 wiring: with
+// MaxRetries > 0, a retryable upstream 5xx must trigger another
+// attempt through the shared provider core rather than surfacing
+// immediately. Mirrors the chat-side coverage so the two surfaces
+// share the same contract.
+func TestOpenAIEmbedRetriesOn5xxThenSucceeds(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testEmbedPath {
+			http.NotFound(w, r)
+			return
+		}
+		n := attempts.Add(1)
+		if n < 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	t.Cleanup(server.Close)
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:    server.URL + "/v1",
+		Model:      "mami",
+		Timeout:    2 * time.Second,
+		MaxRetries: 2,
+	})
+	vectors, err := e.EmbedQueries(context.Background(), []string{"probe"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	if len(vectors) != 1 || len(vectors[0]) != 4 {
+		t.Fatalf("vectors = %v, want one 4-dim vector", vectors)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("attempts = %d, want 2 (one 502 + one success)", got)
+	}
+}
+
+// TestOpenAIEmbedDoesNotRetryOnNon5xx4xx confirms classification-aware
+// retrying: an auth failure (401) is non-retryable, so the client must
+// stop after the first attempt even when MaxRetries > 0. This guards
+// against an accidental regression that would retry every non-2xx.
+func TestOpenAIEmbedDoesNotRetryOnNon5xx4xx(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"invalid key"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:    server.URL + "/v1",
+		Model:      "mami",
+		Timeout:    2 * time.Second,
+		APIToken:   "bad",
+		MaxRetries: 3,
+	})
+	_, err := e.EmbedQueries(context.Background(), []string{"probe"})
+	if err == nil {
+		t.Fatal("EmbedQueries() error = nil, want auth failure")
+	}
+	var perr *provider.Error
+	if !errors.As(err, &perr) {
+		t.Fatalf("err = %v, want *provider.Error", err)
+	}
+	if perr.FailureClass() != provider.FailureClassAuth {
+		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassAuth)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1 (auth failures are non-retryable even with MaxRetries=3)", got)
+	}
+}
+
+// TestOpenAIEmbedHonoursRetryAfterHeader verifies that a 429 response
+// with a Retry-After header makes the retry loop wait at least the
+// server-supplied interval before re-issuing the request. Defers the
+// bulk of Retry-After coverage to provider/retry_test.go; this test
+// confirms the embed surface actually routes through the shared loop.
+func TestOpenAIEmbedHonoursRetryAfterHeader(t *testing.T) {
+	t.Parallel()
+
+	var (
+		attempts        atomic.Int32
+		firstAttemptAt  time.Time
+		secondAttemptAt time.Time
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testEmbedPath {
+			http.NotFound(w, r)
+			return
+		}
+		n := attempts.Add(1)
+		if n == 1 {
+			firstAttemptAt = time.Now()
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		secondAttemptAt = time.Now()
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	t.Cleanup(server.Close)
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:    server.URL + "/v1",
+		Model:      "mami",
+		Timeout:    5 * time.Second,
+		MaxRetries: 2,
+	})
+	if _, err := e.EmbedQueries(context.Background(), []string{"probe"}); err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	gap := secondAttemptAt.Sub(firstAttemptAt)
+	if gap < 900*time.Millisecond {
+		t.Errorf("Retry-After honoured gap = %s, want >=900ms (1s header minus jitter slack)", gap)
+	}
+}
+
+// TestOpenAIEmbedMultiBatchBudgetScalesWithRetries locks the retry-
+// aware multi-batch deadline: when batch 0 spends more than one
+// Timeout window on a retry chain, batch 1 must still get its own
+// full Timeout-sized per-attempt window. Pre-fix the parent ctx
+// deadline was batches*Timeout = 400ms total; batch 0's initial 502
+// + 200ms backoff + 100ms retry work consumed ~305ms of that, and
+// batch 1's 100ms server work then tripped the parent ctx at 400ms.
+// Post-fix the deadline scales by (MaxRetries+1) so batch 1 has a
+// full Timeout worth of budget regardless of what batch 0 did.
+func TestOpenAIEmbedMultiBatchBudgetScalesWithRetries(t *testing.T) {
+	t.Parallel()
+
+	const (
+		timeout      = 200 * time.Millisecond
+		perBatchWork = 100 * time.Millisecond
+	)
+
+	var (
+		mu      sync.Mutex
+		attempt int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testEmbedPath {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		attempt++
+		n := attempt
+		mu.Unlock()
+
+		// Attempt 1 is batch 0's first shot → 502 immediately.
+		// Attempts 2 (batch 0 retry) and 3 (batch 1) do real work
+		// bounded by perBatchWork, which stays under Timeout so the
+		// per-attempt http.Client.Timeout never trips.
+		if n == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		select {
+		case <-time.After(perBatchWork):
+		case <-r.Context().Done():
+			return
+		}
+
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer server.Close()
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:      server.URL + "/v1",
+		Model:        "mami",
+		Timeout:      timeout,
+		MaxRetries:   1,
+		MaxBatchSize: 1,
+	})
+
+	start := time.Now()
+	vectors, err := e.EmbedDocuments(context.Background(), []string{"a", "b"})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("EmbedDocuments() error = %v (retry-aware multi-batch budget regressed; batch 1 likely starved by batch 0's retry chain)", err)
+	}
+	if len(vectors) != 2 {
+		t.Fatalf("len(vectors) = %d, want 2", len(vectors))
+	}
+
+	mu.Lock()
+	got := attempt
+	mu.Unlock()
+	if got != 3 {
+		t.Errorf("server saw %d attempts, want 3 (batch 0 initial 502 + batch 0 retry + batch 1)", got)
+	}
+
+	// Lower bound: backoff (200ms) + at least one 100ms batch of
+	// real work. Proves retries actually fired and we are not just
+	// racing through three instant 2xx responses.
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("elapsed = %s, want >=250ms (backoff+work must have actually happened)", elapsed)
+	}
+	// Upper bound: generous slack for CI jitter. Post-fix total is
+	// ~405ms (5ms + 200ms backoff + 100ms + 100ms); pre-fix failed
+	// outright, so passing at all is the strongest signal.
+	if elapsed > 2*time.Second {
+		t.Errorf("elapsed = %s, want well under 2s (indicates unexpected wall-clock inflation)", elapsed)
+	}
+}
+
+// TestOpenAINormalizesNegativeMaxRetries locks the construction-time
+// clamp: a pathological negative MaxRetries (e.g. from a bad env
+// parse) must not short-circuit provider.Do's retry loop. Without
+// normalization, provider.Do's `for attempt := 0; attempt <=
+// policy.MaxRetries; attempt++` executes zero times when MaxRetries
+// is negative, so the embedder would hard-fail every call with a
+// generic error before any HTTP round trip. After normalization the
+// raw request still fires and either succeeds or returns a
+// classified transport/protocol error — the normal path.
+func TestOpenAINormalizesNegativeMaxRetries(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testEmbedPath {
+			http.NotFound(w, r)
+			return
+		}
+		attempts.Add(1)
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	t.Cleanup(server.Close)
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:    server.URL + "/v1",
+		Model:      "mami",
+		Timeout:    2 * time.Second,
+		MaxRetries: -1, // pathological; must be clamped to 0
+	})
+	if got := e.Config().MaxRetries; got != 0 {
+		t.Errorf("Config().MaxRetries = %d after NewOpenAI, want 0 (negative values must be clamped)", got)
+	}
+
+	vectors, err := e.EmbedQueries(context.Background(), []string{"probe"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v (negative MaxRetries must not brick the embedder)", err)
+	}
+	if len(vectors) != 1 || len(vectors[0]) != 4 {
+		t.Fatalf("vectors = %v, want one 4-dim vector", vectors)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1 (normalized to 0 retries → single attempt)", got)
+	}
+}
+
+// TestOpenAIEmbedMultiBatchBudgetIncludesRetryAfterSlack locks the
+// retry-wait slack in the parent deadline: a 429 with Retry-After on
+// batch 0 sleeps well beyond a single Timeout, but batch 1 must still
+// complete because the deadline budgets MaxRetries * embedMaxRetryAfter
+// of inter-retry wait time on top of per-attempt Timeout. Pre-fix the
+// budget was batches*(MaxRetries+1)*Timeout = 2*2*200ms = 800ms, and a
+// 1s Retry-After alone would consume that before batch 1 even started.
+// Post-fix the budget adds MaxRetries * embedMaxRetryAfter = 30s of
+// slack per batch, so batch 1 still receives its full Timeout window.
+func TestOpenAIEmbedMultiBatchBudgetIncludesRetryAfterSlack(t *testing.T) {
+	t.Parallel()
+
+	const (
+		timeout         = 200 * time.Millisecond
+		retryAfterValue = 1 * time.Second
+	)
+
+	var (
+		mu      sync.Mutex
+		attempt int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testEmbedPath {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		attempt++
+		n := attempt
+		mu.Unlock()
+
+		// Attempt 1 is batch 0's first shot → 429 with a
+		// Retry-After header that substantially exceeds Timeout,
+		// forcing the retry loop to sleep beyond a single Timeout
+		// window. Attempts 2 (batch 0 retry) and 3 (batch 1) both
+		// succeed fast — the test is about the safety-net budget,
+		// not about timing individual responses.
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		out := make([]map[string]any, len(body.Input))
+		for i := range body.Input {
+			out[i] = map[string]any{"embedding": fillVector(4), "index": i}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer server.Close()
+
+	e := NewOpenAI(OpenAIConfig{
+		BaseURL:      server.URL + "/v1",
+		Model:        "mami",
+		Timeout:      timeout,
+		MaxRetries:   1,
+		MaxBatchSize: 1,
+	})
+
+	start := time.Now()
+	vectors, err := e.EmbedDocuments(context.Background(), []string{"a", "b"})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("EmbedDocuments() error = %v (retry-wait slack missing from safety-net deadline — batch 1 starved by batch 0's Retry-After sleep)", err)
+	}
+	if len(vectors) != 2 {
+		t.Fatalf("len(vectors) = %d, want 2", len(vectors))
+	}
+
+	mu.Lock()
+	got := attempt
+	mu.Unlock()
+	if got != 3 {
+		t.Errorf("server saw %d attempts, want 3 (batch 0 initial 429 + batch 0 retry + batch 1)", got)
+	}
+
+	// Lower bound: honouring the Retry-After header means we must
+	// have waited at least ~1s before batch 0's retry. Assert with
+	// slack for CI clock coarseness.
+	if elapsed < 900*time.Millisecond {
+		t.Errorf("elapsed = %s, want >=900ms (Retry-After=1s must have been honoured before batch 0 retry)", elapsed)
+	}
+	// Upper bound: real wall-clock is ~1s Retry-After plus two fast
+	// successful requests. 5s is generous slack against CI jitter
+	// without masking runaway retry behavior.
+	if elapsed > 5*time.Second {
+		t.Errorf("elapsed = %s, want well under 5s (indicates unexpected wall-clock inflation)", elapsed)
 	}
 }
