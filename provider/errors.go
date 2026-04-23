@@ -8,7 +8,7 @@
 // own request shape and response decoder.
 //
 // Product-specific labels (Runtime, RequestType, etc.) are intentionally
-// out of scope — callers that need those wrap ProviderError on return.
+// out of scope — callers that need those wrap Error on return.
 package provider
 
 import (
@@ -31,7 +31,7 @@ const (
 )
 
 // FailureDetails is the substrate-level diagnostic payload attached to
-// every ProviderError. It carries fields provider.Do can populate from
+// every Error. It carries fields provider.Do can populate from
 // the request and response itself. Callers that need product-layer
 // labels (Runtime, Provider, RequestType) wrap the error on return
 // rather than adding those fields here.
@@ -80,17 +80,17 @@ func (d FailureDetails) Map() map[string]any {
 	return values
 }
 
-// ProviderError is the classified-failure type returned by every
+// Error is the classified-failure type returned by every
 // provider.Do path. Callers branch on Details.FailureClass (or use
 // errors.As to reach it) to decide retry / degrade / propagate.
-type ProviderError struct {
+type Error struct {
 	Message    string
 	HTTPStatus int
 	Details    *FailureDetails
 }
 
 // Error implements the error interface.
-func (e *ProviderError) Error() string {
+func (e *Error) Error() string {
 	if e == nil {
 		return ""
 	}
@@ -99,7 +99,7 @@ func (e *ProviderError) Error() string {
 
 // HTTPStatusCode returns the associated HTTP status when the failure
 // came from an HTTP response, or zero otherwise.
-func (e *ProviderError) HTTPStatusCode() int {
+func (e *Error) HTTPStatusCode() int {
 	if e == nil {
 		return 0
 	}
@@ -108,7 +108,7 @@ func (e *ProviderError) HTTPStatusCode() int {
 
 // FailureClass returns the classified failure mode, or "" when the
 // error carries no details.
-func (e *ProviderError) FailureClass() string {
+func (e *Error) FailureClass() string {
 	if e == nil || e.Details == nil {
 		return ""
 	}
@@ -117,7 +117,7 @@ func (e *ProviderError) FailureClass() string {
 
 // DiagnosticFields returns a JSON-friendly diagnostic payload built
 // from the attached details, or nil when none are set.
-func (e *ProviderError) DiagnosticFields() map[string]any {
+func (e *Error) DiagnosticFields() map[string]any {
 	if e == nil || e.Details == nil {
 		return nil
 	}
@@ -128,19 +128,19 @@ func (e *ProviderError) DiagnosticFields() map[string]any {
 	return details.Map()
 }
 
-// NewProviderError formats a classified failure without HTTP context.
-func NewProviderError(details FailureDetails, format string, args ...any) *ProviderError {
-	return &ProviderError{
+// NewError formats a classified failure without HTTP context.
+func NewError(details FailureDetails, format string, args ...any) *Error {
+	return &Error{
 		Message: fmt.Sprintf(format, args...),
 		Details: &details,
 	}
 }
 
-// NewProviderErrorStatus formats a classified failure and records the
+// NewErrorStatus formats a classified failure and records the
 // associated HTTP status code.
-func NewProviderErrorStatus(details FailureDetails, status int, format string, args ...any) *ProviderError {
+func NewErrorStatus(details FailureDetails, status int, format string, args ...any) *Error {
 	details.HTTPStatus = status
-	return &ProviderError{
+	return &Error{
 		Message:    fmt.Sprintf(format, args...),
 		HTTPStatus: status,
 		Details:    &details,

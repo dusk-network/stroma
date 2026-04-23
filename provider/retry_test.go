@@ -154,11 +154,11 @@ func TestDoClassifiesNon2xx(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{Model: "m", Endpoint: server.URL},
 		Policy{MaxRetries: 0},
-		func(_ *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, _ []byte) (string, error) { return "", nil },
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.FailureClass() != FailureClassAuth {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassAuth)
@@ -183,7 +183,7 @@ func TestDoRespectsMaxRetriesExhaustion(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 2},
-		func(_ *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, _ []byte) (string, error) { return "", nil },
 	)
 	if err == nil {
 		t.Fatalf("Do() err = nil, want error after exhaustion")
@@ -191,9 +191,9 @@ func TestDoRespectsMaxRetriesExhaustion(t *testing.T) {
 	if n := attempts.Load(); n != 3 {
 		t.Errorf("attempts = %d, want 3 (1 initial + 2 retries)", n)
 	}
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.FailureClass() != FailureClassServer {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassServer)
@@ -215,9 +215,9 @@ func TestDoEnforcesResponseSizeCap(t *testing.T) {
 		Policy{MaxResponseBytes: 16},
 		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.FailureClass() != FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassSchemaMismatch)
@@ -238,7 +238,7 @@ func TestDoContextCancellationShortCircuits(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 3},
-		func(_ *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, _ []byte) (string, error) { return "", nil },
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
@@ -256,13 +256,13 @@ func TestDoDecoderSchemaMismatchPropagates(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{MaxRetries: 0},
-		func(_ *http.Response, body []byte) (string, error) {
-			return "", NewProviderError(FailureDetails{FailureClass: FailureClassSchemaMismatch}, "bad shape")
+		func(_ *http.Response, _ []byte) (string, error) {
+			return "", NewError(FailureDetails{FailureClass: FailureClassSchemaMismatch}, "bad shape")
 		},
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.FailureClass() != FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassSchemaMismatch)
@@ -399,9 +399,9 @@ func TestDoOversizedNon2xxPreservesStatusClassification(t *testing.T) {
 		Policy{MaxResponseBytes: 16},
 		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.FailureClass() != FailureClassServer {
 		t.Errorf("FailureClass = %q, want %q (status must win over oversize)", perr.FailureClass(), FailureClassServer)
@@ -427,9 +427,9 @@ func TestDoOversized401PreservesAuthClass(t *testing.T) {
 		Policy{MaxResponseBytes: 16},
 		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.FailureClass() != FailureClassAuth {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassAuth)
@@ -438,7 +438,7 @@ func TestDoOversized401PreservesAuthClass(t *testing.T) {
 
 func TestDoWrapsOpaqueDecodeErrorAsSchemaMismatch(t *testing.T) {
 	// The provider contract is that every failure return satisfies
-	// errors.As(*ProviderError). Decoders like embed.parseEmbedResponse
+	// errors.As(*Error). Decoders like embed.parseEmbedResponse
 	// return plain fmt.Errorf values for protocol violations; the
 	// provider layer must wrap them so caller-side branching on
 	// FailureClass still works.
@@ -451,13 +451,13 @@ func TestDoWrapsOpaqueDecodeErrorAsSchemaMismatch(t *testing.T) {
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{Model: "m", Endpoint: server.URL},
 		Policy{},
-		func(_ *http.Response, body []byte) (string, error) {
+		func(_ *http.Response, _ []byte) (string, error) {
 			return "", fmt.Errorf("wrong input count: got 3, want 1")
 		},
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError via errors.As", err)
+		t.Fatalf("err = %v, want *Error via errors.As", err)
 	}
 	if perr.FailureClass() != FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassSchemaMismatch)
@@ -471,23 +471,23 @@ func TestDoWrapsOpaqueDecodeErrorAsSchemaMismatch(t *testing.T) {
 }
 
 func TestDoPreservesClassifiedDecodeError(t *testing.T) {
-	// Decoders that already return *ProviderError must pass through
+	// Decoders that already return *Error must pass through
 	// unchanged — no double-wrapping, original FailureClass preserved.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, `ok`)
 	}))
 	t.Cleanup(server.Close)
 
-	original := NewProviderError(FailureDetails{FailureClass: FailureClassAuth}, "custom auth msg")
+	original := NewError(FailureDetails{FailureClass: FailureClassAuth}, "custom auth msg")
 	_, err := Do(context.Background(), server.Client(),
 		Target{URL: server.URL, Body: []byte(`x`)},
 		FailureDetails{},
 		Policy{},
-		func(_ *http.Response, body []byte) (string, error) { return "", original },
+		func(_ *http.Response, _ []byte) (string, error) { return "", original },
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.FailureClass() != FailureClassAuth {
 		t.Errorf("FailureClass = %q, want %q (original should pass through)", perr.FailureClass(), FailureClassAuth)
@@ -594,9 +594,9 @@ func TestDoReadErrorOnNon2xxPreservesStatus(t *testing.T) {
 		Policy{MaxRetries: 0},
 		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
 	)
-	var perr *ProviderError
+	var perr *Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *ProviderError", err)
+		t.Fatalf("err = %v, want *Error", err)
 	}
 	if perr.HTTPStatusCode() != http.StatusServiceUnavailable {
 		t.Errorf("HTTPStatusCode = %d, want %d", perr.HTTPStatusCode(), http.StatusServiceUnavailable)
@@ -611,7 +611,7 @@ func TestDoRejectsNilClient(t *testing.T) {
 		Target{URL: "http://x"},
 		FailureDetails{},
 		Policy{},
-		func(_ *http.Response, body []byte) (string, error) { return "", nil },
+		func(_ *http.Response, _ []byte) (string, error) { return "", nil },
 	)
 	if err == nil || !strings.Contains(err.Error(), "nil http client") {
 		t.Errorf("err = %v, want nil http client", err)

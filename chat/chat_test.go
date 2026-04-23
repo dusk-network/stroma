@@ -170,9 +170,9 @@ func TestChatCompletionTextSchemaMismatchOnEmptyChoices(t *testing.T) {
 
 	_, err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
 		ChatCompletionText(context.Background(), []Message{{Role: "user", Content: "q"}}, 0, 0)
-	var perr *provider.ProviderError
+	var perr *provider.Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *provider.ProviderError", err)
+		t.Fatalf("err = %v, want *provider.Error", err)
 	}
 	if perr.FailureClass() != provider.FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
@@ -187,9 +187,9 @@ func TestChatCompletionTextSchemaMismatchOnEmptyMessageText(t *testing.T) {
 
 	_, err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
 		ChatCompletionText(context.Background(), []Message{{Role: "user", Content: "q"}}, 0, 0)
-	var perr *provider.ProviderError
+	var perr *provider.Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *provider.ProviderError", err)
+		t.Fatalf("err = %v, want *provider.Error", err)
 	}
 	if perr.FailureClass() != provider.FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
@@ -221,9 +221,9 @@ func TestChatCompletionTextSchemaMismatchOnUnsupportedContentShape(t *testing.T)
 			if out != "" {
 				t.Errorf("out = %q, want empty — raw JSON must not leak as assistant text", out)
 			}
-			var perr *provider.ProviderError
+			var perr *provider.Error
 			if !errors.As(err, &perr) {
-				t.Fatalf("err = %v, want *provider.ProviderError", err)
+				t.Fatalf("err = %v, want *provider.Error", err)
 			}
 			if perr.FailureClass() != provider.FailureClassSchemaMismatch {
 				t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
@@ -262,9 +262,9 @@ func TestChatCompletionTextSchemaMismatchOnDecodeFailure(t *testing.T) {
 
 	_, err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
 		ChatCompletionText(context.Background(), []Message{{Role: "user", Content: "q"}}, 0, 0)
-	var perr *provider.ProviderError
+	var perr *provider.Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *provider.ProviderError", err)
+		t.Fatalf("err = %v, want *provider.Error", err)
 	}
 	if perr.FailureClass() != provider.FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
@@ -305,9 +305,9 @@ func TestChatCompletionTextAuthErrorClassified(t *testing.T) {
 
 	_, err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt", APIToken: "bad"}).
 		ChatCompletionText(context.Background(), []Message{{Role: "user", Content: "q"}}, 0, 0)
-	var perr *provider.ProviderError
+	var perr *provider.Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *provider.ProviderError", err)
+		t.Fatalf("err = %v, want *provider.Error", err)
 	}
 	if perr.FailureClass() != provider.FailureClassAuth {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassAuth)
@@ -336,9 +336,9 @@ func TestChatCompletionTextPopulatesDiagnosticFields(t *testing.T) {
 	})
 	_, err := c.ChatCompletionText(context.Background(),
 		[]Message{{Role: "user", Content: "q"}}, 0, 0)
-	var perr *provider.ProviderError
+	var perr *provider.Error
 	if !errors.As(err, &perr) {
-		t.Fatalf("err = %v, want *provider.ProviderError", err)
+		t.Fatalf("err = %v, want *provider.Error", err)
 	}
 	fields := perr.DiagnosticFields()
 	if fields["model"] != "gpt-4o-mini" {

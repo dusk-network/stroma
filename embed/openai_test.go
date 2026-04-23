@@ -771,9 +771,9 @@ func TestOpenAIEmbedDecodeErrorClassifiesAsSchemaMismatch(t *testing.T) {
 			if err == nil {
 				t.Fatalf("err = nil, want classified schema_mismatch")
 			}
-			var perr *provider.ProviderError
+			var perr *provider.Error
 			if !errors.As(err, &perr) {
-				t.Fatalf("err = %v, want *provider.ProviderError via errors.As", err)
+				t.Fatalf("err = %v, want *provider.Error via errors.As", err)
 			}
 			if perr.FailureClass() != provider.FailureClassSchemaMismatch {
 				t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)

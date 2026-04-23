@@ -44,7 +44,7 @@ func TestFailureDetailsMapOmitsEmpty(t *testing.T) {
 }
 
 func TestProviderErrorIsStandardError(t *testing.T) {
-	err := NewProviderError(FailureDetails{FailureClass: FailureClassAuth}, "missing key for %s", "openai")
+	err := NewError(FailureDetails{FailureClass: FailureClassAuth}, "missing key for %s", "openai")
 	if err.Error() != "missing key for openai" {
 		t.Errorf("Error() = %q", err.Error())
 	}
@@ -52,14 +52,14 @@ func TestProviderErrorIsStandardError(t *testing.T) {
 		t.Errorf("FailureClass() = %q, want %q", err.FailureClass(), FailureClassAuth)
 	}
 
-	var target *ProviderError
+	var target *Error
 	if !errors.As(err, &target) {
-		t.Fatalf("errors.As(ProviderError) = false")
+		t.Fatalf("errors.As(Error) = false")
 	}
 }
 
 func TestProviderErrorStatusRoundtripsHTTPStatus(t *testing.T) {
-	err := NewProviderErrorStatus(FailureDetails{}, 429, "rate limited")
+	err := NewErrorStatus(FailureDetails{}, 429, "rate limited")
 	if err.HTTPStatusCode() != 429 {
 		t.Errorf("HTTPStatusCode() = %d, want 429", err.HTTPStatusCode())
 	}
@@ -114,7 +114,7 @@ func TestExtractErrorValueNilRaw(t *testing.T) {
 }
 
 func TestProviderErrorNilSafe(t *testing.T) {
-	var err *ProviderError
+	var err *Error
 	if err.Error() != "" {
 		t.Errorf("nil.Error() = %q, want empty", err.Error())
 	}

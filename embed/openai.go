@@ -325,7 +325,7 @@ func (e *OpenAI) embedBatch(ctx context.Context, purpose string, texts []string)
 	policy := provider.Policy{MaxResponseBytes: maxEmbedResponseBytes}
 
 	return provider.Do(ctx, e.client, target, details, policy,
-		func(resp *http.Response, body []byte) ([][]float64, error) {
+		func(_ *http.Response, body []byte) ([][]float64, error) {
 			return e.parseEmbedResponse(body, inputCount)
 		},
 	)

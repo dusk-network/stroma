@@ -51,7 +51,7 @@ type Policy struct {
 }
 
 // DecodeFunc parses a successful 2xx response body into T. Decoders
-// may return a *ProviderError directly (e.g. for schema_mismatch) to
+// may return a *Error directly (e.g. for schema_mismatch) to
 // signal a caller-classified failure; other errors are treated as
 // opaque and wrapped as dependency_unavailable.
 type DecodeFunc[T any] func(resp *http.Response, body []byte) (T, error)
@@ -81,7 +81,7 @@ const (
 // bounds the response body, classifies non-2xx responses and transport
 // failures, and hands the raw body to decode on success. details is
 // the baseline FailureDetails used to enrich every returned
-// *ProviderError; HTTPStatus and FailureClass are populated by Do.
+// *Error; HTTPStatus and FailureClass are populated by Do.
 //
 // Retries fire on: 429 Too Many Requests, any 5xx, connection
 // refused / reset / broken pipe, and net.Error.Timeout(). Retry-After
@@ -145,14 +145,14 @@ func Do[T any](
 	}
 
 	if lastErr == nil {
-		lastErr = NewProviderError(details, "request failed")
+		lastErr = NewError(details, "request failed")
 	}
 	return zero, lastErr
 }
 
 // doAttempt performs one HTTP attempt and classifies the outcome.
 // On success it returns (value, 0, statusCode, nil). On failure it
-// returns (_, retryAfter, statusCode, *ProviderError) — or the raw
+// returns (_, retryAfter, statusCode, *Error) — or the raw
 // ctx error when the context was cancelled, which Do propagates
 // without retry.
 func doAttempt[T any](
@@ -163,29 +163,28 @@ func doAttempt[T any](
 	details FailureDetails,
 	maxResponseBytes int64,
 	decode DecodeFunc[T],
-) (T, time.Duration, int, error) {
-	var zero T
+) (value T, retryAfter time.Duration, statusCode int, err error) {
 	req, err := buildRequest(ctx, method, target)
 	if err != nil {
-		return zero, 0, 0, err
+		return value, 0, 0, err
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) ||
 			(errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil) {
-			return zero, 0, 0, err
+			return value, 0, 0, err
 		}
 		failure := classifiedFailureDetails(details, 0, err, err.Error())
-		return zero, 0, 0, NewProviderError(failure, "call %s %s: %v", method, target.URL, err)
+		return value, 0, 0, NewError(failure, "call %s %s: %v", method, target.URL, err)
 	}
 
-	retryAfter := retryAfterDuration(resp.Header.Get("Retry-After"))
+	retryAfter = retryAfterDuration(resp.Header.Get("Retry-After"))
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	closeErr := resp.Body.Close()
 
-	value, outErr := interpretResponse(resp, method, target, body, readErr, closeErr, details, maxResponseBytes, decode)
-	return value, retryAfter, resp.StatusCode, outErr
+	value, err = interpretResponse(resp, method, target, body, readErr, closeErr, details, maxResponseBytes, decode)
+	return value, retryAfter, resp.StatusCode, err
 }
 
 // buildRequest assembles the http.Request including headers so
@@ -208,7 +207,7 @@ func buildRequest(ctx context.Context, method string, target Target) (*http.Requ
 }
 
 // interpretResponse classifies a received HTTP response into a
-// decoded value or a *ProviderError. HTTP-status classification wins
+// decoded value or a *Error. HTTP-status classification wins
 // over body-read and oversize concerns so the strongest signal
 // (auth / rate_limit / server) survives truncation or oversized error
 // payloads.
@@ -232,30 +231,30 @@ func interpretResponse[T any](
 	}
 	if readErr != nil {
 		failure := classifiedFailureDetails(details, 0, readErr, readErr.Error())
-		return zero, NewProviderError(failure, "read response: %v", readErr)
+		return zero, NewError(failure, "read response: %v", readErr)
 	}
 	if oversized {
 		failure := details
 		failure.FailureClass = FailureClassSchemaMismatch
-		return zero, NewProviderError(failure, "response exceeds %d bytes; aborting decode", maxResponseBytes)
+		return zero, NewError(failure, "response exceeds %d bytes; aborting decode", maxResponseBytes)
 	}
 
 	value, decodeErr := decode(resp, body)
 	if decodeErr == nil {
 		if closeErr != nil {
 			failure := classifiedFailureDetails(details, 0, closeErr, closeErr.Error())
-			return zero, NewProviderError(failure, "close response: %v", closeErr)
+			return zero, NewError(failure, "close response: %v", closeErr)
 		}
 		return value, nil
 	}
-	// Decoders that already return a classified *ProviderError pass
+	// Decoders that already return a classified *Error pass
 	// through; opaque errors are wrapped as schema_mismatch so every
-	// Do return satisfies errors.As(*ProviderError).
-	var perr *ProviderError
+	// Do return satisfies errors.As(*Error).
+	var perr *Error
 	if !errors.As(decodeErr, &perr) {
 		failure := details
 		failure.FailureClass = FailureClassSchemaMismatch
-		decodeErr = NewProviderError(failure, "decode response: %v", decodeErr)
+		decodeErr = NewError(failure, "decode response: %v", decodeErr)
 	}
 	return zero, decodeErr
 }
@@ -274,7 +273,7 @@ func interpretNon2xx(
 ) error {
 	if readErr != nil {
 		failure := classifiedFailureDetails(details, resp.StatusCode, nil, readErr.Error())
-		return NewProviderErrorStatus(failure, resp.StatusCode,
+		return NewErrorStatus(failure, resp.StatusCode,
 			"%s %s returned %s (response body read failed: %v)",
 			method, target.URL, resp.Status, readErr)
 	}
@@ -289,7 +288,7 @@ func interpretNon2xx(
 		message = fmt.Sprintf("%s (response body exceeds %d bytes; truncated)", http.StatusText(resp.StatusCode), maxResponseBytes)
 	}
 	failure := classifiedFailureDetails(details, resp.StatusCode, nil, message)
-	return NewProviderErrorStatus(failure, resp.StatusCode,
+	return NewErrorStatus(failure, resp.StatusCode,
 		"%s %s returned %s: %s", method, target.URL, resp.Status, message)
 }
 

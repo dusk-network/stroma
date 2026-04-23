@@ -205,33 +205,33 @@ func (c *OpenAI) ChatCompletionText(ctx context.Context, messages []Message, tem
 	}
 
 	return provider.Do(ctx, c.client, target, details, policy,
-		func(resp *http.Response, responseBody []byte) (string, error) {
+		func(_ *http.Response, responseBody []byte) (string, error) {
 			var payload chatResponse
 			if err := json.Unmarshal(responseBody, &payload); err != nil {
 				failure := details
 				failure.FailureClass = provider.FailureClassSchemaMismatch
-				return "", provider.NewProviderError(failure, "decode response: %v", err)
+				return "", provider.NewError(failure, "decode response: %v", err)
 			}
 			if message := provider.ExtractErrorValue(payload.Err); message != "" {
 				failure := details
 				failure.FailureClass = provider.Classify(0, nil, message)
-				return "", provider.NewProviderError(failure, "%s returned an error: %s", target.URL, message)
+				return "", provider.NewError(failure, "%s returned an error: %s", target.URL, message)
 			}
 			if len(payload.Choices) == 0 {
 				failure := details
 				failure.FailureClass = provider.FailureClassSchemaMismatch
-				return "", provider.NewProviderError(failure, "response contained no choices")
+				return "", provider.NewError(failure, "response contained no choices")
 			}
 			text, ok := ExtractMessageText(payload.Choices[0].Message.Content)
 			if !ok {
 				failure := details
 				failure.FailureClass = provider.FailureClassSchemaMismatch
-				return "", provider.NewProviderError(failure, "response message content is not a recognized shape")
+				return "", provider.NewError(failure, "response message content is not a recognized shape")
 			}
 			if text == "" {
 				failure := details
 				failure.FailureClass = provider.FailureClassSchemaMismatch
-				return "", provider.NewProviderError(failure, "response contained an empty message")
+				return "", provider.NewError(failure, "response contained an empty message")
 			}
 			return text, nil
 		},
