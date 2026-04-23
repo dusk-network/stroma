@@ -38,6 +38,15 @@ const (
 	// bounds wall time but not bytes, so this is the byte-side guard.
 	maxEmbedResponseBytes = 32 << 20 // 32 MiB
 
+	// embedMaxRetryAfter caps how long a single retry gap will block
+	// on a server-supplied Retry-After header. Set on every request's
+	// provider.Policy, and also used by the multi-batch deadline math
+	// so the safety-net deadline and the actual retry loop agree on
+	// the worst-case per-retry wait. A hostile or misconfigured
+	// upstream returning `Retry-After: 86400` would otherwise park
+	// the goroutine for hours.
+	embedMaxRetryAfter = 30 * time.Second
+
 	// redactedTokenPlaceholder replaces APIToken in every text/JSON
 	// representation of OpenAIConfig so accidental structured logging
 	// or pretty-printing cannot leak the credential.
@@ -63,17 +72,49 @@ type OpenAIConfig struct {
 	BaseURL string
 	Model   string
 
-	// Timeout bounds a single embeddings sub-request. For inputs that
-	// fit in a single batch (len(texts) <= MaxBatchSize) this is also
-	// the total wall-clock budget. For multi-batch calls the total
-	// budget is Timeout * ceil(len(texts)/MaxBatchSize) — each
-	// sub-request gets its own Timeout-sized window, and a slow early
-	// batch cannot starve later batches. A zero or negative value
-	// selects defaultOpenAITimeout (15s) at NewOpenAI time. Callers
-	// that want a tighter global cap should pass a ctx with their own
-	// deadline; the embedder honors whichever deadline trips first.
+	// Timeout bounds a single embeddings HTTP attempt. With
+	// MaxRetries=0 this is also the total wall-clock budget for a
+	// single-batch call. With MaxRetries > 0 the wall-clock extends
+	// beyond Timeout: each attempt is still bounded by Timeout, but
+	// retries and Retry-After / backoff waits stack on top — see
+	// MaxRetries for details.
+	//
+	// For multi-batch calls the embedder schedules a safety-net
+	// parent deadline of approximately:
+	//
+	//   batches * ((MaxRetries+1) * Timeout + MaxRetries * 30s)
+	//
+	// where batches = ceil(len(texts)/MaxBatchSize) and 30s is the
+	// embed-side cap on each inter-retry Retry-After / backoff wait.
+	// Each sub-request keeps a full per-attempt window even when an
+	// earlier batch retried through a rate limit, so a slow or
+	// retrying early batch cannot starve later batches. The formula
+	// saturates at math.MaxInt64 nanoseconds on overflow.
+	//
+	// A zero or negative value selects defaultOpenAITimeout (15s) at
+	// NewOpenAI time. Callers that need a hard global cap should pass
+	// a ctx with their own deadline; the embedder honors whichever
+	// deadline trips first.
 	Timeout  time.Duration
 	APIToken string
+
+	// MaxRetries caps the number of retry attempts after a retryable
+	// failure (429, 5xx, connection reset, timeout). Zero disables
+	// retries. A negative value is normalized to zero at NewOpenAI
+	// time so a config typo or bad env parse cannot silently
+	// short-circuit every request. Retry-After is always honoured
+	// when present, up to an embed-side cap of embedMaxRetryAfter
+	// (30s) per gap. Mirrors chat.OpenAIConfig.MaxRetries semantics
+	// so consumers that swap between chat and embed get the same
+	// retry surface.
+	//
+	// Retries replay the embeddings POST unchanged — no idempotency
+	// key is sent — so on ambiguous transport failures (timeout,
+	// connection reset) an upstream that already processed the first
+	// attempt may bill both. Self-hosted gateways generally have no
+	// billing concern; callers hitting real OpenAI with cost ceilings
+	// should leave this at zero or cap it tightly.
+	MaxRetries int
 
 	// MaxBatchSize caps how many inputs are sent in a single embeddings
 	// request. EmbedDocuments and EmbedQueries chunk their input into
@@ -93,8 +134,8 @@ func (c OpenAIConfig) Enabled() bool {
 // String returns a redacted, human-readable rendering of the config.
 // fmt verbs %v and %s route through this method.
 func (c OpenAIConfig) String() string {
-	return fmt.Sprintf("OpenAIConfig{BaseURL:%q Model:%q Timeout:%s MaxBatchSize:%d APIToken:%q}",
-		c.BaseURL, c.Model, c.Timeout, c.MaxBatchSize, redactedToken(c.APIToken))
+	return fmt.Sprintf("OpenAIConfig{BaseURL:%q Model:%q Timeout:%s MaxRetries:%d MaxBatchSize:%d APIToken:%q}",
+		c.BaseURL, c.Model, c.Timeout, c.MaxRetries, c.MaxBatchSize, redactedToken(c.APIToken))
 }
 
 // GoString returns a redacted Go-syntax rendering of the config for %#v.
@@ -104,8 +145,8 @@ func (c OpenAIConfig) String() string {
 // back into source (Duration's default %s form "2s" is human-readable
 // but not Go-parseable).
 func (c OpenAIConfig) GoString() string {
-	return fmt.Sprintf("embed.OpenAIConfig{BaseURL:%q, Model:%q, Timeout:time.Duration(%d), MaxBatchSize:%d, APIToken:%q}",
-		c.BaseURL, c.Model, int64(c.Timeout), c.MaxBatchSize, redactedToken(c.APIToken))
+	return fmt.Sprintf("embed.OpenAIConfig{BaseURL:%q, Model:%q, Timeout:time.Duration(%d), MaxRetries:%d, MaxBatchSize:%d, APIToken:%q}",
+		c.BaseURL, c.Model, int64(c.Timeout), c.MaxRetries, c.MaxBatchSize, redactedToken(c.APIToken))
 }
 
 // LogValue implements slog.LogValuer so slog handlers — including the
@@ -119,6 +160,7 @@ func (c OpenAIConfig) LogValue() slog.Value {
 		slog.String("base_url", c.BaseURL),
 		slog.String("model", c.Model),
 		slog.Duration("timeout", c.Timeout),
+		slog.Int("max_retries", c.MaxRetries),
 		slog.Int("max_batch_size", c.MaxBatchSize),
 		slog.String("api_token", redactedToken(c.APIToken)),
 	)
@@ -158,6 +200,15 @@ func NewOpenAI(cfg OpenAIConfig) *OpenAI {
 		timeout = defaultOpenAITimeout
 	}
 	cfg.Timeout = timeout
+	if cfg.MaxRetries < 0 {
+		// Normalize pathological negative MaxRetries at construction so
+		// both the multi-batch deadline math and provider.Policy agree
+		// on attempt counts. Without this, a negative value (e.g. from
+		// a bad env parse) would short-circuit provider.Do's retry loop
+		// and hard-fail every request with a generic error before any
+		// HTTP round trip.
+		cfg.MaxRetries = 0
+	}
 	if cfg.MaxBatchSize <= 0 {
 		cfg.MaxBatchSize = defaultOpenAIMaxBatchSize
 	}
@@ -227,21 +278,34 @@ func (e *OpenAI) embed(ctx context.Context, purpose string, texts []string) ([][
 		return e.embedBatch(ctx, purpose, texts)
 	}
 
-	// Derive an overall deadline that scales with batch count so every
-	// sub-request gets a full Timeout window. A single flat deadline
-	// (the pre-#63 shape) collapsed the entire loop under one Timeout:
-	// one slow early batch shrank the remaining budget and made later
-	// sub-requests fail with `context deadline exceeded` even though
-	// each individually fit inside Timeout. Scaling by batch count
-	// keeps the per-request budget honest while preserving an upper
-	// bound on total wall time for callers who rely on Timeout to
-	// bound batch runs. context.WithDeadline honors any tighter
-	// caller-supplied deadline, so callers that want a smaller global
-	// cap pass it via ctx.
+	// Derive an overall safety-net deadline that covers every batch's
+	// full retry chain — attempts AND inter-retry waits — so one slow
+	// or rate-limited early batch cannot starve later batches.
+	//
+	// Three historical footguns informed this shape:
+	//   - Pre-#63: one flat Timeout around the whole loop collapsed
+	//     the budget; later batches got ctx.DeadlineExceeded.
+	//   - #63: scaling by batches fixed the per-attempt starvation
+	//     but left no room for retries — which #73 then introduced.
+	//   - #73 + first adversarial-review fix: scaling by
+	//     batches * (retries+1) covered per-attempt time but not the
+	//     retry-wait sleeps (backoff + Retry-After), so a 429 with
+	//     Retry-After could still starve batch 1.
+	//
+	// Current shape accounts for all three: each batch gets
+	// (MaxRetries+1) * Timeout of attempt time plus MaxRetries *
+	// embedMaxRetryAfter of inter-retry wait budget. NewOpenAI has
+	// already clamped MaxRetries >= 0, so attemptsPerBatch >= 1.
+	// context.WithDeadline honors any tighter caller-supplied
+	// deadline, so callers that want a smaller global cap pass it via
+	// ctx.
 	batches := (len(texts) + batchSize - 1) / batchSize
+	attemptsPerBatch := 1 + e.config.MaxRetries
 	if e.config.Timeout > 0 && batches > 0 {
+		perBatch := perBatchWallClockBudget(e.config.Timeout, attemptsPerBatch, embedMaxRetryAfter)
+		totalBudget := scaledMultiBatchBudget(perBatch, batches)
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(scaledMultiBatchBudget(e.config.Timeout, batches)))
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(totalBudget))
 		defer cancel()
 	}
 
@@ -286,6 +350,32 @@ func scaledMultiBatchBudget(perRequest time.Duration, batches int) time.Duration
 	return perRequest * time.Duration(batches)
 }
 
+// perBatchWallClockBudget returns an upper bound on wall-clock time
+// one batch can consume including retries and retry waits, saturating
+// at math.MaxInt64 nanoseconds on overflow. attemptsPerBatch covers
+// (1 + MaxRetries) HTTP attempts, each bounded by perAttempt. With R =
+// attemptsPerBatch-1 retries, the inter-attempt sleep budget is
+// bounded by R * maxRetryWait — that covers both exponential backoff
+// (capped at 2s per gap in provider) and a server-supplied Retry-After
+// (capped at maxRetryWait in provider). Scaling by batches is the
+// caller's responsibility; this helper stops at one batch so the
+// retry-wait term is not double-counted.
+func perBatchWallClockBudget(perAttempt time.Duration, attemptsPerBatch int, maxRetryWait time.Duration) time.Duration {
+	attempts := scaledMultiBatchBudget(perAttempt, attemptsPerBatch)
+	retries := attemptsPerBatch - 1
+	if retries <= 0 || maxRetryWait <= 0 {
+		return attempts
+	}
+	waits := scaledMultiBatchBudget(maxRetryWait, retries)
+	// Saturating add: on overflow return the int64 max so the derived
+	// deadline behaves as "effectively unbounded", matching
+	// scaledMultiBatchBudget's own overflow policy.
+	if attempts > time.Duration(math.MaxInt64)-waits {
+		return time.Duration(math.MaxInt64)
+	}
+	return attempts + waits
+}
+
 // embedBatch issues a single embeddings request through the shared
 // provider core. Callers guarantee len(texts) is within the server's
 // per-request limit; embed() handles that via MaxBatchSize chunking.
@@ -308,6 +398,7 @@ func (e *OpenAI) embedBatch(ctx context.Context, purpose string, texts []string)
 		Model:      e.config.Model,
 		Endpoint:   e.config.BaseURL,
 		TimeoutMS:  int(e.config.Timeout / time.Millisecond),
+		MaxRetries: e.config.MaxRetries,
 		BatchSize:  inputCount,
 		InputCount: inputCount,
 	}
@@ -322,7 +413,17 @@ func (e *OpenAI) embedBatch(ctx context.Context, purpose string, texts []string)
 	// the historical 32 MiB cap rather than falling to the provider
 	// default (4 MiB) so self-hosted gateways that concatenate batches
 	// still decode cleanly.
-	policy := provider.Policy{MaxResponseBytes: maxEmbedResponseBytes}
+	policy := provider.Policy{
+		MaxRetries: e.config.MaxRetries,
+		// MaxRetryAfter is set explicitly so the provider retry loop
+		// and the multi-batch deadline math in embed() agree on the
+		// worst-case per-retry wait. Without this they would drift
+		// apart if provider ever changed its default and the safety-
+		// net deadline would under-bound retry chains that honored
+		// the new provider cap.
+		MaxRetryAfter:    embedMaxRetryAfter,
+		MaxResponseBytes: maxEmbedResponseBytes,
+	}
 
 	return provider.Do(ctx, e.client, target, details, policy,
 		func(_ *http.Response, body []byte) ([][]float64, error) {
