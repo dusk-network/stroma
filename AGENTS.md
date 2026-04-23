@@ -4,7 +4,7 @@
 
 ## Project
 
-Stroma is a neutral corpus and index substrate. It owns content normalization, chunking, embedding interfaces, and SQLite-backed retrieval primitives that other products can build on. It does not own governance semantics, spec workflows, transport layers, or product-specific adapters.
+Stroma is a neutral corpus and index substrate. It owns content normalization, chunking, embedding and chat completion interfaces, and SQLite-backed retrieval primitives that other products can build on. It does not own governance semantics, spec workflows, prompt templates, JSON-shape enforcement, or product-specific adapters.
 
 ## Coding Standards
 
@@ -15,7 +15,7 @@ Stroma is a neutral corpus and index substrate. It owns content normalization, c
 
 ## Architecture Rules
 
-- Stroma owns only substrate concerns: records, chunking, embeddings, index storage, and retrieval.
+- Stroma owns only substrate concerns: records, chunking, embeddings, chat completion HTTP transport, index storage, and retrieval.
 - Product layers such as governance analysis, issue workflows, CI integrations, and vendor transports stay out of scope.
 - Persist machine-readable state. The SQLite index is a contract surface, not an incidental cache.
 - Public packages should be usable independently; avoid hidden globals and repo-local assumptions.

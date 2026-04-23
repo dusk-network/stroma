@@ -9,8 +9,9 @@ Its job is narrow:
 1. normalize records into a stable internal shape
 2. chunk record bodies into retrievable sections, optionally with parent/leaf lineage
 3. delegate vector generation to an embedder, optionally with a per-chunk context prefix
-4. persist records, chunks, vectors, FTS entries, and index metadata in SQLite
-5. open immutable local snapshots for typed reads, hybrid semantic search with per-arm provenance, and parent/neighbor context expansion
+4. delegate text generation to an OpenAI-compatible chat completion client over the same retry / Retry-After / failure-classification substrate as the embedder
+5. persist records, chunks, vectors, FTS entries, and index metadata in SQLite
+6. open immutable local snapshots for typed reads, hybrid semantic search with per-arm provenance, and parent/neighbor context expansion
 
 Everything above that line belongs elsewhere.
 
@@ -21,7 +22,9 @@ Stroma owns:
 - canonical corpus records
 - content hashing and corpus fingerprints
 - pluggable chunking (Markdown, kind-dispatched, hierarchical)
-- embedding abstractions (`Embedder`, `ContextualEmbedder`)
+- embedding abstractions (`Embedder`, `ContextualEmbedder`) and an OpenAI-compatible HTTP embedder
+- OpenAI-compatible chat completion HTTP transport (`chat.OpenAI`): request/response encoding, retry with capped `Retry-After`, response-size bounding, APIToken redaction, classified failures
+- a shared provider substrate (`provider`) that both `embed` and `chat` consume — retry policy, response-size cap, and the `FailureClass` taxonomy
 - SQLite plus `sqlite-vec` storage across three quantization modes
 - hybrid semantic retrieval: dense vector + FTS5 fused via a pluggable `FusionStrategy` with per-hit `HitProvenance`
 - incremental `Update` with embedding reuse and forward-only schema migrations
@@ -32,6 +35,8 @@ Stroma does not own:
 - governance graphs
 - source adapters such as GitHub, filesystem discovery, or MCP
 - policy analysis such as overlap, compliance, drift, or impact
+- prompt templates, system prompts, or JSON-shape enforcement of chat responses
+- product-layer diagnostic labels (`Runtime`, `Provider`, `RequestType`) — callers wrap `*provider.ProviderError` to add those
 - product-facing workflows, CLIs, or review/reporting layers
 
 ## Public Packages
@@ -53,7 +58,18 @@ Stroma does not own:
   - `Embedder` is the minimum embedding contract the index depends on (`Fingerprint`, `Dimension`, `EmbedDocuments`, `EmbedQueries`).
   - `ContextualEmbedder` embeds `Embedder` and adds `EmbedDocumentChunks` for implementations that want document-aware chunk vectors.
   - `Fixture` provides deterministic embeddings for tests and offline use.
-  - `OpenAI` provides a generic OpenAI-compatible HTTP embedder without product-layer env loading or diagnostics. `OpenAIConfig.MaxBatchSize` caps per-request batch size; the parent deadline scales with batch count so a slow early batch cannot starve later ones. `APIToken` is redacted in `String`, `GoString`, and `LogValue` so logs cannot leak the secret.
+  - `OpenAI` provides a generic OpenAI-compatible HTTP embedder without product-layer env loading or diagnostics. `OpenAIConfig.MaxBatchSize` caps per-request batch size; the parent deadline scales with batch count so a slow early batch cannot starve later ones. `APIToken` is redacted in `String`, `GoString`, and `LogValue` so logs cannot leak the secret. Per-batch HTTP calls route through the shared `provider` core, inheriting its retry / Retry-After / failure-classification behaviour.
+
+- `chat`
+  - `OpenAI` provides a generic OpenAI-compatible chat completion client (`ChatCompletionText(ctx, messages, temperature, maxTokens)`). Mirrors `embed.OpenAIConfig`: `BaseURL`, `Model`, `Timeout`, `APIToken`, `MaxRetries`, `MaxResponseBytes`. `APIToken` is redacted in `String` / `GoString` / `LogValue`.
+  - Handles both the plain-string `content` shape and the multi-part array shape used by tool-capable models. Any other shape (object, number, bool, null) surfaces as `FailureClassSchemaMismatch` — the package refuses to persist raw JSON as assistant text.
+  - Prompt templates, output-schema validation, and product-specific interpretation of failures stay at the caller.
+
+- `provider`
+  - Shared HTTP substrate used by `embed` and `chat`. Not a full HTTP client — it takes a caller-supplied `*http.Client`, a `Target` (method/URL/body/token), and a decode function, and handles retry, `Retry-After`, response-size bounding, and failure classification around them.
+  - `FailureClass` taxonomy: `auth`, `rate_limit`, `timeout`, `server`, `transport`, `schema_mismatch`, `dependency_unavailable`. HTTP status classification wins over message parsing; message parsing is the fallback when the status carries no signal.
+  - `*ProviderError` is the public error type: every `provider.Do` failure satisfies `errors.As(*ProviderError)`. Callers branch on `ProviderError.FailureClass()` and attach their own product-layer labels via wrapping.
+  - `Policy.MaxRetryAfter` caps a server-supplied `Retry-After` header at 30s by default so a hostile or misconfigured upstream cannot park a goroutine for hours via a large header value. Callers with a larger budget override the cap explicitly.
 
 - `store`
   - validates that SQLite and `sqlite-vec` are usable
@@ -107,4 +123,4 @@ The schema is product-neutral. There are no spec/document distinctions, no gover
 
 Stroma should stay boring.
 
-If a feature introduces domain language such as spec status, applies-to rules, drift classes, review flows, or product transport contracts, it belongs in the consuming product, not in Stroma.
+If a feature introduces domain language such as spec status, applies-to rules, drift classes, review flows, prompt templates, or product transport contracts, it belongs in the consuming product, not in Stroma. The chat and embed packages ship HTTP transport primitives only — anything that looks like product semantics (which model to pick, what to prompt it with, how to validate its JSON output, which runtime label to attach to a diagnostic) stays at the caller.

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dusk-network/stroma/v2/provider"
 )
 
 const (
@@ -285,78 +286,62 @@ func scaledMultiBatchBudget(perRequest time.Duration, batches int) time.Duration
 	return perRequest * time.Duration(batches)
 }
 
-// embedBatch issues a single embeddings request. Callers guarantee
-// len(texts) is within the server's per-request limit; embed() handles
-// that via MaxBatchSize chunking.
+// embedBatch issues a single embeddings request through the shared
+// provider core. Callers guarantee len(texts) is within the server's
+// per-request limit; embed() handles that via MaxBatchSize chunking.
 func (e *OpenAI) embedBatch(ctx context.Context, purpose string, texts []string) ([][]float64, error) {
-	req, inputCount, err := e.buildEmbedRequest(ctx, purpose, texts)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("stroma/embed: call openai endpoint %s: %w", req.URL.String(), err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("stroma/embed: openai endpoint %s returned status %s", req.URL.String(), resp.Status)
-	}
-
-	return e.parseEmbedResponse(resp.Body, inputCount)
-}
-
-func (e *OpenAI) buildEmbedRequest(ctx context.Context, purpose string, texts []string) (*http.Request, int, error) {
 	input := make([]string, 0, len(texts))
 	for _, text := range texts {
 		input = append(input, prepareOpenAIEmbeddingInput(e.strategy, purpose, text))
 	}
-
 	requestBody, err := json.Marshal(map[string]any{
 		"model": e.config.Model,
 		"input": input,
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("stroma/embed: encode openai request: %w", err)
+		return nil, fmt.Errorf("stroma/embed: encode openai request: %w", err)
 	}
 
+	inputCount := len(input)
 	endpoint := e.config.BaseURL + "/embeddings"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
-	if err != nil {
-		return nil, 0, fmt.Errorf("stroma/embed: build openai request: %w", err)
+	details := provider.FailureDetails{
+		Model:      e.config.Model,
+		Endpoint:   e.config.BaseURL,
+		TimeoutMS:  int(e.config.Timeout / time.Millisecond),
+		BatchSize:  inputCount,
+		InputCount: inputCount,
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if e.config.APIToken != "" {
-		req.Header.Set("Authorization", "Bearer "+e.config.APIToken)
+	target := provider.Target{
+		Method: http.MethodPost,
+		URL:    endpoint,
+		Body:   requestBody,
+		Token:  e.config.APIToken,
 	}
-	return req, len(input), nil
+	// Embedding responses are larger than chat completions — a full
+	// batch of 512 inputs × ~1536-dim floats fills several MiB. Keep
+	// the historical 32 MiB cap rather than falling to the provider
+	// default (4 MiB) so self-hosted gateways that concatenate batches
+	// still decode cleanly.
+	policy := provider.Policy{MaxResponseBytes: maxEmbedResponseBytes}
+
+	return provider.Do(ctx, e.client, target, details, policy,
+		func(resp *http.Response, body []byte) ([][]float64, error) {
+			return e.parseEmbedResponse(body, inputCount)
+		},
+	)
 }
 
-func (e *OpenAI) parseEmbedResponse(body io.Reader, inputCount int) ([][]float64, error) {
-	// Cap how much we read before decoding. An unbounded json.Decode
-	// against a hostile or misconfigured upstream can stream GiBs and
-	// OOM the host — the client Timeout bounds wall time but not
-	// bytes. LimitReader(max+1) lets us detect an overflow without
-	// swallowing it silently.
-	raw, err := io.ReadAll(io.LimitReader(body, maxEmbedResponseBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("stroma/embed: read openai response: %w", err)
-	}
-	if int64(len(raw)) > maxEmbedResponseBytes {
-		return nil, fmt.Errorf("stroma/embed: openai response exceeds %d bytes; aborting decode to avoid OOM", maxEmbedResponseBytes)
-	}
-
+func (e *OpenAI) parseEmbedResponse(body []byte, inputCount int) ([][]float64, error) {
 	var payload struct {
 		Data []struct {
 			Embedding []float64 `json:"embedding"`
 			Index     int       `json:"index"`
 		} `json:"data"`
 	}
-	// json.Decoder matches the previous json.NewDecoder(body).Decode
-	// behaviour — it tolerates trailing whitespace or filler after the
+	// json.Decoder tolerates trailing whitespace or filler after the
 	// first complete JSON value, which nonconforming self-hosted
 	// gateways sometimes emit. json.Unmarshal would reject those.
-	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&payload); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("stroma/embed: decode openai response: %w", err)
 	}
 	if len(payload.Data) != inputCount {
