@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/dusk-network/stroma/v2/chunk"
@@ -2818,8 +2819,7 @@ func TestUpdatePostCommitIntegrityFailureIsTyped(t *testing.T) {
 
 // failingEmbedder mirrors the fingerprint and dimension of the wrapped
 // fixture so it passes resolveUpdateSessionConfig's compatibility checks,
-// but returns err from EmbedDocuments. Used to drive a post-migration
-// failure in TestUpdateFailureAfterMigrationRollsBackSchema.
+// but returns err from EmbedDocuments.
 type failingEmbedder struct {
 	inner embed.Embedder
 	err   error
@@ -2836,7 +2836,355 @@ func (f failingEmbedder) EmbedQueries(context.Context, []string) ([][]float64, e
 	return nil, f.err
 }
 
-func TestUpdateFailureAfterMigrationRollsBackSchema(t *testing.T) {
+type documentCallCountingEmbedder struct {
+	inner         embed.Embedder
+	documentCalls atomic.Int64
+}
+
+func (e *documentCallCountingEmbedder) Fingerprint() string { return e.inner.Fingerprint() }
+func (e *documentCallCountingEmbedder) Dimension(ctx context.Context) (int, error) {
+	return e.inner.Dimension(ctx)
+}
+func (e *documentCallCountingEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error) {
+	e.documentCalls.Add(1)
+	return e.inner.EmbedDocuments(ctx, texts)
+}
+func (e *documentCallCountingEmbedder) EmbedQueries(ctx context.Context, texts []string) ([][]float64, error) {
+	return e.inner.EmbedQueries(ctx, texts)
+}
+
+type onFirstEmbedDocumentsEmbedder struct {
+	inner   embed.Embedder
+	onFirst func(context.Context) error
+	called  atomic.Bool
+}
+
+func (e *onFirstEmbedDocumentsEmbedder) Fingerprint() string { return e.inner.Fingerprint() }
+func (e *onFirstEmbedDocumentsEmbedder) Dimension(ctx context.Context) (int, error) {
+	return e.inner.Dimension(ctx)
+}
+func (e *onFirstEmbedDocumentsEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error) {
+	if e.called.CompareAndSwap(false, true) && e.onFirst != nil {
+		if err := e.onFirst(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return e.inner.EmbedDocuments(ctx, texts)
+}
+func (e *onFirstEmbedDocumentsEmbedder) EmbedQueries(ctx context.Context, texts []string) ([][]float64, error) {
+	return e.inner.EmbedQueries(ctx, texts)
+}
+
+type transactionOrderEmbedder struct {
+	inner     embed.Embedder
+	txStarted *atomic.Bool
+}
+
+func (e transactionOrderEmbedder) Fingerprint() string { return e.inner.Fingerprint() }
+func (e transactionOrderEmbedder) Dimension(ctx context.Context) (int, error) {
+	return e.inner.Dimension(ctx)
+}
+func (e transactionOrderEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error) {
+	if e.txStarted != nil && e.txStarted.Load() {
+		return nil, errors.New("EmbedDocuments called after update transaction started")
+	}
+	return e.inner.EmbedDocuments(ctx, texts)
+}
+func (e transactionOrderEmbedder) EmbedQueries(ctx context.Context, texts []string) ([][]float64, error) {
+	return e.inner.EmbedQueries(ctx, texts)
+}
+
+type transactionOrderContextualEmbedder struct {
+	transactionOrderEmbedder
+	chunksCalled *atomic.Bool
+}
+
+func (e transactionOrderContextualEmbedder) EmbedDocumentChunks(ctx context.Context, _ string, chunks []string) ([][]float64, error) {
+	if e.chunksCalled != nil {
+		e.chunksCalled.Store(true)
+	}
+	if e.txStarted != nil && e.txStarted.Load() {
+		return nil, errors.New("EmbedDocumentChunks called after update transaction started")
+	}
+	return e.inner.EmbedDocuments(ctx, chunks)
+}
+
+func TestRebuildRejectsDuplicateRefsBeforeEmbedding(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	counting := &documentCallCountingEmbedder{inner: fixture}
+
+	_, err = Rebuild(context.Background(), []corpus.Record{
+		{
+			Ref:        "alpha",
+			Kind:       "note",
+			Title:      "Alpha",
+			SourceRef:  "file://alpha.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "alpha content",
+		},
+		{
+			Ref:        " alpha ",
+			Kind:       "note",
+			Title:      "Alpha duplicate",
+			SourceRef:  "file://alpha-duplicate.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "duplicate alpha content",
+		},
+	}, BuildOptions{
+		Path:     t.TempDir() + "/stroma.db",
+		Embedder: counting,
+	})
+	if err == nil {
+		t.Fatal("Rebuild() succeeded with duplicate refs, want failure")
+	}
+	if !strings.Contains(err.Error(), "duplicate build record ref") {
+		t.Fatalf("Rebuild() err = %v, want duplicate build record ref error", err)
+	}
+	if calls := counting.documentCalls.Load(); calls != 0 {
+		t.Fatalf("EmbedDocuments calls = %d, want 0 before duplicate-ref failure", calls)
+	}
+}
+
+func TestUpdateEmbedsAddedRecordsBeforeTransaction(t *testing.T) {
+	// Not parallel: mutates the package-level updateTransactionStartedHook.
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	var txStarted atomic.Bool
+	updateTransactionStartedHook = func() { txStarted.Store(true) }
+	t.Cleanup(func() { updateTransactionStartedHook = nil })
+
+	checking := transactionOrderEmbedder{inner: fixture, txStarted: &txStarted}
+	result, err := Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: checking,
+	})
+	if err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if !txStarted.Load() {
+		t.Fatal("update transaction hook did not fire")
+	}
+	if result.RecordCount != 2 {
+		t.Fatalf("RecordCount = %d, want 2", result.RecordCount)
+	}
+}
+
+func TestUpdateEmbedsContextualChunksBeforeTransaction(t *testing.T) {
+	// Not parallel: mutates the package-level updateTransactionStartedHook.
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	var txStarted atomic.Bool
+	updateTransactionStartedHook = func() { txStarted.Store(true) }
+	t.Cleanup(func() { updateTransactionStartedHook = nil })
+
+	var chunksCalled atomic.Bool
+	checking := transactionOrderContextualEmbedder{
+		transactionOrderEmbedder: transactionOrderEmbedder{inner: fixture, txStarted: &txStarted},
+		chunksCalled:             &chunksCalled,
+	}
+	result, err := Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: checking,
+	})
+	if err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if !chunksCalled.Load() {
+		t.Fatal("EmbedDocumentChunks was not called")
+	}
+	if !txStarted.Load() {
+		t.Fatal("update transaction hook did not fire")
+	}
+	if result.RecordCount != 2 {
+		t.Fatalf("RecordCount = %d, want 2", result.RecordCount)
+	}
+}
+
+func TestUpdateRejectsStalePlanWhenSnapshotChangesBeforeTransaction(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	mutating := &onFirstEmbedDocumentsEmbedder{inner: fixture}
+	mutating.onFirst = func(ctx context.Context) error {
+		_, err := Update(ctx, []corpus.Record{{
+			Ref:        "gamma",
+			Kind:       "note",
+			Title:      "Gamma",
+			SourceRef:  "file://gamma.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "gamma content",
+		}}, nil, UpdateOptions{
+			Path:     path,
+			Embedder: fixture,
+		})
+		return err
+	}
+
+	_, err = Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: mutating,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded with stale plan, want failure")
+	}
+	if !errors.Is(err, ErrStaleUpdatePlan) {
+		t.Fatalf("Update() err = %v, want wraps ErrStaleUpdatePlan", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	records, err := snapshot.Records(context.Background(), RecordQuery{})
+	if err != nil {
+		t.Fatalf("Records() error = %v", err)
+	}
+	refs := make([]string, 0, len(records))
+	for _, record := range records {
+		refs = append(refs, record.Ref)
+	}
+	want := []string{testAlphaRef, "gamma"}
+	if !reflect.DeepEqual(refs, want) {
+		t.Fatalf("refs after stale Update = %+v, want %+v", refs, want)
+	}
+}
+
+func TestUpdateEmbedderFailureDoesNotStartTransaction(t *testing.T) {
+	// Not parallel: mutates the package-level updateTransactionStartedHook.
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	var txStarted atomic.Bool
+	updateTransactionStartedHook = func() { txStarted.Store(true) }
+	t.Cleanup(func() { updateTransactionStartedHook = nil })
+
+	embedErr := errors.New("simulated embedder failure")
+	broken := failingEmbedder{inner: fixture, err: embedErr}
+	_, err = Update(context.Background(), []corpus.Record{{
+		Ref:        "beta",
+		Kind:       "note",
+		Title:      "Beta",
+		SourceRef:  "file://beta.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "beta content",
+	}}, nil, UpdateOptions{
+		Path:     path,
+		Embedder: broken,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded despite failing embedder, want failure")
+	}
+	if !errors.Is(err, embedErr) {
+		t.Fatalf("Update() err = %v, want wraps embedder failure", err)
+	}
+	if txStarted.Load() {
+		t.Fatal("update transaction started before surfacing embedder failure")
+	}
+}
+
+func TestUpdateEmbedderFailureBeforeMigrationLeavesLegacySchema(t *testing.T) {
 	t.Parallel()
 
 	fixture, err := embed.NewFixture("fixture-a", 16)
@@ -2862,10 +3210,8 @@ func TestUpdateFailureAfterMigrationRollsBackSchema(t *testing.T) {
 		t.Fatalf("rewriteSnapshotToV2() error = %v", err)
 	}
 
-	// Drive a failure AFTER resolveUpdateSessionConfig has already run
-	// migrateV2ToV3 on the outer tx, by failing the embedder when Update
-	// tries to embed the new record. The tx must roll back both the
-	// schema bump and the half-written update, leaving the file at v2.
+	// Drive a pre-transaction failure by failing the embedder while Update
+	// plans added records. Migration must not start, leaving the file at v2.
 	embedErr := errors.New("simulated embedder failure")
 	broken := failingEmbedder{inner: fixture, err: embedErr}
 
@@ -2897,7 +3243,7 @@ func TestUpdateFailureAfterMigrationRollsBackSchema(t *testing.T) {
 		t.Fatalf("readMetadataValue() error = %v", err)
 	}
 	if strings.TrimSpace(schema) != legacySchemaVersionV2 {
-		t.Fatalf("schema_version = %q after failed Update, want %q; migration leaked past Update's rollback",
+		t.Fatalf("schema_version = %q after failed Update, want %q; migration started before embedding completed",
 			schema, legacySchemaVersionV2)
 	}
 	hasPrefix, err := hasChunkColumn(context.Background(), checkDB, "context_prefix")
@@ -2905,7 +3251,7 @@ func TestUpdateFailureAfterMigrationRollsBackSchema(t *testing.T) {
 		t.Fatalf("hasChunkColumn() error = %v", err)
 	}
 	if hasPrefix {
-		t.Fatal("context_prefix column present after failed Update; ALTER leaked past rollback")
+		t.Fatal("context_prefix column present after failed Update; migration started before embedding completed")
 	}
 }
 

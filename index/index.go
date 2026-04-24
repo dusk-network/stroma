@@ -114,6 +114,17 @@ var ErrUnsupportedSchemaVersion = errors.New("unsupported snapshot schema versio
 // file byte-identical to its pre-call state.
 var ErrUpdateCommittedIntegrityCheckFailed = errors.New("update committed but post-commit integrity check failed")
 
+// ErrStaleUpdatePlan signals that Update planned added records against one
+// committed snapshot, but the snapshot content changed before the write
+// transaction applied those plans. Callers can retry the Update so chunk reuse
+// and embeddings are recomputed against the new base snapshot.
+var ErrStaleUpdatePlan = errors.New("index changed while planning update")
+
+// updateTransactionStartedHook is a test-only seam used to assert that
+// external embedding calls happen before Update opens its SQLite transaction.
+// Production leaves it nil.
+var updateTransactionStartedHook func()
+
 // BuildOptions controls how a Stroma index is rebuilt.
 type BuildOptions struct {
 	// Path is the OS-native filesystem path where the built snapshot
@@ -577,6 +588,9 @@ func prepareBuildInputs(ctx context.Context, records []corpus.Record, options Bu
 	if err != nil {
 		return rebuildInputs{}, err
 	}
+	if err := validateUniqueRecordRefs(normalized, "build"); err != nil {
+		return rebuildInputs{}, err
+	}
 	dimension, err := options.Embedder.Dimension(ctx)
 	if err != nil {
 		return rebuildInputs{}, fmt.Errorf("resolve embedder dimension: %w", err)
@@ -643,33 +657,29 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 	}
 	defer func() { _ = db.Close() }()
 
-	// Open the main update transaction before resolving session config so
-	// the v2→v3 migration — run from inside resolveUpdateSessionConfig —
-	// commits or rolls back atomically with the rest of the update. A
-	// failure at any later step (embedder error, ctx cancellation, insert
-	// failure) thus cannot leave the file permanently bumped to v3 with
-	// no corresponding update applied.
+	preflightCfg, plannedAdded, err := planUpdateInputs(ctx, db, indexPath, normalizedAdded, options)
+	if err != nil {
+		return nil, err
+	}
+
+	// Keep the main transaction focused on schema migration and SQLite
+	// writes. Added records are chunked, contextualized, reuse-planned, and
+	// embedded above against the committed snapshot so external embedder
+	// latency never holds the update transaction open.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin update transaction: %w", err)
+	}
+	if updateTransactionStartedHook != nil {
+		updateTransactionStartedHook()
 	}
 	defer func() {
 		_ = tx.Rollback()
 	}()
 
-	cfg, err := resolveUpdateSessionConfig(ctx, tx, normalizedAdded, options)
+	cfg, err := resolveUpdateTransactionConfig(ctx, tx, normalizedAdded, preflightCfg, options)
 	if err != nil {
 		return nil, err
-	}
-	if len(normalizedAdded) > 0 {
-		cfg.reuse = loadReuseState(
-			ctx,
-			indexPath,
-			cfg.embedderFingerprint,
-			cfg.dimension,
-			cfg.quantization,
-		)
-		defer func() { _ = cfg.reuse.Close() }()
 	}
 
 	result := &UpdateResult{
@@ -683,26 +693,9 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 		return nil, err
 	}
 
-	if len(normalizedAdded) > 0 {
-		session, err := newIndexSession(ctx, tx, cfg)
-		if err != nil {
+	if len(plannedAdded) > 0 {
+		if err := applyPlannedUpdateRecords(ctx, tx, cfg, plannedAdded, result); err != nil {
 			return nil, err
-		}
-		defer session.Close()
-
-		for _, record := range normalizedAdded {
-			if _, err := deleteRecord(ctx, tx, record.Ref); err != nil {
-				return nil, err
-			}
-			stats, err := session.processRecord(ctx, record)
-			if err != nil {
-				return nil, err
-			}
-			result.ReusedChunkCount += stats.reusedChunks
-			result.EmbeddedChunkCount += stats.embeddedChunks
-			if stats.recordUnchanged {
-				result.ReusedRecordCount++
-			}
 		}
 	}
 
@@ -735,6 +728,108 @@ func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result
 		}
 	}
 	return nil
+}
+
+func planUpdateInputs(
+	ctx context.Context,
+	db queryContextRunner,
+	indexPath string,
+	normalizedAdded []corpus.Record,
+	options UpdateOptions,
+) (sessionConfig, []plannedRecordWrite, error) {
+	if len(normalizedAdded) == 0 {
+		return sessionConfig{}, nil, nil
+	}
+	cfg, err := resolveUpdateSessionConfigReadOnly(ctx, db, normalizedAdded, options)
+	if err != nil {
+		return sessionConfig{}, nil, err
+	}
+	planned, err := planUpdateRecords(ctx, normalizedAdded, indexPath, cfg)
+	if err != nil {
+		return sessionConfig{}, nil, err
+	}
+	return cfg, planned, nil
+}
+
+func resolveUpdateTransactionConfig(
+	ctx context.Context,
+	tx *sql.Tx,
+	normalizedAdded []corpus.Record,
+	preflightCfg sessionConfig,
+	options UpdateOptions,
+) (sessionConfig, error) {
+	if len(normalizedAdded) == 0 {
+		return resolveUpdateSessionConfig(ctx, tx, normalizedAdded, options)
+	}
+	if err := migrateSchemaToCurrent(ctx, tx); err != nil {
+		return sessionConfig{}, err
+	}
+	cfg, err := resolveStoredUpdateSessionConfig(ctx, tx, options)
+	if err != nil {
+		return sessionConfig{}, err
+	}
+	if err := validatePlannedUpdateConfig(preflightCfg, cfg); err != nil {
+		return sessionConfig{}, err
+	}
+	cfg.embedder = preflightCfg.embedder
+	return cfg, nil
+}
+
+func applyPlannedUpdateRecords(
+	ctx context.Context,
+	tx *sql.Tx,
+	cfg sessionConfig,
+	plannedAdded []plannedRecordWrite,
+	result *UpdateResult,
+) error {
+	session, err := newIndexSession(ctx, tx, cfg)
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	for i := range plannedAdded {
+		planned := &plannedAdded[i]
+		if _, err := deleteRecord(ctx, tx, planned.record.Ref); err != nil {
+			return err
+		}
+		if err := session.insertPlannedRecord(ctx, *planned); err != nil {
+			return err
+		}
+		stats := planned.stats
+		result.ReusedChunkCount += stats.reusedChunks
+		result.EmbeddedChunkCount += stats.embeddedChunks
+		if stats.recordUnchanged {
+			result.ReusedRecordCount++
+		}
+	}
+	return nil
+}
+
+func planUpdateRecords(ctx context.Context, records []corpus.Record, indexPath string, cfg sessionConfig) ([]plannedRecordWrite, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	reuse := loadReuseState(
+		ctx,
+		indexPath,
+		cfg.embedderFingerprint,
+		cfg.dimension,
+		cfg.quantization,
+	)
+	defer func() { _ = reuse.Close() }()
+
+	chunkPolicy := resolveChunkPolicy(cfg.chunkPolicy, cfg.chunkOpts)
+	contextual := contextualEmbedderFor(cfg.embedder)
+	planned := make([]plannedRecordWrite, 0, len(records))
+	for _, record := range records {
+		next, err := planRecordWrite(ctx, record, chunkPolicy, cfg.contextualizer, reuse, contextual, cfg.embedder)
+		if err != nil {
+			return nil, err
+		}
+		planned = append(planned, next)
+	}
+	return planned, nil
 }
 
 func finalizeUpdate(ctx context.Context, db *sql.DB, tx *sql.Tx, cfg sessionConfig, result *UpdateResult) error {
@@ -983,6 +1078,7 @@ type sessionConfig struct {
 	// embedderFingerprint, dimension, and quantization from stored metadata.
 	embedder            embed.Embedder
 	embedderFingerprint string
+	contentFingerprint  string
 	contextualizer      ChunkContextualizer
 	reuse               *reuseState
 	chunkOpts           chunk.Options
@@ -996,6 +1092,15 @@ type recordStats struct {
 	reusedChunks    int
 	embeddedChunks  int
 	recordUnchanged bool
+}
+
+type plannedRecordWrite struct {
+	record    corpus.Record
+	lineaged  []chunk.SectionWithLineage
+	parentSet map[int]bool
+	plan      recordReusePlan
+	vectors   [][]float64
+	stats     recordStats
 }
 
 // indexSession owns the prepared statements, embedder branch, and reuse state
@@ -1026,23 +1131,11 @@ func newIndexSession(ctx context.Context, tx *sql.Tx, cfg sessionConfig) (*index
 		contextualizer: cfg.contextualizer,
 		reuse:          cfg.reuse,
 		chunkOpts:      cfg.chunkOpts,
-		chunkPolicy:    cfg.chunkPolicy,
+		chunkPolicy:    resolveChunkPolicy(cfg.chunkPolicy, cfg.chunkOpts),
 		dimension:      cfg.dimension,
 		quantization:   cfg.quantization,
 	}
-	if s.chunkPolicy == nil {
-		// Default policy reproduces the pre-1.0 chunking pipeline
-		// exactly: heading-aware Markdown sectioning + optional
-		// token-budget split, flat output (every section's
-		// ParentIndex == NoParent). Snapshots built via the default
-		// policy carry parent_chunk_id NULL on every chunk row, so
-		// PR-A's storage layer is exercised but no lineage is
-		// recorded.
-		s.chunkPolicy = chunk.MarkdownPolicy{Options: cfg.chunkOpts}
-	}
-	if contextual, ok := cfg.embedder.(embed.ContextualEmbedder); ok {
-		s.contextual = contextual
-	}
+	s.contextual = contextualEmbedderFor(cfg.embedder)
 
 	var err error
 	s.recordStmt, err = tx.PrepareContext(ctx, `INSERT INTO records (
@@ -1092,6 +1185,23 @@ record_ref, chunk_index, heading, content, context_prefix, parent_chunk_id
 	return s, nil
 }
 
+func resolveChunkPolicy(policy chunk.Policy, opts chunk.Options) chunk.Policy {
+	if policy != nil {
+		return policy
+	}
+	// Default policy reproduces the pre-1.0 chunking pipeline exactly:
+	// heading-aware Markdown sectioning + optional token-budget split, flat
+	// output (every section's ParentIndex == NoParent). Snapshots built via
+	// the default policy carry parent_chunk_id NULL on every chunk row, so
+	// PR-A's storage layer is exercised but no lineage is recorded.
+	return chunk.MarkdownPolicy{Options: opts}
+}
+
+func contextualEmbedderFor(embedder embed.Embedder) embed.ContextualEmbedder {
+	contextual, _ := embedder.(embed.ContextualEmbedder)
+	return contextual
+}
+
 // Close releases prepared statements. It is nil-safe and idempotent.
 func (s *indexSession) Close() {
 	if s == nil {
@@ -1106,39 +1216,61 @@ func (s *indexSession) Close() {
 }
 
 func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) (recordStats, error) {
-	var stats recordStats
+	planned, err := planRecordWrite(ctx, record, s.chunkPolicy, s.contextualizer, s.reuse, s.contextual, s.embedder)
+	if err != nil {
+		return planned.stats, err
+	}
+	if err := s.insertPlannedRecord(ctx, planned); err != nil {
+		return planned.stats, err
+	}
+	return planned.stats, nil
+}
 
-	if err := insertRecord(ctx, s.recordStmt, record); err != nil {
-		return stats, err
+func planRecordWrite(
+	ctx context.Context,
+	record corpus.Record,
+	chunkPolicy chunk.Policy,
+	contextualizer ChunkContextualizer,
+	reuse *reuseState,
+	contextual embed.ContextualEmbedder,
+	embedder embed.Embedder,
+) (plannedRecordWrite, error) {
+	var planned plannedRecordWrite
+	planned.record = record
+	if chunkPolicy == nil {
+		chunkPolicy = resolveChunkPolicy(nil, chunk.Options{})
 	}
 
-	lineaged, err := s.chunkPolicy.Chunk(ctx, record)
+	lineaged, err := chunkPolicy.Chunk(ctx, record)
 	if err != nil {
-		return stats, fmt.Errorf("chunk record %s: %w", record.Ref, err)
+		return planned, fmt.Errorf("chunk record %s: %w", record.Ref, err)
 	}
 	if err := validateLineageTopology(record.Ref, lineaged); err != nil {
-		return stats, err
+		return planned, err
 	}
+	planned.lineaged = lineaged
 	parentSet := identifyParents(lineaged)
+	planned.parentSet = parentSet
 
 	sections := make([]chunk.Section, len(lineaged))
 	for i, l := range lineaged {
 		sections[i] = l.Section
 	}
 
-	prefixes, err := runContextualizer(ctx, s.contextualizer, record, sections)
+	prefixes, err := runContextualizer(ctx, contextualizer, record, sections)
 	if err != nil {
-		return stats, fmt.Errorf("contextualize record %s: %w", record.Ref, err)
+		return planned, fmt.Errorf("contextualize record %s: %w", record.Ref, err)
 	}
 
-	plan := planRecordReuse(record, storedRecordForReuse(ctx, s.reuse, record.Ref), sections, prefixes, parentSet)
-	stats.sections = len(sections)
-	stats.reusedChunks = plan.reusedChunkCount
-	stats.embeddedChunks = plan.embeddedChunkCount
-	stats.recordUnchanged = plan.recordUnchanged
+	plan := planRecordReuse(record, storedRecordForReuse(ctx, reuse, record.Ref), sections, prefixes, parentSet)
+	planned.plan = plan
+	planned.stats.sections = len(sections)
+	planned.stats.reusedChunks = plan.reusedChunkCount
+	planned.stats.embeddedChunks = plan.embeddedChunkCount
+	planned.stats.recordUnchanged = plan.recordUnchanged
 
 	if len(sections) == 0 {
-		return stats, nil
+		return planned, nil
 	}
 
 	// Embedding pipeline: parents are storage-only context (Q decision
@@ -1158,24 +1290,31 @@ func (s *indexSession) processRecord(ctx context.Context, record corpus.Record) 
 
 	vectors := make([][]float64, 0, len(texts))
 	if len(texts) > 0 {
-		if s.contextual != nil {
-			vectors, err = s.contextual.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
+		if contextual != nil {
+			vectors, err = contextual.EmbedDocumentChunks(ctx, documentTextForEmbedding(record), texts)
 		} else {
-			vectors, err = s.embedder.EmbedDocuments(ctx, texts)
+			if embedder == nil {
+				return planned, fmt.Errorf("embedder is required to embed record %s", record.Ref)
+			}
+			vectors, err = embedder.EmbedDocuments(ctx, texts)
 		}
 		if err != nil {
-			return stats, fmt.Errorf("embed record %s: %w", record.Ref, err)
+			return planned, fmt.Errorf("embed record %s: %w", record.Ref, err)
 		}
 		if len(vectors) != len(texts) {
-			return stats, fmt.Errorf("embedder returned %d vectors for %d new leaf sections on %s", len(vectors), len(texts), record.Ref)
+			return planned, fmt.Errorf("embedder returned %d vectors for %d new leaf sections on %s", len(vectors), len(texts), record.Ref)
 		}
 	}
+	planned.vectors = vectors
 
-	if err := s.insertChunks(ctx, record, lineaged, parentSet, plan, vectors); err != nil {
-		return stats, err
+	return planned, nil
+}
+
+func (s *indexSession) insertPlannedRecord(ctx context.Context, planned plannedRecordWrite) error {
+	if err := insertRecord(ctx, s.recordStmt, planned.record); err != nil {
+		return err
 	}
-
-	return stats, nil
+	return s.insertChunks(ctx, planned.record, planned.lineaged, planned.parentSet, planned.plan, planned.vectors)
 }
 
 // validateLineageTopology rejects forward parent references and
@@ -2228,13 +2367,10 @@ func normalizeRemovedRefs(refs []string) []string {
 }
 
 func validateUpdateInputs(added []corpus.Record, removed []string) error {
-	addedRefs := make(map[string]struct{}, len(added))
-	for _, record := range added {
-		if _, ok := addedRefs[record.Ref]; ok {
-			return fmt.Errorf("duplicate added record ref %q", record.Ref)
-		}
-		addedRefs[record.Ref] = struct{}{}
+	if err := validateUniqueRecordRefs(added, "added"); err != nil {
+		return err
 	}
+	addedRefs := recordRefSet(added)
 	for _, ref := range removed {
 		if _, ok := addedRefs[ref]; ok {
 			return fmt.Errorf("record ref %q appears in both added and removed", ref)
@@ -2243,16 +2379,57 @@ func validateUpdateInputs(added []corpus.Record, removed []string) error {
 	return nil
 }
 
+func validateUniqueRecordRefs(records []corpus.Record, label string) error {
+	seen := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		if _, ok := seen[record.Ref]; ok {
+			return fmt.Errorf("duplicate %s record ref %q", label, record.Ref)
+		}
+		seen[record.Ref] = struct{}{}
+	}
+	return nil
+}
+
+func recordRefSet(records []corpus.Record) map[string]struct{} {
+	refs := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		refs[record.Ref] = struct{}{}
+	}
+	return refs
+}
+
 func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.Record, options UpdateOptions) (sessionConfig, error) {
 	if err := migrateSchemaToCurrent(ctx, tx); err != nil {
 		return sessionConfig{}, err
 	}
-
-	embedderFingerprint, err := readMetadataValue(ctx, tx, "embedder_fingerprint")
+	cfg, err := resolveStoredUpdateSessionConfig(ctx, tx, options)
 	if err != nil {
 		return sessionConfig{}, err
 	}
-	dimensionValue, err := readMetadataValue(ctx, tx, "embedder_dimension")
+	return attachUpdateEmbedder(ctx, cfg, added, options)
+}
+
+func resolveUpdateSessionConfigReadOnly(ctx context.Context, query queryContextRunner, added []corpus.Record, options UpdateOptions) (sessionConfig, error) {
+	if err := validateUpdatableSchema(ctx, query); err != nil {
+		return sessionConfig{}, err
+	}
+	cfg, err := resolveStoredUpdateSessionConfig(ctx, query, options)
+	if err != nil {
+		return sessionConfig{}, err
+	}
+	return attachUpdateEmbedder(ctx, cfg, added, options)
+}
+
+func resolveStoredUpdateSessionConfig(ctx context.Context, query queryContextRunner, options UpdateOptions) (sessionConfig, error) {
+	embedderFingerprint, err := readMetadataValue(ctx, query, "embedder_fingerprint")
+	if err != nil {
+		return sessionConfig{}, err
+	}
+	contentFingerprint, err := readMetadataValue(ctx, query, "content_fingerprint")
+	if err != nil {
+		return sessionConfig{}, err
+	}
+	dimensionValue, err := readMetadataValue(ctx, query, "embedder_dimension")
 	if err != nil {
 		return sessionConfig{}, err
 	}
@@ -2261,7 +2438,7 @@ func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.
 		return sessionConfig{}, fmt.Errorf("parse embedder_dimension %q: %w", dimensionValue, err)
 	}
 
-	quantization, err := readMetadataValueOptional(ctx, tx, "quantization", store.QuantizationFloat32)
+	quantization, err := readMetadataValueOptional(ctx, query, "quantization", store.QuantizationFloat32)
 	if err != nil {
 		return sessionConfig{}, err
 	}
@@ -2281,6 +2458,7 @@ func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.
 
 	cfg := sessionConfig{
 		embedderFingerprint: embedderFingerprint,
+		contentFingerprint:  contentFingerprint,
 		contextualizer:      options.Contextualizer,
 		dimension:           dimension,
 		quantization:        quantization,
@@ -2291,19 +2469,58 @@ func resolveUpdateSessionConfig(ctx context.Context, tx *sql.Tx, added []corpus.
 		},
 		chunkPolicy: options.ChunkPolicy,
 	}
+	return cfg, nil
+}
 
+func attachUpdateEmbedder(ctx context.Context, cfg sessionConfig, added []corpus.Record, options UpdateOptions) (sessionConfig, error) {
 	if len(added) == 0 && options.Embedder == nil {
 		return cfg, nil
 	}
 	if options.Embedder == nil {
 		return sessionConfig{}, fmt.Errorf("update embedder is required when adding records")
 	}
-	if err := validateUpdateEmbedder(ctx, options.Embedder, embedderFingerprint, dimension); err != nil {
+	if err := validateUpdateEmbedder(ctx, options.Embedder, cfg.embedderFingerprint, cfg.dimension); err != nil {
 		return sessionConfig{}, err
 	}
 
 	cfg.embedder = options.Embedder
 	return cfg, nil
+}
+
+func validateUpdatableSchema(ctx context.Context, query queryContextRunner) error {
+	schema, err := readMetadataValue(ctx, query, "schema_version")
+	if err != nil {
+		return err
+	}
+	switch strings.TrimSpace(schema) {
+	case legacySchemaVersionV2, legacySchemaVersionV3, prevSchemaVersion, schemaVersion:
+		return nil
+	default:
+		return fmt.Errorf("%w: index=%q update=%q", ErrUnsupportedSchemaVersion, strings.TrimSpace(schema), schemaVersion)
+	}
+}
+
+func validatePlannedUpdateConfig(preflight, current sessionConfig) error {
+	if preflight.contentFingerprint != current.contentFingerprint {
+		return fmt.Errorf("%w: content fingerprint was %q now %q",
+			ErrStaleUpdatePlan, preflight.contentFingerprint, current.contentFingerprint)
+	}
+	if preflight.embedderFingerprint != current.embedderFingerprint {
+		return fmt.Errorf("%w: embedder fingerprint was %q now %q",
+			ErrStaleUpdatePlan,
+			preflight.embedderFingerprint, current.embedderFingerprint)
+	}
+	if preflight.dimension != current.dimension {
+		return fmt.Errorf("%w: embedder dimension was %d now %d",
+			ErrStaleUpdatePlan,
+			preflight.dimension, current.dimension)
+	}
+	if preflight.quantization != current.quantization {
+		return fmt.Errorf("%w: quantization was %q now %q",
+			ErrStaleUpdatePlan,
+			preflight.quantization, current.quantization)
+	}
+	return nil
 }
 
 // validateUpdateEmbedder checks that the update-time embedder agrees with
