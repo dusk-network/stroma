@@ -612,6 +612,9 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	if query.Limit <= 0 {
 		query.Limit = DefaultSearchLimit
 	}
+	if query.Limit > MaxSearchLimit {
+		return nil, fmt.Errorf("search limit %d exceeds MaxSearchLimit (%d)", query.Limit, MaxSearchLimit)
+	}
 
 	if err := ensureCompatibleEmbedder(ctx, s.db, query.Embedder); err != nil {
 		return nil, err
@@ -698,6 +701,9 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	}
 	if query.Limit <= 0 {
 		query.Limit = DefaultSearchLimit
+	}
+	if query.Limit > MaxSearchLimit {
+		return nil, fmt.Errorf("search limit %d exceeds MaxSearchLimit (%d)", query.Limit, MaxSearchLimit)
 	}
 	if s.quantizationErr != nil {
 		return nil, s.quantizationErr

@@ -285,7 +285,11 @@ type SearchParams struct {
 	// "search text is required" error — this field has no default.
 	Text string
 	// Limit caps the number of SearchHits returned. Zero or negative
-	// selects DefaultSearchLimit (10). Pass an explicit Limit when
+	// selects DefaultSearchLimit (10). Values larger than MaxSearchLimit
+	// are rejected with an error — the internal candidate shortlist is
+	// bounded (see MaxSearchLimit) so a larger Limit cannot actually
+	// return more hits, and silently capping the request would mislead
+	// pagination/rerank/export flows (#78). Pass an explicit Limit when
 	// throughput matters or when a downstream consumer needs a stable
 	// shortlist size across snapshots.
 	Limit int
@@ -2421,6 +2425,15 @@ const (
 	minCandidatePool = 25
 	// maxCandidatePool caps the shortlist to bound per-query cost.
 	maxCandidatePool = 250
+
+	// MaxSearchLimit is the maximum value accepted for SearchParams.Limit /
+	// VectorSearchQuery.Limit. The underlying candidate shortlist is bounded
+	// by maxCandidatePool (250) to keep per-query cost predictable, so a
+	// caller cannot receive more than 250 hits from a single search. Prior
+	// versions silently capped the result count; we now reject the request
+	// with a clear error so pagination / reranking / export flows can reason
+	// from the public API (#78).
+	MaxSearchLimit = maxCandidatePool
 )
 
 func candidateLimit(limit int) int {
