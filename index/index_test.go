@@ -3897,10 +3897,12 @@ func TestRebuildNegativeMaxChunkSectionsDisablesGuard(t *testing.T) {
 		t.Fatalf("NewFixture() error = %v", err)
 	}
 
-	// Just enough headings to exceed the conservative index-layer cap
-	// defaults, but tractable for a unit test.
+	// Reuse the same bounded fixture shape the rejection test above
+	// fails with MaxChunkSections=10. This test is about option
+	// semantics (negative disables the guard), not stress-testing the
+	// SQLite writer with a huge single body_text value.
 	var builder strings.Builder
-	const headings = 200
+	const headings = 50
 	for i := 0; i < headings; i++ {
 		fmt.Fprintf(&builder, "## Section %d\n\nBody %d\n\n", i, i)
 	}
