@@ -87,6 +87,7 @@ type Error struct {
 	Message    string
 	HTTPStatus int
 	Details    *FailureDetails
+	cause      error
 }
 
 // Error implements the error interface.
@@ -95,6 +96,14 @@ func (e *Error) Error() string {
 		return ""
 	}
 	return e.Message
+}
+
+// Unwrap returns the original lower-level cause, when one exists.
+func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 // HTTPStatusCode returns the associated HTTP status when the failure
@@ -130,20 +139,33 @@ func (e *Error) DiagnosticFields() map[string]any {
 
 // NewError formats a classified failure without HTTP context.
 func NewError(details FailureDetails, format string, args ...any) *Error {
+	return NewErrorCause(details, nil, format, args...)
+}
+
+// NewErrorCause formats a classified failure and preserves a lower-level cause.
+func NewErrorCause(details FailureDetails, cause error, format string, args ...any) *Error {
 	return &Error{
 		Message: fmt.Sprintf(format, args...),
 		Details: &details,
+		cause:   cause,
 	}
 }
 
 // NewErrorStatus formats a classified failure and records the
 // associated HTTP status code.
 func NewErrorStatus(details FailureDetails, status int, format string, args ...any) *Error {
+	return NewErrorStatusCause(details, status, nil, format, args...)
+}
+
+// NewErrorStatusCause formats a classified HTTP failure and preserves
+// a lower-level cause.
+func NewErrorStatusCause(details FailureDetails, status int, cause error, format string, args ...any) *Error {
 	details.HTTPStatus = status
 	return &Error{
 		Message:    fmt.Sprintf(format, args...),
 		HTTPStatus: status,
 		Details:    &details,
+		cause:      cause,
 	}
 }
 

@@ -185,7 +185,7 @@ func doAttempt[T any](
 			return value, 0, 0, err
 		}
 		failure := classifiedFailureDetails(details, 0, err, err.Error())
-		return value, 0, 0, NewError(failure, "call %s %s: %v", method, target.URL, err)
+		return value, 0, 0, NewErrorCause(failure, err, "call %s %s: %v", method, target.URL, err)
 	}
 
 	retryAfter = retryAfterDuration(resp.Header.Get("Retry-After"))
@@ -240,7 +240,7 @@ func interpretResponse[T any](
 	}
 	if readErr != nil {
 		failure := classifiedFailureDetails(details, 0, readErr, readErr.Error())
-		return zero, NewError(failure, "read response: %v", readErr)
+		return zero, NewErrorCause(failure, readErr, "read response: %v", readErr)
 	}
 	if oversized {
 		failure := details
@@ -252,7 +252,7 @@ func interpretResponse[T any](
 	if decodeErr == nil {
 		if closeErr != nil {
 			failure := classifiedFailureDetails(details, 0, closeErr, closeErr.Error())
-			return zero, NewError(failure, "close response: %v", closeErr)
+			return zero, NewErrorCause(failure, closeErr, "close response: %v", closeErr)
 		}
 		return value, nil
 	}
@@ -263,7 +263,7 @@ func interpretResponse[T any](
 	if !errors.As(decodeErr, &perr) {
 		failure := details
 		failure.FailureClass = FailureClassSchemaMismatch
-		decodeErr = NewError(failure, "decode response: %v", decodeErr)
+		decodeErr = NewErrorCause(failure, decodeErr, "decode response: %v", decodeErr)
 	}
 	return zero, decodeErr
 }
@@ -282,7 +282,7 @@ func interpretNon2xx(
 ) error {
 	if readErr != nil {
 		failure := classifiedFailureDetails(details, resp.StatusCode, nil, readErr.Error())
-		return NewErrorStatus(failure, resp.StatusCode,
+		return NewErrorStatusCause(failure, resp.StatusCode, readErr,
 			"%s %s returned %s (response body read failed: %v)",
 			method, target.URL, resp.Status, readErr)
 	}

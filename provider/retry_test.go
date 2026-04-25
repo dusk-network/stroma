@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -250,6 +251,40 @@ func TestDoEnforcesResponseSizeCap(t *testing.T) {
 	}
 	if perr.FailureClass() != FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassSchemaMismatch)
+	}
+}
+
+func TestDoRetriesTimeoutCauseAfterWrapping(t *testing.T) {
+	var attempts atomic.Int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if attempts.Add(1) == 1 {
+				return nil, fakeNetError{msg: "temporary upstream stall", timeout: true}
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	out, err := Do(context.Background(), client,
+		Target{URL: "http://example.test/v1", Body: []byte(`x`)},
+		FailureDetails{},
+		Policy{MaxRetries: 1},
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
+	)
+	if err != nil {
+		t.Fatalf("Do() err = %v", err)
+	}
+	if out != "ok" {
+		t.Errorf("Do() = %q, want ok", out)
+	}
+	if n := attempts.Load(); n != 2 {
+		t.Errorf("attempts = %d, want 2 (wrapped net.Error timeout must retry)", n)
 	}
 }
 
@@ -645,4 +680,10 @@ func TestDoRejectsNilClient(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "nil http client") {
 		t.Errorf("err = %v, want nil http client", err)
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
