@@ -212,6 +212,58 @@ func TestSearchReturnsClosestHit(t *testing.T) {
 	}
 }
 
+func TestSearchRejectsLimitAboveMaxSearchLimit(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "guide",
+		Title:      "Alpha",
+		SourceRef:  "file://docs/alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "# Overview\n\nAlpha handles queue admission.",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	if _, err := Search(context.Background(), SearchQuery{
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "queue admission",
+			Limit:    MaxSearchLimit + 1,
+			Embedder: fixture,
+		},
+	}); err == nil || !strings.Contains(err.Error(), "MaxSearchLimit") {
+		t.Fatalf("Search() err = %v, want MaxSearchLimit rejection", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	queryVector, err := fixture.EmbedQueries(context.Background(), []string{"queue admission"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	if _, err := snapshot.SearchVector(context.Background(), VectorSearchQuery{
+		Embedding: queryVector[0],
+		Limit:     MaxSearchLimit + 1,
+	}); err == nil || !strings.Contains(err.Error(), "MaxSearchLimit") {
+		t.Fatalf("SearchVector() err = %v, want MaxSearchLimit rejection", err)
+	}
+}
+
 func TestSearchHybridBoostsExactMatch(t *testing.T) {
 	t.Parallel()
 
