@@ -96,7 +96,8 @@ type VectorSearchQuery struct {
 	// default.
 	Embedding []float64
 	// Limit caps the number of SearchHits returned. Zero or negative
-	// selects DefaultSearchLimit (10).
+	// selects DefaultSearchLimit (10). Values above MaxSearchLimit
+	// reject with an error instead of being silently capped.
 	Limit int
 	// Kinds filters candidate records to the supplied kind list. Nil
 	// or empty means "no filter, all kinds".
@@ -612,6 +613,9 @@ func (s *Snapshot) Search(ctx context.Context, query SnapshotSearchQuery) ([]Sea
 	if query.Limit <= 0 {
 		query.Limit = DefaultSearchLimit
 	}
+	if err := validateSearchLimit(query.Limit); err != nil {
+		return nil, err
+	}
 
 	if err := ensureCompatibleEmbedder(ctx, s.db, query.Embedder); err != nil {
 		return nil, err
@@ -699,6 +703,9 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 	if query.Limit <= 0 {
 		query.Limit = DefaultSearchLimit
 	}
+	if err := validateSearchLimit(query.Limit); err != nil {
+		return nil, err
+	}
 	if s.quantizationErr != nil {
 		return nil, s.quantizationErr
 	}
@@ -711,6 +718,13 @@ func (s *Snapshot) SearchVector(ctx context.Context, query VectorSearchQuery) ([
 		hits = hits[:query.Limit]
 	}
 	return hits, nil
+}
+
+func validateSearchLimit(limit int) error {
+	if limit > MaxSearchLimit {
+		return fmt.Errorf("search limit %d exceeds MaxSearchLimit (%d)", limit, MaxSearchLimit)
+	}
+	return nil
 }
 
 func (s *Snapshot) searchVectorCandidates(ctx context.Context, embedding []float64, limit int, kinds []string, quantization string, searchDimension int) ([]SearchHit, error) {

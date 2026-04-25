@@ -60,6 +60,13 @@ const DefaultMaxChunkSections = 10_000
 // size across snapshots.
 const DefaultSearchLimit = 10
 
+// MaxSearchLimit is the largest accepted SearchParams.Limit or
+// VectorSearchQuery.Limit. Search uses bounded in-memory shortlists for
+// vector/FTS fusion and reranking; callers needing more than this should
+// page or shard at a higher layer rather than relying on an unbounded
+// single-query scan.
+const MaxSearchLimit = 250
+
 // resolveMaxChunkSections maps a caller-provided MaxChunkSections knob
 // onto the chunk.Options.MaxSections value: zero → safe default,
 // negative → chunk-level "unlimited", positive → verbatim.
@@ -323,9 +330,8 @@ type SearchParams struct {
 	// "search text is required" error — this field has no default.
 	Text string
 	// Limit caps the number of SearchHits returned. Zero or negative
-	// selects DefaultSearchLimit (10). Pass an explicit Limit when
-	// throughput matters or when a downstream consumer needs a stable
-	// shortlist size across snapshots.
+	// selects DefaultSearchLimit (10). Values above MaxSearchLimit
+	// reject with an error instead of being silently capped.
 	Limit int
 	// Kinds filters candidate records to the supplied kind list. Nil
 	// or empty means "no filter, all kinds".
@@ -2668,7 +2674,7 @@ const (
 	// above buildSearchSQL.
 	minCandidatePool = 25
 	// maxCandidatePool caps the shortlist to bound per-query cost.
-	maxCandidatePool = 250
+	maxCandidatePool = MaxSearchLimit
 )
 
 func candidateLimit(limit int) int {
