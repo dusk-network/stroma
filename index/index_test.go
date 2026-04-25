@@ -1578,6 +1578,160 @@ func TestUpdateMixedOperationsMatchEquivalentRebuild(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsAddedRecordsAboveMaxPlannedRecords(t *testing.T) {
+	// Not parallel: mutates the package-level updateTransactionStartedHook.
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	var txStarted atomic.Bool
+	updateTransactionStartedHook = func() { txStarted.Store(true) }
+	t.Cleanup(func() { updateTransactionStartedHook = nil })
+
+	counting := &documentCallCountingEmbedder{inner: fixture}
+	_, err = Update(context.Background(), []corpus.Record{
+		{
+			Ref:        "beta",
+			Kind:       "note",
+			Title:      "Beta",
+			SourceRef:  "file://beta.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "beta content",
+		},
+		{
+			Ref:        "gamma",
+			Kind:       "note",
+			Title:      "Gamma",
+			SourceRef:  "file://gamma.txt",
+			BodyFormat: corpus.FormatPlaintext,
+			BodyText:   "gamma content",
+		},
+	}, nil, UpdateOptions{
+		Path:              path,
+		Embedder:          counting,
+		MaxPlannedRecords: 1,
+	})
+	if err == nil {
+		t.Fatal("Update() succeeded above MaxPlannedRecords, want failure")
+	}
+	if !errors.Is(err, ErrUpdatePlanTooLarge) {
+		t.Fatalf("Update() err = %v, want wraps ErrUpdatePlanTooLarge", err)
+	}
+	if counting.documentCalls.Load() != 0 {
+		t.Fatalf("EmbedDocuments calls = %d, want 0; rejected update should not plan records",
+			counting.documentCalls.Load())
+	}
+	if txStarted.Load() {
+		t.Fatal("update transaction started despite MaxPlannedRecords rejection")
+	}
+
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.RecordCount != 1 {
+		t.Fatalf("RecordCount = %d after rejected Update, want 1", stats.RecordCount)
+	}
+}
+
+func TestUpdateAppliesLargeInputInBoundedCallerBatches(t *testing.T) {
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	initial := []corpus.Record{{
+		Ref:        testAlphaRef,
+		Kind:       "note",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.txt",
+		BodyFormat: corpus.FormatPlaintext,
+		BodyText:   "alpha content",
+	}}
+	if _, err := Rebuild(context.Background(), initial, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	const (
+		addedCount = 37
+		batchSize  = 8
+	)
+	added := make([]corpus.Record, 0, addedCount)
+	for i := 0; i < addedCount; i++ {
+		n := strconv.Itoa(i)
+		added = append(added, corpus.Record{
+			Ref:        "bulk-" + n,
+			Kind:       "guide",
+			Title:      "Bulk " + n,
+			SourceRef:  "file://bulk/" + n + ".md",
+			BodyFormat: corpus.FormatMarkdown,
+			BodyText: "# Overview\n\nBulk record " + n + " handles queue admission.\n\n" +
+				"## Retry\n\nBulk record " + n + " records bounded retry budgets.",
+		})
+	}
+
+	for start := 0; start < len(added); start += batchSize {
+		end := start + batchSize
+		if end > len(added) {
+			end = len(added)
+		}
+		result, err := Update(context.Background(), added[start:end], nil, UpdateOptions{
+			Path:              path,
+			Embedder:          fixture,
+			MaxPlannedRecords: batchSize,
+		})
+		if err != nil {
+			t.Fatalf("Update(batch %d:%d) error = %v", start, end, err)
+		}
+		if result.UpsertedCount != end-start {
+			t.Fatalf("Update(batch %d:%d) UpsertedCount = %d, want %d",
+				start, end, result.UpsertedCount, end-start)
+		}
+	}
+
+	stats, err := ReadStats(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadStats() error = %v", err)
+	}
+	if stats.RecordCount != len(initial)+len(added) {
+		t.Fatalf("RecordCount = %d, want %d", stats.RecordCount, len(initial)+len(added))
+	}
+	if stats.ChunkCount != len(initial)+len(added)*2 {
+		t.Fatalf("ChunkCount = %d, want %d", stats.ChunkCount, len(initial)+len(added)*2)
+	}
+
+	expected := append([]corpus.Record(nil), initial...)
+	expected = append(expected, added...)
+	wantFingerprint, err := corpus.Fingerprint(expected)
+	if err != nil {
+		t.Fatalf("corpus.Fingerprint(expected) error = %v", err)
+	}
+	if stats.ContentFingerprint != wantFingerprint {
+		t.Fatalf("ContentFingerprint = %q, want %q", stats.ContentFingerprint, wantFingerprint)
+	}
+}
+
 func TestRebuildStreamingReuseAcrossManyRecords(t *testing.T) {
 	t.Parallel()
 

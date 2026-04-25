@@ -33,7 +33,7 @@ Stroma is not for:
 - `chat` — OpenAI-compatible chat completion client (`chat.OpenAI`, `chat.Message`, `ChatCompletionText`, `ChatCompletionJSON`); tolerates string and multi-part array content; structured JSON responses decode into caller-owned targets and malformed JSON returns `schema_mismatch`; `APIToken` redaction parity with `embed.OpenAIConfig`
 - `provider` — shared HTTP substrate used by `embed` and `chat`: retry with capped `Retry-After`, response-size bounding, negative `MaxRetries` normalization to zero, and a stable `FailureClass` taxonomy surfaced via `*provider.Error`. Callers branch on `FailureClass` to retry / degrade / propagate, and can unwrap lower-level transport/decode causes where available
 - `store` — SQLite readiness probes, `sqlite-vec` readiness, quantization blob helpers (`QuantizationFloat32` / `QuantizationInt8` / `QuantizationBinary`)
-- `index` — atomic `Rebuild` with embedding reuse and explicit reuse diagnostics, incremental `Update`, long-lived `Snapshot` readers, `Stats`, hybrid `Search` with provenance and explicit `MaxSearchLimit`, `ExpandContext` for parent/neighbor walks
+- `index` — atomic `Rebuild` with embedding reuse and explicit reuse diagnostics, incremental `Update` with `MaxPlannedRecords` batching guard, long-lived `Snapshot` readers, `Stats`, hybrid `Search` with provenance and explicit `MaxSearchLimit`, `ExpandContext` for parent/neighbor walks
 
 ## Retrieval Evidence And Batch Use
 
@@ -48,6 +48,12 @@ For durable evidence handles, persist at least:
 `ChunkID` is not a cross-rebuild identity. Before expanding a previously saved hit, reopen the snapshot, compare `Stats.ContentFingerprint` with the saved value, and rerun search if it differs. `SearchHit.Score` and `HitProvenance` are ranking evidence for the query that produced the hit; keep them for audit/debugging, but do not use them as identity fields.
 
 `ExpandContext(hit.ChunkID, opts)` returns the hit chunk plus requested parent/neighbor sections in document order. On flat snapshots, parent expansion is a no-op and neighbors are same-record chunks. On hierarchical snapshots, parent expansion follows `parent_chunk_id` one level and neighbors stay in the same sibling group. A missing chunk returns an empty slice and nil error, which lets wrappers treat stale handles as "not found" after they have already checked the content fingerprint.
+
+## Update Memory And Batching
+
+`Update` chunks, contextualizes, reuse-plans, and embeds added/replaced records before opening its SQLite write transaction. That keeps external embedder latency out of the transaction and preserves stale-plan rollback semantics, but the pre-transaction plan retains each added record's chunks, reuse decisions, and new vectors until the write phase.
+
+For large ingests, split added records into caller-sized batches and set `UpdateOptions.MaxPlannedRecords` to that batch size. A batch above the cap fails before embedding and before the write transaction starts with an error wrapping `index.ErrUpdatePlanTooLarge`, so callers can retry smaller batches without changing the on-disk snapshot. `MaxChunkSections` still bounds per-record section expansion.
 
 ## Example
 
