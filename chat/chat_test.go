@@ -70,6 +70,31 @@ func TestNewOpenAINormalisesDefaults(t *testing.T) {
 	}
 }
 
+func TestNewOpenAINormalizesNegativeMaxRetries(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewOpenAI(OpenAIConfig{
+		BaseURL:    server.URL,
+		Model:      "gpt",
+		MaxRetries: -1,
+	})
+	if got := client.Config().MaxRetries; got != 0 {
+		t.Fatalf("Config().MaxRetries = %d, want 0", got)
+	}
+	_, err := client.ChatCompletionText(context.Background(), []Message{{Role: "user", Content: "q"}}, 0, 0)
+	if err == nil {
+		t.Fatal("ChatCompletionText() err = nil, want single-attempt 502 error")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1 (negative MaxRetries normalizes to no retries)", got)
+	}
+}
+
 func TestNewOpenAIBaseURLBareHostAddsV1(t *testing.T) {
 	cfg := NewOpenAI(OpenAIConfig{BaseURL: "http://x", Model: "m"}).Config()
 	if cfg.BaseURL != "http://x/v1" {

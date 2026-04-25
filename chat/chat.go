@@ -65,7 +65,8 @@ type OpenAIConfig struct {
 
 	// MaxRetries caps the number of retry attempts after a retryable
 	// failure (429, 5xx, connection reset, timeout). Zero disables
-	// retries. Retry-After is always honoured when present.
+	// retries; negative values normalize to zero. Retry-After is always
+	// honoured when present.
 	MaxRetries int
 
 	// MaxResponseBytes bounds the response body; zero selects the
@@ -132,6 +133,9 @@ func NewOpenAI(cfg OpenAIConfig) *OpenAI {
 	cfg.Model = strings.TrimSpace(cfg.Model)
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultChatTimeout
+	}
+	if cfg.MaxRetries < 0 {
+		cfg.MaxRetries = 0
 	}
 	return &OpenAI{
 		config: cfg,
