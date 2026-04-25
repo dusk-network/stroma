@@ -96,6 +96,71 @@ func TestExpandContextZeroOptionsReturnsJustTheChunk(t *testing.T) {
 	}
 }
 
+func TestSnapshotSupportsRepeatedSearchAndContextExpansion(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-batch", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "ops",
+		Kind:       "note",
+		Title:      "Operations",
+		SourceRef:  "ops.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText: "# Queue\n\nQueue admission is recorded here.\n\n" +
+			"# Audit\n\nAudit trail context is recorded here.\n\n" +
+			"# Review\n\nReview packets are recorded here.\n",
+	}}, BuildOptions{Path: path, Embedder: fixture}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	snap, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	t.Cleanup(func() { _ = snap.Close() })
+
+	stats, err := snap.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if stats.ContentFingerprint == "" {
+		t.Fatal("Stats().ContentFingerprint = empty, want evidence-handle generation")
+	}
+
+	for _, query := range []string{"queue admission", "audit trail"} {
+		hits, err := snap.Search(context.Background(), SnapshotSearchQuery{
+			SearchParams: SearchParams{
+				Text:     query,
+				Limit:    2,
+				Embedder: fixture,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Search(%q) error = %v", query, err)
+		}
+		if len(hits) == 0 {
+			t.Fatalf("Search(%q) returned no hits", query)
+		}
+		if hits[0].ChunkID == 0 || hits[0].Ref == "" {
+			t.Fatalf("Search(%q) hit = %+v, want durable chunk/ref fields", query, hits[0])
+		}
+		sections, err := snap.ExpandContext(context.Background(), hits[0].ChunkID, ContextOptions{NeighborWindow: 1})
+		if err != nil {
+			t.Fatalf("ExpandContext(%q hit) error = %v", query, err)
+		}
+		if len(sections) == 0 {
+			t.Fatalf("ExpandContext(%q hit) returned no sections", query)
+		}
+		if sections[0].Ref != hits[0].Ref {
+			t.Fatalf("ExpandContext(%q hit) first ref = %q, want %q", query, sections[0].Ref, hits[0].Ref)
+		}
+	}
+}
+
 // TestExpandContextNeighborWindowOnFlatChunks builds a small Markdown
 // record that produces multiple flat chunks (parent_chunk_id NULL on
 // every row, the only shape PR-A actually emits) and asserts that
