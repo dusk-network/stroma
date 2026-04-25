@@ -200,6 +200,35 @@ func TestDoRespectsMaxRetriesExhaustion(t *testing.T) {
 	}
 }
 
+func TestDoNormalizesNegativeMaxRetries(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Do(context.Background(), server.Client(),
+		Target{URL: server.URL, Body: []byte(`x`)},
+		FailureDetails{MaxRetries: -1},
+		Policy{MaxRetries: -1},
+		func(_ *http.Response, _ []byte) (string, error) { return "", nil },
+	)
+	if err == nil {
+		t.Fatalf("Do() err = nil, want error from single failed attempt")
+	}
+	if n := attempts.Load(); n != 1 {
+		t.Errorf("attempts = %d, want 1 (negative MaxRetries normalizes to zero retries)", n)
+	}
+	var perr *Error
+	if !errors.As(err, &perr) {
+		t.Fatalf("err = %v, want *Error", err)
+	}
+	if fields := perr.DiagnosticFields(); fields["max_retries"] != nil {
+		t.Errorf("DiagnosticFields()[max_retries] = %v, want omitted zero value", fields["max_retries"])
+	}
+}
+
 func TestDoEnforcesResponseSizeCap(t *testing.T) {
 	// Emit a response larger than the configured cap.
 	payload := strings.Repeat("x", 64)

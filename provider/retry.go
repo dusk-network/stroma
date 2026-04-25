@@ -29,9 +29,10 @@ type Target struct {
 }
 
 // Policy controls retry and response-size behaviour. A zero Policy is
-// valid: MaxRetries 0 means "try once, no retries", and a zero
-// MaxResponseBytes selects defaultMaxResponseBytes (4 MiB) — generous
-// for chat completions, tight enough to avoid OOMing the host on a
+// valid: MaxRetries 0 means "try once, no retries", negative
+// MaxRetries values normalize to zero, and a zero MaxResponseBytes
+// selects defaultMaxResponseBytes (4 MiB) — generous for chat
+// completions, tight enough to avoid OOMing the host on a
 // misconfigured upstream. Embedders with larger expected payloads set
 // MaxResponseBytes explicitly.
 type Policy struct {
@@ -117,13 +118,21 @@ func Do[T any](
 		maxRetryAfter = defaultMaxRetryAfter
 	}
 
+	maxRetries := policy.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	if details.MaxRetries < 0 {
+		details.MaxRetries = 0
+	}
+
 	method := target.Method
 	if method == "" {
 		method = http.MethodPost
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= policy.MaxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		value, retryAfter, statusCode, err := doAttempt(ctx, client, method, target, details, maxResponseBytes, decode)
 		if err == nil {
 			return value, nil
@@ -135,7 +144,7 @@ func Do[T any](
 			return zero, err
 		}
 		lastErr = err
-		if shouldRetry(err, statusCode) && attempt < policy.MaxRetries {
+		if shouldRetry(err, statusCode) && attempt < maxRetries {
 			if waitErr := waitBeforeRetry(ctx, attempt, min(retryAfter, maxRetryAfter)); waitErr != nil {
 				return zero, waitErr
 			}
