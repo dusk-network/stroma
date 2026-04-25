@@ -27,6 +27,10 @@ import (
 type reuseState struct {
 	db           *sql.DB
 	quantization string
+	status       ReuseStatus
+	// disabledReason is empty only when reuse is active. It records why
+	// setup fell back to no reuse without turning the build fatal.
+	disabledReason string
 	// hasContextPrefix is derived from the accept-listed schema_version at
 	// reuse-open time so per-record chunk queries do not reprobe PRAGMA
 	// table_info(chunks) — which used to fire once per record during a
@@ -55,7 +59,7 @@ type recordReusePlan struct {
 }
 
 func loadReuseState(ctx context.Context, path, embedderFingerprint string, embedderDimension int, quantization string) *reuseState {
-	empty := &reuseState{}
+	empty := &reuseState{status: ReuseStatusDisabled, disabledReason: "reuse not requested"}
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return empty
@@ -64,30 +68,48 @@ func loadReuseState(ctx context.Context, path, embedderFingerprint string, embed
 	info, err := os.Stat(path)
 	switch {
 	case os.IsNotExist(err):
+		empty.status = ReuseStatusUnavailable
+		empty.disabledReason = "reuse snapshot not found"
 		return empty
 	case err != nil:
+		empty.status = ReuseStatusError
+		empty.disabledReason = fmt.Sprintf("stat reuse snapshot: %v", err)
 		return empty
 	case info.IsDir():
+		empty.status = ReuseStatusUnavailable
+		empty.disabledReason = "reuse path is a directory"
 		return empty
 	}
 
 	db, err := store.OpenReadOnlyContext(ctx, path)
 	if err != nil {
+		empty.status = ReuseStatusError
+		empty.disabledReason = fmt.Sprintf("open reuse snapshot: %v", err)
 		return empty
 	}
 
-	compatible, hasPrefix := isCompatibleReuseSnapshot(ctx, db, embedderFingerprint, embedderDimension, quantization)
+	compatible, hasPrefix, failureStatus, reason := reuseSnapshotCompatibility(ctx, db, embedderFingerprint, embedderDimension, quantization)
 	if !compatible {
 		_ = db.Close()
+		empty.status = failureStatus
+		if empty.status == "" {
+			empty.status = ReuseStatusIncompatible
+		}
+		empty.disabledReason = reason
+		if empty.disabledReason == "" {
+			empty.disabledReason = "reuse snapshot is incompatible"
+		}
 		return empty
 	}
 
 	normQ, err := normalizeQuantization(quantization)
 	if err != nil {
 		_ = db.Close()
+		empty.status = ReuseStatusError
+		empty.disabledReason = fmt.Sprintf("normalize reuse quantization: %v", err)
 		return empty
 	}
-	return &reuseState{db: db, quantization: normQ, hasContextPrefix: hasPrefix}
+	return &reuseState{db: db, quantization: normQ, status: ReuseStatusActive, hasContextPrefix: hasPrefix}
 }
 
 // Close releases the underlying read-only connection. Nil-safe and idempotent.
@@ -100,15 +122,15 @@ func (s *reuseState) Close() error {
 	return err
 }
 
-// isCompatibleReuseSnapshot reports whether the prior snapshot can seed the
+// reuseSnapshotCompatibility reports whether the prior snapshot can seed the
 // reuse cache, and — when compatible — whether it carries the v3
 // chunks.context_prefix column. Returning the column flag here avoids a
 // second schema_version round-trip in loadReuseState and lets per-record
 // chunk queries skip PRAGMA table_info(chunks).
-func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int, quantization string) (compatible, hasContextPrefix bool) {
+func reuseSnapshotCompatibility(ctx context.Context, db *sql.DB, embedderFingerprint string, embedderDimension int, quantization string) (compatible, hasContextPrefix bool, failureStatus ReuseStatus, reason string) {
 	schema, err := readMetadataValue(ctx, db, "schema_version")
 	if err != nil {
-		return false, false
+		return false, false, ReuseStatusError, fmt.Sprintf("read reuse schema_version: %v", err)
 	}
 	// v2 snapshots pre-date context_prefix. They remain reuse-compatible
 	// because loadStoredChunksForRecord defaults the missing prefix to
@@ -122,26 +144,40 @@ func isCompatibleReuseSnapshot(ctx context.Context, db *sql.DB, embedderFingerpr
 	// every unchanged chunk.
 	trimmed := strings.TrimSpace(schema)
 	if trimmed != schemaVersion && trimmed != prevSchemaVersion && trimmed != legacySchemaVersionV3 && trimmed != legacySchemaVersionV2 {
-		return false, false
+		return false, false, ReuseStatusIncompatible, fmt.Sprintf("unsupported reuse schema_version %q", trimmed)
 	}
 	storedFingerprint, err := readMetadataValue(ctx, db, "embedder_fingerprint")
 	if err != nil || strings.TrimSpace(storedFingerprint) != strings.TrimSpace(embedderFingerprint) {
-		return false, false
+		if err != nil {
+			return false, false, ReuseStatusError, fmt.Sprintf("read reuse embedder_fingerprint: %v", err)
+		}
+		return false, false, ReuseStatusIncompatible, fmt.Sprintf("reuse embedder_fingerprint %q does not match %q",
+			strings.TrimSpace(storedFingerprint), strings.TrimSpace(embedderFingerprint))
 	}
 	storedDimension, err := readMetadataValue(ctx, db, "embedder_dimension")
 	if err != nil || strings.TrimSpace(storedDimension) != strconv.Itoa(embedderDimension) {
-		return false, false
+		if err != nil {
+			return false, false, ReuseStatusError, fmt.Sprintf("read reuse embedder_dimension: %v", err)
+		}
+		return false, false, ReuseStatusIncompatible, fmt.Sprintf("reuse embedder_dimension %q does not match %d",
+			strings.TrimSpace(storedDimension), embedderDimension)
 	}
 	storedQuantization, err := readMetadataValueOptional(ctx, db, "quantization", store.QuantizationFloat32)
 	if err != nil {
-		return false, false
+		return false, false, ReuseStatusError, fmt.Sprintf("read reuse quantization: %v", err)
 	}
 	normStored, err1 := normalizeQuantization(storedQuantization)
 	normTarget, err2 := normalizeQuantization(quantization)
 	if err1 != nil || err2 != nil || normStored != normTarget {
-		return false, false
+		if err1 != nil {
+			return false, false, ReuseStatusError, fmt.Sprintf("normalize reuse quantization %q: %v", storedQuantization, err1)
+		}
+		if err2 != nil {
+			return false, false, ReuseStatusError, fmt.Sprintf("normalize target quantization %q: %v", quantization, err2)
+		}
+		return false, false, ReuseStatusIncompatible, fmt.Sprintf("reuse quantization %q does not match %q", normStored, normTarget)
 	}
-	return true, schemaHasContextPrefix(trimmed)
+	return true, schemaHasContextPrefix(trimmed), "", ""
 }
 
 // planRecordReuse builds a per-record plan given the resolved sections,
@@ -215,14 +251,14 @@ func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) st
 	row := state.db.QueryRowContext(ctx, `SELECT title, content_hash FROM records WHERE ref = ?`, ref)
 	if err := row.Scan(&title, &contentHash); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			state.disable()
+			state.disable(fmt.Sprintf("read reuse record %s: %v", ref, err))
 		}
 		return storedRecord{}
 	}
 
 	chunks, err := loadStoredChunksForRecord(ctx, state.db, ref, title, state.quantization, state.hasContextPrefix)
 	if err != nil {
-		state.disable()
+		state.disable(err.Error())
 		return storedRecord{}
 	}
 	return storedRecord{
@@ -234,12 +270,17 @@ func storedRecordForReuse(ctx context.Context, state *reuseState, ref string) st
 
 // disable closes the read-only handle and nils it out so subsequent reuse
 // lookups short-circuit to an empty storedRecord. Idempotent.
-func (s *reuseState) disable() {
+func (s *reuseState) disable(reason string) {
 	if s == nil || s.db == nil {
 		return
 	}
 	_ = s.db.Close()
 	s.db = nil
+	s.status = ReuseStatusError
+	s.disabledReason = strings.TrimSpace(reason)
+	if s.disabledReason == "" {
+		s.disabledReason = "reuse disabled after read error"
+	}
 }
 
 func loadStoredChunksForRecord(ctx context.Context, db *sql.DB, ref, title, quantization string, hasContextPrefix bool) (map[string][]byte, error) {
