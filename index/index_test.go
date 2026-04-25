@@ -212,6 +212,58 @@ func TestSearchReturnsClosestHit(t *testing.T) {
 	}
 }
 
+func TestSearchRejectsLimitAboveMaxSearchLimit(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	if _, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "guide",
+		Title:      "Alpha",
+		SourceRef:  "file://docs/alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "# Overview\n\nAlpha handles queue admission.",
+	}}, BuildOptions{
+		Path:     path,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	if _, err := Search(context.Background(), SearchQuery{
+		Path: path,
+		SearchParams: SearchParams{
+			Text:     "queue admission",
+			Limit:    MaxSearchLimit + 1,
+			Embedder: fixture,
+		},
+	}); err == nil || !strings.Contains(err.Error(), "MaxSearchLimit") {
+		t.Fatalf("Search() err = %v, want MaxSearchLimit rejection", err)
+	}
+
+	snapshot, err := OpenSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenSnapshot() error = %v", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	queryVector, err := fixture.EmbedQueries(context.Background(), []string{"queue admission"})
+	if err != nil {
+		t.Fatalf("EmbedQueries() error = %v", err)
+	}
+	if _, err := snapshot.SearchVector(context.Background(), VectorSearchQuery{
+		Embedding: queryVector[0],
+		Limit:     MaxSearchLimit + 1,
+	}); err == nil || !strings.Contains(err.Error(), "MaxSearchLimit") {
+		t.Fatalf("SearchVector() err = %v, want MaxSearchLimit rejection", err)
+	}
+}
+
 func TestSearchHybridBoostsExactMatch(t *testing.T) {
 	t.Parallel()
 
@@ -593,6 +645,108 @@ func TestRebuildInt8RejectsFloat32Reuse(t *testing.T) {
 	}
 	if result.ReusedChunkCount != 0 {
 		t.Fatalf("ReusedChunkCount = %d, want 0 (quantization changed)", result.ReusedChunkCount)
+	}
+	if result.ReuseStatus != ReuseStatusIncompatible {
+		t.Fatalf("ReuseStatus = %q, want %q", result.ReuseStatus, ReuseStatusIncompatible)
+	}
+	if !strings.Contains(result.ReuseDisabledReason, "quantization") {
+		t.Fatalf("ReuseDisabledReason = %q, want quantization diagnostic", result.ReuseDisabledReason)
+	}
+}
+
+func TestRebuildReuseDiagnosticsForMissingSnapshot(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	path := t.TempDir() + "/stroma.db"
+	result, err := Rebuild(context.Background(), []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "artifact",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "Burst handling lives here.",
+	}}, BuildOptions{
+		Path:          path,
+		ReuseFromPath: path + ".missing",
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(missing reuse) error = %v", err)
+	}
+	if result.ReuseStatus != ReuseStatusUnavailable {
+		t.Fatalf("ReuseStatus = %q, want %q", result.ReuseStatus, ReuseStatusUnavailable)
+	}
+	if !strings.Contains(result.ReuseDisabledReason, "not found") {
+		t.Fatalf("ReuseDisabledReason = %q, want not-found diagnostic", result.ReuseDisabledReason)
+	}
+	if result.ReusedChunkCount != 0 {
+		t.Fatalf("ReusedChunkCount = %d, want 0 when reuse snapshot is missing", result.ReusedChunkCount)
+	}
+}
+
+func TestRebuildReuseDiagnosticsForRuntimeReadFailure(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := embed.NewFixture("fixture-a", 16)
+	if err != nil {
+		t.Fatalf("NewFixture() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	reusePath := dir + "/reuse.db"
+	nextPath := dir + "/next.db"
+	records := []corpus.Record{{
+		Ref:        "alpha",
+		Kind:       "artifact",
+		Title:      "Alpha",
+		SourceRef:  "file://alpha.md",
+		BodyFormat: corpus.FormatMarkdown,
+		BodyText:   "# Overview\n\nBurst handling lives here.",
+	}}
+
+	if _, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:     reusePath,
+		Embedder: fixture,
+	}); err != nil {
+		t.Fatalf("Rebuild(reuse source) error = %v", err)
+	}
+
+	db, err := store.OpenReadWriteContext(context.Background(), reusePath)
+	if err != nil {
+		t.Fatalf("OpenReadWriteContext() error = %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `DROP TABLE chunks`); err != nil {
+		_ = db.Close()
+		t.Fatalf("drop chunks table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close corrupted reuse source: %v", err)
+	}
+
+	result, err := Rebuild(context.Background(), records, BuildOptions{
+		Path:          nextPath,
+		ReuseFromPath: reusePath,
+		Embedder:      fixture,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild(runtime reuse read failure) error = %v", err)
+	}
+	if result.ReuseStatus != ReuseStatusError {
+		t.Fatalf("ReuseStatus = %q, want %q", result.ReuseStatus, ReuseStatusError)
+	}
+	if !strings.Contains(result.ReuseDisabledReason, "query stored chunks") {
+		t.Fatalf("ReuseDisabledReason = %q, want stored-chunk query diagnostic", result.ReuseDisabledReason)
+	}
+	if result.ReusedChunkCount != 0 {
+		t.Fatalf("ReusedChunkCount = %d, want 0 after runtime reuse read failure", result.ReusedChunkCount)
+	}
+	if result.EmbeddedChunkCount == 0 {
+		t.Fatalf("EmbeddedChunkCount = 0, want fallback embedding after runtime reuse read failure")
 	}
 }
 
@@ -1497,6 +1651,12 @@ func TestRebuildStreamingReuseAcrossManyRecords(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Rebuild(B, reuse A) error = %v", err)
+	}
+	if result.ReuseStatus != ReuseStatusActive {
+		t.Fatalf("ReuseStatus = %q, want %q", result.ReuseStatus, ReuseStatusActive)
+	}
+	if result.ReuseDisabledReason != "" {
+		t.Fatalf("ReuseDisabledReason = %q, want empty for active reuse", result.ReuseDisabledReason)
 	}
 
 	// Chunks in B: unchanged (2 each) + edited (2 each) + added (1 each).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -200,6 +201,35 @@ func TestDoRespectsMaxRetriesExhaustion(t *testing.T) {
 	}
 }
 
+func TestDoNormalizesNegativeMaxRetries(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Do(context.Background(), server.Client(),
+		Target{URL: server.URL, Body: []byte(`x`)},
+		FailureDetails{MaxRetries: -1},
+		Policy{MaxRetries: -1},
+		func(_ *http.Response, _ []byte) (string, error) { return "", nil },
+	)
+	if err == nil {
+		t.Fatalf("Do() err = nil, want error from single failed attempt")
+	}
+	if n := attempts.Load(); n != 1 {
+		t.Errorf("attempts = %d, want 1 (negative MaxRetries normalizes to zero retries)", n)
+	}
+	var perr *Error
+	if !errors.As(err, &perr) {
+		t.Fatalf("err = %v, want *Error", err)
+	}
+	if fields := perr.DiagnosticFields(); fields["max_retries"] != nil {
+		t.Errorf("DiagnosticFields()[max_retries] = %v, want omitted zero value", fields["max_retries"])
+	}
+}
+
 func TestDoEnforcesResponseSizeCap(t *testing.T) {
 	// Emit a response larger than the configured cap.
 	payload := strings.Repeat("x", 64)
@@ -221,6 +251,40 @@ func TestDoEnforcesResponseSizeCap(t *testing.T) {
 	}
 	if perr.FailureClass() != FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), FailureClassSchemaMismatch)
+	}
+}
+
+func TestDoRetriesTimeoutCauseAfterWrapping(t *testing.T) {
+	var attempts atomic.Int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if attempts.Add(1) == 1 {
+				return nil, fakeNetError{msg: "temporary upstream stall", timeout: true}
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	out, err := Do(context.Background(), client,
+		Target{URL: "http://example.test/v1", Body: []byte(`x`)},
+		FailureDetails{},
+		Policy{MaxRetries: 1},
+		func(_ *http.Response, body []byte) (string, error) { return string(body), nil },
+	)
+	if err != nil {
+		t.Fatalf("Do() err = %v", err)
+	}
+	if out != "ok" {
+		t.Errorf("Do() = %q, want ok", out)
+	}
+	if n := attempts.Load(); n != 2 {
+		t.Errorf("attempts = %d, want 2 (wrapped net.Error timeout must retry)", n)
 	}
 }
 
@@ -616,4 +680,10 @@ func TestDoRejectsNilClient(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "nil http client") {
 		t.Errorf("err = %v, want nil http client", err)
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

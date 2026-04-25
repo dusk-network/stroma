@@ -60,6 +60,13 @@ const DefaultMaxChunkSections = 10_000
 // size across snapshots.
 const DefaultSearchLimit = 10
 
+// MaxSearchLimit is the largest accepted SearchParams.Limit or
+// VectorSearchQuery.Limit. Search uses bounded in-memory shortlists for
+// vector/FTS fusion and reranking; callers needing more than this should
+// page or shard at a higher layer rather than relying on an unbounded
+// single-query scan.
+const MaxSearchLimit = 250
+
 // resolveMaxChunkSections maps a caller-provided MaxChunkSections knob
 // onto the chunk.Options.MaxSections value: zero → safe default,
 // negative → chunk-level "unlimited", positive → verbatim.
@@ -205,10 +212,37 @@ type BuildResult struct {
 	ReusedRecordCount   int
 	ReusedChunkCount    int
 	EmbeddedChunkCount  int
+	ReuseStatus         ReuseStatus
+	ReuseDisabledReason string
 	EmbedderDimension   int
 	EmbedderFingerprint string
 	ContentFingerprint  string
 }
+
+// ReuseStatus reports whether BuildOptions.ReuseFromPath was usable
+// during Rebuild. Reuse setup remains non-fatal by default; callers can
+// inspect BuildResult.ReuseStatus and BuildResult.ReuseDisabledReason
+// to distinguish "nothing reusable" from "reuse could not start".
+type ReuseStatus string
+
+const (
+	// ReuseStatusDisabled means BuildOptions.ReuseFromPath was empty.
+	ReuseStatusDisabled ReuseStatus = "disabled"
+	// ReuseStatusActive means the prior snapshot opened and passed
+	// compatibility checks, so section-level reuse was attempted.
+	ReuseStatusActive ReuseStatus = "active"
+	// ReuseStatusUnavailable means the configured path did not name a
+	// readable snapshot file, for example because it was missing or a
+	// directory.
+	ReuseStatusUnavailable ReuseStatus = "unavailable"
+	// ReuseStatusIncompatible means the snapshot exists but cannot seed
+	// this build because schema, embedder, dimension, or quantization
+	// metadata does not match.
+	ReuseStatusIncompatible ReuseStatus = "incompatible"
+	// ReuseStatusError means setup hit an operational error while
+	// checking the configured snapshot.
+	ReuseStatusError ReuseStatus = "error"
+)
 
 // UpdateOptions controls how an existing Stroma index is updated in place.
 type UpdateOptions struct {
@@ -296,9 +330,8 @@ type SearchParams struct {
 	// "search text is required" error — this field has no default.
 	Text string
 	// Limit caps the number of SearchHits returned. Zero or negative
-	// selects DefaultSearchLimit (10). Pass an explicit Limit when
-	// throughput matters or when a downstream consumer needs a stable
-	// shortlist size across snapshots.
+	// selects DefaultSearchLimit (10). Values above MaxSearchLimit
+	// reject with an error instead of being silently capped.
 	Limit int
 	// Kinds filters candidate records to the supplied kind list. Nil
 	// or empty means "no filter, all kinds".
@@ -524,6 +557,8 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 	result := &BuildResult{
 		Path:                inputs.indexPath,
 		RecordCount:         len(inputs.normalized),
+		ReuseStatus:         inputs.reuseState.status,
+		ReuseDisabledReason: inputs.reuseState.disabledReason,
 		EmbedderDimension:   inputs.dimension,
 		EmbedderFingerprint: options.Embedder.Fingerprint(),
 		ContentFingerprint:  contentFingerprint,
@@ -541,6 +576,8 @@ func Rebuild(ctx context.Context, records []corpus.Record, options BuildOptions)
 			result.ReusedRecordCount++
 		}
 	}
+	result.ReuseStatus = inputs.reuseState.status
+	result.ReuseDisabledReason = inputs.reuseState.disabledReason
 
 	// Release the reuse snapshot before swapping the staged index into
 	// place: on Windows, replaceFile cannot rename over an open SQLite
@@ -2637,7 +2674,7 @@ const (
 	// above buildSearchSQL.
 	minCandidatePool = 25
 	// maxCandidatePool caps the shortlist to bound per-query cost.
-	maxCandidatePool = 250
+	maxCandidatePool = MaxSearchLimit
 )
 
 func candidateLimit(limit int) int {

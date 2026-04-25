@@ -70,6 +70,31 @@ func TestNewOpenAINormalisesDefaults(t *testing.T) {
 	}
 }
 
+func TestNewOpenAINormalizesNegativeMaxRetries(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewOpenAI(OpenAIConfig{
+		BaseURL:    server.URL,
+		Model:      "gpt",
+		MaxRetries: -1,
+	})
+	if got := client.Config().MaxRetries; got != 0 {
+		t.Fatalf("Config().MaxRetries = %d, want 0", got)
+	}
+	_, err := client.ChatCompletionText(context.Background(), []Message{{Role: "user", Content: "q"}}, 0, 0)
+	if err == nil {
+		t.Fatal("ChatCompletionText() err = nil, want single-attempt 502 error")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1 (negative MaxRetries normalizes to no retries)", got)
+	}
+}
+
 func TestNewOpenAIBaseURLBareHostAddsV1(t *testing.T) {
 	cfg := NewOpenAI(OpenAIConfig{BaseURL: "http://x", Model: "m"}).Config()
 	if cfg.BaseURL != "http://x/v1" {
@@ -143,6 +168,263 @@ func TestChatCompletionTextSuccess(t *testing.T) {
 	}
 	if captured.Auth != "Bearer sk" {
 		t.Errorf("Authorization = %q, want Bearer sk", captured.Auth)
+	}
+}
+
+func TestChatCompletionJSONDecodesObjectForms(t *testing.T) {
+	type payload struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+
+	cases := map[string]string{
+		"plain":  `{"name":"alpha","count":2}`,
+		"fenced": "```json\n{\"name\":\"alpha\",\"count\":2}\n```",
+		"prose":  "Here is the object: {\"name\":\"alpha\",\"count\":2}.",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(chatResponse{
+					Choices: []chatChoice{{Message: chatChoiceMessage{Content: mustRawMessage(t, content)}}},
+				})
+			}))
+			t.Cleanup(server.Close)
+
+			var got payload
+			err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
+				ChatCompletionJSON(context.Background(), JSONCallRequest{
+					Messages: []Message{{Role: "user", Content: "return JSON"}},
+				}, &got)
+			if err != nil {
+				t.Fatalf("ChatCompletionJSON() err = %v", err)
+			}
+			if got != (payload{Name: "alpha", Count: 2}) {
+				t.Fatalf("decoded = %+v, want alpha payload", got)
+			}
+		})
+	}
+}
+
+func TestChatCompletionJSONSendsSchemaResponseFormat(t *testing.T) {
+	var responseFormat json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		responseFormat = append(responseFormat, body.ResponseFormat...)
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
+		ChatCompletionJSON(context.Background(), JSONCallRequest{
+			Messages: []Message{{Role: "user", Content: "return JSON"}},
+			Schema:   json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}`),
+		}, &got)
+	if err != nil {
+		t.Fatalf("ChatCompletionJSON() err = %v", err)
+	}
+	if !got.OK {
+		t.Fatalf("OK = false, want true")
+	}
+	var format struct {
+		Type       string `json:"type"`
+		JSONSchema struct {
+			Name   string          `json:"name"`
+			Schema json.RawMessage `json:"schema"`
+		} `json:"json_schema"`
+	}
+	if err := json.Unmarshal(responseFormat, &format); err != nil {
+		t.Fatalf("response_format = %s: %v", responseFormat, err)
+	}
+	if format.Type != "json_schema" {
+		t.Fatalf("response_format.type = %q, want json_schema", format.Type)
+	}
+	if format.JSONSchema.Name != "stroma_json_response" {
+		t.Fatalf("json_schema.name = %q, want stroma_json_response", format.JSONSchema.Name)
+	}
+	if !json.Valid(format.JSONSchema.Schema) || !strings.Contains(string(format.JSONSchema.Schema), `"ok"`) {
+		t.Fatalf("json_schema.schema = %s, want caller schema", format.JSONSchema.Schema)
+	}
+}
+
+func TestChatCompletionJSONSchemaMismatchResponses(t *testing.T) {
+	cases := map[string]string{
+		"invalid_json":  `{"choices":[{"message":{"content":"{\"name\":"}}]}`,
+		"missing_json":  `{"choices":[{"message":{"content":"no structured data here"}}]}`,
+		"wrong_shape":   `{"choices":[{"message":{"content":"[{\"name\":\"alpha\"}]"}}]}`,
+		"empty_message": `{"choices":[{"message":{"content":""}}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, body)
+			}))
+			t.Cleanup(server.Close)
+
+			var got struct {
+				Name string `json:"name"`
+			}
+			err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
+				ChatCompletionJSON(context.Background(), JSONCallRequest{
+					Messages: []Message{{Role: "user", Content: "return JSON"}},
+				}, &got)
+			var perr *provider.Error
+			if !errors.As(err, &perr) {
+				t.Fatalf("err = %v, want *provider.Error", err)
+			}
+			if perr.FailureClass() != provider.FailureClassSchemaMismatch {
+				t.Fatalf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
+			}
+		})
+	}
+}
+
+func TestChatCompletionJSONUpstreamProviderFailureRemainsClassified(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"invalid key"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt", APIToken: "bad"}).
+		ChatCompletionJSON(context.Background(), JSONCallRequest{
+			Messages: []Message{{Role: "user", Content: "return JSON"}},
+		}, &got)
+	var perr *provider.Error
+	if !errors.As(err, &perr) {
+		t.Fatalf("err = %v, want *provider.Error", err)
+	}
+	if perr.FailureClass() != provider.FailureClassAuth {
+		t.Fatalf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassAuth)
+	}
+}
+
+func TestChatCompletionJSONRepairRetry(t *testing.T) {
+	var attempts atomic.Int32
+	var secondRequest chatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		var body chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if n == 1 {
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"not json"}}]}`)
+			return
+		}
+		secondRequest = body
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
+		ChatCompletionJSON(context.Background(), JSONCallRequest{
+			Messages: []Message{{Role: "user", Content: "return JSON"}},
+			Retry:    JSONRetryPolicy{MaxRepairs: 3},
+		}, &got)
+	if err != nil {
+		t.Fatalf("ChatCompletionJSON() err = %v", err)
+	}
+	if !got.OK {
+		t.Fatalf("OK = false, want true")
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2 (repair capped at one pass)", attempts.Load())
+	}
+	if len(secondRequest.Messages) != 3 {
+		t.Fatalf("second request messages = %d, want original + assistant + repair", len(secondRequest.Messages))
+	}
+	if secondRequest.Messages[1].Role != "assistant" || secondRequest.Messages[1].Content != "not json" {
+		t.Fatalf("second request assistant message = %+v, want malformed response context", secondRequest.Messages[1])
+	}
+	if !strings.Contains(secondRequest.Messages[2].Content, "valid JSON object") {
+		t.Fatalf("repair message = %q, want JSON object instruction", secondRequest.Messages[2].Content)
+	}
+}
+
+func TestChatCompletionJSONRepairDoesNotPreserveFailedDecodeFields(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"name\":\"stale\",\"count\":\"bad\"}"}}]}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"count\":2}"}}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	var got struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+	err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
+		ChatCompletionJSON(context.Background(), JSONCallRequest{
+			Messages: []Message{{Role: "user", Content: "return JSON"}},
+			Retry:    JSONRetryPolicy{MaxRepairs: 1},
+		}, &got)
+	if err != nil {
+		t.Fatalf("ChatCompletionJSON() err = %v", err)
+	}
+	if got.Name != "" {
+		t.Fatalf("Name = %q, want empty; failed decode must not mutate caller target", got.Name)
+	}
+	if got.Count != 2 {
+		t.Fatalf("Count = %d, want 2", got.Count)
+	}
+}
+
+func TestChatCompletionJSONRepairsEmptyMessage(t *testing.T) {
+	var attempts atomic.Int32
+	var secondRequest chatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		var body chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if n == 1 {
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":""}}]}`)
+			return
+		}
+		secondRequest = body
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	err := NewOpenAI(OpenAIConfig{BaseURL: server.URL, Model: "gpt"}).
+		ChatCompletionJSON(context.Background(), JSONCallRequest{
+			Messages: []Message{{Role: "user", Content: "return JSON"}},
+			Retry:    JSONRetryPolicy{MaxRepairs: 1},
+		}, &got)
+	if err != nil {
+		t.Fatalf("ChatCompletionJSON() err = %v", err)
+	}
+	if !got.OK {
+		t.Fatalf("OK = false, want true")
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+	if len(secondRequest.Messages) != 2 {
+		t.Fatalf("second request messages = %d, want original + repair", len(secondRequest.Messages))
+	}
+	if !strings.Contains(secondRequest.Messages[1].Content, "valid JSON object") {
+		t.Fatalf("repair message = %q, want JSON object instruction", secondRequest.Messages[1].Content)
 	}
 }
 
@@ -254,6 +536,30 @@ func TestExtractMessageTextDirectly(t *testing.T) {
 	}
 }
 
+func TestExtractJSONObjectDirectly(t *testing.T) {
+	cases := map[string]string{
+		"plain":  `{"ok":true}`,
+		"fenced": "```json\n{\"ok\":true}\n```",
+		"prose":  "Result: {\"ok\":true}.",
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			raw, err := ExtractJSONObject(input)
+			if err != nil {
+				t.Fatalf("ExtractJSONObject() err = %v", err)
+			}
+			if string(raw) != `{"ok":true}` {
+				t.Fatalf("raw = %s, want object", raw)
+			}
+		})
+	}
+	for _, input := range []string{"", "no json", `[{"ok":true}]`, `{"ok":true} {"ok":false}`} {
+		if raw, err := ExtractJSONObject(input); err == nil {
+			t.Fatalf("ExtractJSONObject(%q) = %s, nil err; want error", input, raw)
+		}
+	}
+}
+
 func TestChatCompletionTextSchemaMismatchOnDecodeFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, `<html>not json</html>`)
@@ -269,6 +575,15 @@ func TestChatCompletionTextSchemaMismatchOnDecodeFailure(t *testing.T) {
 	if perr.FailureClass() != provider.FailureClassSchemaMismatch {
 		t.Errorf("FailureClass = %q, want %q", perr.FailureClass(), provider.FailureClassSchemaMismatch)
 	}
+}
+
+func mustRawMessage(t *testing.T, text string) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(text)
+	if err != nil {
+		t.Fatalf("Marshal(%q): %v", text, err)
+	}
+	return raw
 }
 
 func TestChatCompletionTextRetriesOn5xxThenSucceeds(t *testing.T) {

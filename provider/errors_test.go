@@ -3,6 +3,7 @@ package provider
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"testing"
 )
 
@@ -55,6 +56,22 @@ func TestProviderErrorIsStandardError(t *testing.T) {
 	var target *Error
 	if !errors.As(err, &target) {
 		t.Fatalf("errors.As(Error) = false")
+	}
+}
+
+func TestProviderErrorUnwrapsCause(t *testing.T) {
+	cause := fakeNetError{msg: "temporary upstream stall", timeout: true}
+	err := NewErrorCause(FailureDetails{FailureClass: FailureClassTimeout}, cause, "call failed: %v", cause)
+
+	if !errors.Is(err, cause) {
+		t.Fatalf("errors.Is(err, cause) = false")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) {
+		t.Fatalf("errors.As(err, net.Error) = false")
+	}
+	if !netErr.Timeout() {
+		t.Fatalf("netErr.Timeout() = false, want true")
 	}
 }
 

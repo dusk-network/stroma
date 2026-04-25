@@ -29,9 +29,10 @@ type Target struct {
 }
 
 // Policy controls retry and response-size behaviour. A zero Policy is
-// valid: MaxRetries 0 means "try once, no retries", and a zero
-// MaxResponseBytes selects defaultMaxResponseBytes (4 MiB) — generous
-// for chat completions, tight enough to avoid OOMing the host on a
+// valid: MaxRetries 0 means "try once, no retries", negative
+// MaxRetries values normalize to zero, and a zero MaxResponseBytes
+// selects defaultMaxResponseBytes (4 MiB) — generous for chat
+// completions, tight enough to avoid OOMing the host on a
 // misconfigured upstream. Embedders with larger expected payloads set
 // MaxResponseBytes explicitly.
 type Policy struct {
@@ -117,13 +118,21 @@ func Do[T any](
 		maxRetryAfter = defaultMaxRetryAfter
 	}
 
+	maxRetries := policy.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	if details.MaxRetries < 0 {
+		details.MaxRetries = 0
+	}
+
 	method := target.Method
 	if method == "" {
 		method = http.MethodPost
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= policy.MaxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		value, retryAfter, statusCode, err := doAttempt(ctx, client, method, target, details, maxResponseBytes, decode)
 		if err == nil {
 			return value, nil
@@ -135,7 +144,7 @@ func Do[T any](
 			return zero, err
 		}
 		lastErr = err
-		if shouldRetry(err, statusCode) && attempt < policy.MaxRetries {
+		if shouldRetry(err, statusCode) && attempt < maxRetries {
 			if waitErr := waitBeforeRetry(ctx, attempt, min(retryAfter, maxRetryAfter)); waitErr != nil {
 				return zero, waitErr
 			}
@@ -176,7 +185,7 @@ func doAttempt[T any](
 			return value, 0, 0, err
 		}
 		failure := classifiedFailureDetails(details, 0, err, err.Error())
-		return value, 0, 0, NewError(failure, "call %s %s: %v", method, target.URL, err)
+		return value, 0, 0, NewErrorCause(failure, err, "call %s %s: %v", method, target.URL, err)
 	}
 
 	retryAfter = retryAfterDuration(resp.Header.Get("Retry-After"))
@@ -231,7 +240,7 @@ func interpretResponse[T any](
 	}
 	if readErr != nil {
 		failure := classifiedFailureDetails(details, 0, readErr, readErr.Error())
-		return zero, NewError(failure, "read response: %v", readErr)
+		return zero, NewErrorCause(failure, readErr, "read response: %v", readErr)
 	}
 	if oversized {
 		failure := details
@@ -243,7 +252,7 @@ func interpretResponse[T any](
 	if decodeErr == nil {
 		if closeErr != nil {
 			failure := classifiedFailureDetails(details, 0, closeErr, closeErr.Error())
-			return zero, NewError(failure, "close response: %v", closeErr)
+			return zero, NewErrorCause(failure, closeErr, "close response: %v", closeErr)
 		}
 		return value, nil
 	}
@@ -254,7 +263,7 @@ func interpretResponse[T any](
 	if !errors.As(decodeErr, &perr) {
 		failure := details
 		failure.FailureClass = FailureClassSchemaMismatch
-		decodeErr = NewError(failure, "decode response: %v", decodeErr)
+		decodeErr = NewErrorCause(failure, decodeErr, "decode response: %v", decodeErr)
 	}
 	return zero, decodeErr
 }
@@ -273,7 +282,7 @@ func interpretNon2xx(
 ) error {
 	if readErr != nil {
 		failure := classifiedFailureDetails(details, resp.StatusCode, nil, readErr.Error())
-		return NewErrorStatus(failure, resp.StatusCode,
+		return NewErrorStatusCause(failure, resp.StatusCode, readErr,
 			"%s %s returned %s (response body read failed: %v)",
 			method, target.URL, resp.Status, readErr)
 	}
