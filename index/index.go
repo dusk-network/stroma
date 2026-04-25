@@ -127,6 +127,11 @@ var ErrUpdateCommittedIntegrityCheckFailed = errors.New("update committed but po
 // and embeddings are recomputed against the new base snapshot.
 var ErrStaleUpdatePlan = errors.New("index changed while planning update")
 
+// ErrUpdatePlanTooLarge signals that UpdateOptions.MaxPlannedRecords rejected
+// the added-record set before Update opened the write transaction. Callers can
+// split added records into smaller Update calls and retry.
+var ErrUpdatePlanTooLarge = errors.New("update plan exceeds MaxPlannedRecords")
+
 // updateTransactionStartedHook is a test-only seam used to assert that
 // external embedding calls happen before Update opens its SQLite transaction.
 // Production leaves it nil.
@@ -272,6 +277,14 @@ type UpdateOptions struct {
 	// incremental-update path. Zero → DefaultMaxChunkSections; negative
 	// → no cap.
 	MaxChunkSections int
+
+	// MaxPlannedRecords caps how many added/replaced records Update will
+	// chunk, reuse-plan, and embed before opening its write transaction.
+	// This bounds resident pre-transaction plan memory for callers that
+	// split large ingests into repeated Update calls. Zero keeps the
+	// historical unbounded behavior; negative values reject. The cap
+	// applies only to added/replaced records, not removals.
+	MaxPlannedRecords int
 
 	// Quantization, when provided, must match the existing index — see
 	// the store.Quantization* constants (float32, int8, binary) for the
@@ -687,6 +700,9 @@ func Update(ctx context.Context, added []corpus.Record, removed []string, option
 	if err != nil {
 		return nil, err
 	}
+	if err := validateUpdatePlanRecordLimit(len(normalizedAdded), options.MaxPlannedRecords); err != nil {
+		return nil, err
+	}
 
 	db, err := store.OpenReadWriteContext(ctx, indexPath)
 	if err != nil {
@@ -752,6 +768,17 @@ func normalizeUpdateInputs(added []corpus.Record, removed []string) ([]corpus.Re
 		return nil, nil, err
 	}
 	return normalizedAdded, removedRefs, nil
+}
+
+func validateUpdatePlanRecordLimit(addedCount, maxPlannedRecords int) error {
+	if maxPlannedRecords < 0 {
+		return fmt.Errorf("MaxPlannedRecords must be non-negative")
+	}
+	if maxPlannedRecords > 0 && addedCount > maxPlannedRecords {
+		return fmt.Errorf("%w: %d added records exceeds limit %d; split the added records into smaller Update calls",
+			ErrUpdatePlanTooLarge, addedCount, maxPlannedRecords)
+	}
+	return nil
 }
 
 func deleteRemovedRecords(ctx context.Context, tx *sql.Tx, refs []string, result *UpdateResult) error {
@@ -2585,6 +2612,15 @@ func validateUpdateEmbedder(ctx context.Context, embedder embed.Embedder, stored
 }
 
 func deleteRecord(ctx context.Context, tx *sql.Tx, ref string) (bool, error) {
+	var exists int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM records WHERE ref = ?`, ref).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("probe record %s before delete: %w", ref, err)
+	}
+
 	// chunks_vec and fts_chunks are sqlite-vec / FTS5 virtual tables and
 	// do not participate in foreign-key cascades, so we delete their rows
 	// explicitly. chunks_vec_full is a regular table with
